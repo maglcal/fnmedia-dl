@@ -7,6 +7,8 @@
 接口：
   GET  /api/health           健康检查（含版本号）
   GET  /api/update/check     在线更新检查（GitHub Releases）
+  POST /api/update/download  一键在线更新（下载 fpk → 替换 → 重启，后台执行）
+  GET  /api/update/progress  更新进度轮询（stage/percent/detail）
   GET  /api/backends         各下载通道状态
   POST /api/backends/test    单通道连通性测试
   GET  /api/thunder_cloud/review         迅雷风控短信验证状态
@@ -37,6 +39,7 @@ from pydantic import BaseModel
 
 import config as cfgmod
 import links as linksmod
+import updater as updmod
 from backends.base import BackendError
 from downloader import DownloadManager
 
@@ -122,6 +125,33 @@ def update_check():
                     "size": a.get("size")}
                    for a in (data.get("assets") or [])],
     }
+
+
+class UpdateDownloadReq(BaseModel):
+    url: str = ""
+    version: str = ""
+
+
+@app.post("/api/update/download")
+def update_download(req: UpdateDownloadReq):
+    """一键在线更新：后台线程下载 fpk → 替换 → 重启服务，进度走 /api/update/progress。"""
+    url = req.url or ""
+    if not url:
+        # 未显式给 URL 时兜底取最新 release 的 fpk 资产
+        info = update_check()
+        for asset in info.get("assets", []):
+            if (asset.get("name") or "").endswith(".fpk"):
+                url = asset.get("url") or ""
+                break
+    try:
+        return {"ok": True, **updmod.start(url, req.version)}
+    except updmod.UpdateError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/update/progress")
+def update_progress():
+    return updmod.progress()
 
 
 class BackendTestReq(BaseModel):

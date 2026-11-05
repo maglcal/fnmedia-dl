@@ -534,14 +534,24 @@ $("#updateCheckBtn").addEventListener("click", async () => {
   const st = $("#updateStatus");
   btn.disabled = true;
   st.hidden = false;
+  st.className = "dir-status";
   st.textContent = "正在检查更新…";
   try {
     const r = await API.get("/api/update/check");
     if (r.has_update) {
+      // 记住 fpk 资产地址与目标版本，亮出「一键更新」
+      const fpk = (r.assets || []).find((a) => (a.name || "").endsWith(".fpk"));
+      if (fpk && fpk.url) {
+        UPD.url = fpk.url;
+        UPD.target = r.latest;
+        $("#updateRunBtn").hidden = false;
+      }
       st.innerHTML =
         `发现新版本 <b>v${r.latest}</b>（当前 v${r.current}）` +
-        (r.url ? ` —— <a href="${r.url}" target="_blank" rel="noreferrer">前往下载</a>` : "");
+        (fpk ? "，可点「一键更新」在线升级" :
+          (r.url ? ` —— <a href="${r.url}" target="_blank" rel="noreferrer">前往下载</a>` : ""));
     } else {
+      $("#updateRunBtn").hidden = true;
       st.textContent = `✓ 已是最新版本（v${r.current}）`;
     }
   } catch (e) {
@@ -549,6 +559,99 @@ $("#updateCheckBtn").addEventListener("click", async () => {
   } finally {
     btn.disabled = false;
   }
+});
+
+/* ---------------- 一键在线更新（下载 fpk → 替换 → 重启，带进度） ---------------- */
+const UPD = { url: "", target: "", timer: null };
+
+$("#updateRunBtn").addEventListener("click", async () => {
+  if (!UPD.url) return;
+  const st = $("#updateStatus");
+  const box = $("#updateProgressBox");
+  const bar = $("#updateProgressBar");
+  const stageEl = $("#updateProgressStage");
+  const pctEl = $("#updateProgressPct");
+  $("#updateRunBtn").disabled = true;
+  $("#updateCheckBtn").disabled = true;
+  st.hidden = false;
+  st.className = "dir-status";
+  st.textContent = `正在在线更新到 v${UPD.target}，期间服务会短暂重启，请勿关闭页面…`;
+  box.hidden = false;
+  bar.style.width = "2%";
+  stageEl.textContent = "准备下载…";
+  pctEl.textContent = "2%";
+  try {
+    await API.send("/api/update/download", "POST",
+      { url: UPD.url, version: UPD.target });
+  } catch (e) {
+    st.className = "dir-status bad";
+    st.textContent = "✗ 启动更新失败：" + e.message;
+    box.hidden = true;
+    $("#updateRunBtn").disabled = false;
+    $("#updateCheckBtn").disabled = false;
+    return;
+  }
+  const render = (p) => {
+    const pct = Math.max(0, Math.min(100, p.percent || 0));
+    bar.style.width = pct + "%";
+    stageEl.textContent = p.detail || p.stage || "";
+    pctEl.textContent = pct + "%";
+    return p;
+  };
+  clearInterval(UPD.timer);
+  UPD.timer = setInterval(async () => {
+    let p = null;
+    try {
+      p = render(await API.get("/api/update/progress"));
+    } catch {
+      /* 服务重启中接口暂不可达，等下一轮 */
+      stageEl.textContent = "服务重启中…";
+    }
+    if (p && p.done) {
+      clearInterval(UPD.timer);
+      if (p.stage === "error") {
+        st.className = "dir-status bad";
+        st.textContent = "✗ " + (p.detail || "更新失败");
+        box.hidden = true;
+        $("#updateRunBtn").disabled = false;
+        $("#updateCheckBtn").disabled = false;
+        return;
+      }
+      // 替换完成、服务重启中：轮询 health 等新版本起来
+      stageEl.textContent = "服务重启中，等待新版本生效…";
+      bar.style.width = "100%";
+      pctEl.textContent = "100%";
+      const oldVer = (p.from_version || "").replace(/^v/, "");
+      const newVer = (p.to_version || UPD.target || "").replace(/^v/, "");
+      const deadline = Date.now() + 90000;
+      const healthTimer = setInterval(async () => {
+        try {
+          const h = await API.get("/api/health");
+          const v = (h.version || "").replace(/^v/, "");
+          if (v && v !== oldVer) {
+            clearInterval(healthTimer);
+            st.className = "dir-status ok";
+            st.textContent = `✓ 更新完成：v${oldVer} → v${v}`;
+            toast(`✓ 已更新到 v${v}`);
+            $("#updateRunBtn").hidden = true;
+            $("#updateRunBtn").disabled = false;
+            $("#updateCheckBtn").disabled = false;
+            loadVersion();
+            return;
+          }
+        } catch { /* 还没起来 */ }
+        if (Date.now() > deadline) {
+          clearInterval(healthTimer);
+          st.className = "dir-status bad";
+          st.textContent = `⚠ 文件已替换为 v${newVer}，但服务未在预期时间内恢复，` +
+            `请到应用中心重启「飞牛下载助手」`;
+          box.hidden = true;
+          $("#updateRunBtn").disabled = false;
+          $("#updateCheckBtn").disabled = false;
+        }
+      }, 2000);
+    }
+  }, 1000);
 });
 
 /* ---------------- init ---------------- */

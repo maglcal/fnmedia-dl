@@ -50,6 +50,20 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(r.json()["version"],
                          vfile.read_text(encoding="utf-8").strip())
 
+    def test_update_progress(self):
+        r = self.client.get("/api/update/progress")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIn("stage", body)
+        self.assertIn("percent", body)
+        self.assertIn("done", body)
+
+    def test_update_download_rejects_bad_url(self):
+        r = self.client.post("/api/update/download",
+                             json={"url": "https://evil.example.com/x.fpk"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("GitHub", r.json()["detail"])
+
     def test_update_check(self):
         from unittest import mock
         payload = {
