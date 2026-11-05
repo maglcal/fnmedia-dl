@@ -631,12 +631,13 @@ $("#updateRunBtn").addEventListener("click", async () => {
           if (v && v !== oldVer) {
             clearInterval(healthTimer);
             st.className = "dir-status ok";
-            st.textContent = `✓ 更新完成：v${oldVer} → v${v}`;
+            st.textContent = `✓ 更新完成：v${oldVer} → v${v}，页面即将自动刷新…`;
             toast(`✓ 已更新到 v${v}`);
             $("#updateRunBtn").hidden = true;
-            $("#updateRunBtn").disabled = false;
             $("#updateCheckBtn").disabled = false;
             loadVersion();
+            // 重载整页让新 UI/署名等页面改动生效（版本号新、页面旧的问题）
+            setTimeout(() => location.reload(), 1800);
             return;
           }
         } catch { /* 还没起来 */ }

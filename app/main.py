@@ -68,6 +68,16 @@ app = FastAPI(title="fnmedia-dl", version=VERSION)
 app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
 
 
+@app.middleware("http")
+async def _no_cache_ui(request, call_next):
+    """UI 页面/脚本/样式禁协商缓存：在线更新后 iframe 不吃旧页（版本号新、页面旧）。"""
+    resp = await call_next(request)
+    ct = resp.headers.get("content-type", "")
+    if any(t in ct for t in ("text/html", "javascript", "text/css")):
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 def _manager() -> DownloadManager:
     return DownloadManager(cfgmod.load())
 

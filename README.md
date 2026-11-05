@@ -100,7 +100,7 @@ amule 等重型组件，暂不支持派发。
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v    # 111 个用例，全程无网络
+python -m unittest discover -s tests -v    # 112 个用例，全程无网络
 ```
 
 覆盖：链接解析（magnet/thunder/ed2k/种子）、drive/v1 请求形状、云端登录链与

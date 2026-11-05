@@ -64,6 +64,16 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("GitHub", r.json()["detail"])
 
+    def test_ui_assets_no_cache(self):
+        """UI 页面/脚本禁协商缓存：在线更新后 iframe 不吃旧页。"""
+        for path in ("/", "/static/app.js", "/static/app.css"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200, path)
+            self.assertEqual(r.headers.get("cache-control"), "no-cache", path)
+        # API JSON 不受此策略影响（无该头）
+        r = self.client.get("/api/health")
+        self.assertNotEqual(r.headers.get("cache-control"), "no-cache")
+
     def test_update_check(self):
         from unittest import mock
         payload = {
