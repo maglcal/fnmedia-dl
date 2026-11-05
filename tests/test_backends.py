@@ -475,6 +475,33 @@ class TestThunderCloudFixes(unittest.TestCase):
         self.assertIn("人机令牌", msg)
         self.assertIn("不是短信验证码输错", msg)
 
+    def test_list_tasks_paginates_all_pages(self):
+        """任务列表自动翻页（0.1.12 用户实测「列表显示不全」）：
+        drive/v1 /tasks 按 page_token 分页，只拉首页会漏任务。"""
+        seen = []
+
+        def handler(request):
+            if request.url.path.endswith("/tasks"):
+                seen.append(str(request.url))
+                if not request.url.params.get("page_token", ""):
+                    return httpx.Response(200, json={
+                        "tasks": [{"id": "t1", "name": "a",
+                                   "params": {"target": "remote-1"}}],
+                        "next_page_token": "p2"})
+                return httpx.Response(200, json={
+                    "tasks": [{"id": "t2", "name": "b",
+                               "params": {"target": "remote-1"}}],
+                    "next_page_token": ""})
+            return httpx.Response(200, json={})
+
+        conf = self._conf()
+        conf["access_token"] = "at-1"
+        tc = ThunderCloud(_client(handler), conf)
+        tasks = tc.list_tasks()
+        self.assertEqual(len(tasks), 2)          # 两页合并，不漏任务
+        self.assertEqual(len(seen), 2)
+        self.assertIn("page_token=p2", seen[1])  # 第二页带翻页游标
+
     def test_error_semantics_standard(self):
         from backends.thunder_cloud import _is_error
         self.assertFalse(_is_error({}))

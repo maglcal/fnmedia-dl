@@ -139,11 +139,23 @@ class DriveCore:
     # ------------------------------------------------------------ 列表
 
     def list_tasks(self, space: str, *, active_only: bool = False) -> list[dict]:
+        """任务列表（自动翻页）：drive/v1 /tasks 按 page_token 分页，
+        只拉首页会漏任务。"""
         phases = ACTIVE_PHASES if active_only else ALL_PHASES
         filters = json.dumps({"phase": {"in": phases}})
-        data = self._request("GET", "/tasks",
-                             params={"space": space, "filters": filters})
-        return data.get("tasks", [])
+        out: list[dict] = []
+        page_token = ""
+        for _ in range(20):        # 安全上限，防异常响应导致死循环
+            params: dict = {"space": space, "filters": filters}
+            if page_token:
+                params["page_token"] = page_token
+            data = self._request("GET", "/tasks", params=params)
+            out.extend(data.get("tasks", []))
+            page_token = ((data.get("next_page_token")
+                           or data.get("nextPageToken") or "").strip())
+            if not page_token:
+                break
+        return out
 
     # ------------------------------------------------------------ 操作
 
