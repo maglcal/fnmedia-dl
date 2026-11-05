@@ -197,6 +197,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 }
 .about-list { margin: 10px 0 4px; padding-left: 20px; }
 .about-list li { margin: 6px 0; font-size: 13.5px; line-height: 1.7; }
+.about-list li.sign { list-style: none; margin-left: -20px; color: var(--muted); font-style: italic; }
 .about-list a { color: var(--primary); text-decoration: none; }
 .about-list a:hover { text-decoration: underline; }
 .tag {

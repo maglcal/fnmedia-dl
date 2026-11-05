@@ -108,7 +108,7 @@ python -m unittest discover -s tests -v    # 111 个用例，全程无网络
 
 ## License
 
-MIT
+MIT · Copyright (c) 2026 许诺
 
 ---
 

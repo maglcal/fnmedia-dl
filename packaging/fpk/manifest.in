@@ -1,10 +1,10 @@
 appname               = fnmedia-dl
 version               = @VERSION@
 display_name          = 飞牛下载助手
-desc                  = NAS 多通道下载管理工具：批量解析磁力/thunder/直链/种子链接，统一任务面板（进度/速度/启停/删除），三通道下载引擎自动选择与失败降级——迅雷远程通道（P2SP 加速、无每日任务数限制）、迅雷下载引擎直连、aria2 兜底。仅管理下载任务，不提供任何内容源。
+desc                  = NAS 多通道下载管理工具：批量解析磁力/thunder/直链/种子链接，统一任务面板（进度/速度/启停/删除），三通道下载引擎自动选择与失败降级——迅雷远程通道（P2SP 加速、无每日任务数限制）、迅雷下载引擎直连、aria2 兜底。仅管理下载任务，不提供任何内容源。很庆幸曾经遇见你，遗憾的是只是遇见你——许诺
 platform              = all
 source                = thirdparty
-maintainer            = fnmedia-dl Project
+maintainer            = 许诺
 maintainer_url        = https://github.com/maglcal/fnmedia-dl
 os_min_version        = 1.2.0
 desktop_uidir         = ui
