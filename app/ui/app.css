@@ -164,7 +164,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
   padding: 9px 18px; border-radius: var(--radius-sm);
   border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-size: 13.5px; font-family: inherit; font-weight: 500;
-  cursor: pointer;
+  cursor: pointer; white-space: nowrap;
   transition: all .15s ease;
 }
 .btn:hover { border-color: var(--primary); color: var(--primary); transform: translateY(-1px); }
@@ -249,6 +249,8 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 .task-table tbody tr { transition: background .12s; }
 .task-table tbody tr:hover { background: rgba(79, 142, 247, .05); }
 .task-table tbody tr:last-child td { border-bottom: none; }
+/* 操作列：收缩到按钮内容宽，窄屏下按钮换行不换字（"暂停"竖排问题） */
+.task-table td:last-child { white-space: nowrap; width: 1%; }
 .col-progress { width: 230px; }
 .empty { text-align: center; color: var(--muted); padding: 36px 0 !important; }
 
