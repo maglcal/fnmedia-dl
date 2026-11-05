@@ -389,6 +389,92 @@ class TestThunderCloudFixes(unittest.TestCase):
         self.assertEqual(init_body["meta"]["user_id"], "u1")
         self.assertIn("captcha_sign", init_body["meta"])
 
+    def test_captcha_refresh_without_userid_keeps_signed_meta(self):
+        """"登录后"刷人机令牌必须走签名 meta，
+        user_id 为空也不能退化成账号形态 meta——服务端按形态区分签发场景，
+        形态不对时照发 token 但 drive/v1 不认，陷入 error_code=9 循环
+        （0.1.9 用户实测「验证码无效（error_code=9）」的原因）。"""
+        seen = {}
+        state = {"n": 0}
+
+        def handler(request):
+            path = request.url.path
+            seen.setdefault(path, []).append(request)
+            if path.endswith("/drive/v1/resource/list"):
+                state["n"] += 1
+                if state["n"] == 1:
+                    return httpx.Response(200, json={"error_code": 9,
+                                                     "error": "captcha"})
+                return httpx.Response(200, json={
+                    "list": {"resources": [{"name": "movie", "file_size": 5}]}})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct-2"})
+            return httpx.Response(200, json={})
+
+        conf = self._conf()
+        conf.update({"access_token": "at-1", "refresh_token": "rt-1"})  # 无 user_id
+        tc = ThunderCloud(_client(handler), conf)
+        r = tc.parse("magnet:?xt=urn:btih:aa")
+        self.assertEqual(r.name, "movie")
+        meta = json.loads(seen["/v1/shield/captcha/init"][-1].content)["meta"]
+        self.assertEqual(
+            sorted(meta),
+            sorted(["client_version", "package_name", "user_id",
+                    "timestamp", "captcha_sign"]))
+        self.assertEqual(meta["user_id"], "")          # 空值也要带键
+        self.assertNotIn("phone_number", meta)          # 不许退化成账号形态
+        self.assertNotIn("username", meta)
+        self.assertNotIn("email", meta)
+
+    def test_core_login_stores_userid(self):
+        """v3 登录响应的 userID 是登录后刷人机令牌 meta 的首要来源。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/xluser.core.login/v3/login"):
+                return httpx.Response(200, json={"sessionID": "sess-1",
+                                                 "userID": "u-42"})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct-1"})
+            if path.endswith("/auth/signin/token"):
+                return httpx.Response(200, json={
+                    "token_type": "Bearer", "access_token": "at-1",
+                    "refresh_token": "rt-1"})
+            return httpx.Response(200, json={})
+
+        conf = self._conf()
+        tc = ThunderCloud(_client(handler), conf)
+        tc.login()
+        self.assertEqual(conf["user_id"], "u-42")
+
+    def test_apply_token_userid_fallback_sub(self):
+        """signin/token 的 user_id 缺失时退 sub，再退 v3 已存值。"""
+        conf = self._conf()
+        tc = ThunderCloud(_client(lambda r: httpx.Response(200, json={})), conf)
+        tc._apply_token({"access_token": "at", "sub": "sub-9"})
+        self.assertEqual(conf["user_id"], "sub-9")
+        tc._apply_token({"access_token": "at", "user_id": "u-2", "sub": "sub-9"})
+        self.assertEqual(conf["user_id"], "u-2")
+        tc._apply_token({"access_token": "at"})
+        self.assertEqual(conf["user_id"], "u-2")        # 保留已存值
+
+    def test_captcha_error9_final_message_distinguishes_sms(self):
+        """"验证码无效（error_code=9）"是人机令牌校验失败、不是短信码输错，
+        终局文案必须说清（0.1.9 用户被误导重输短信码）。"""
+        def handler(request):
+            if request.url.path.endswith("/drive/v1/resource/list"):
+                return httpx.Response(200, json={"error_code": 9,
+                                                 "error": "captcha"})
+            return httpx.Response(200, json={"captcha_token": "ct"})
+
+        conf = self._conf()
+        conf.update({"access_token": "at-1", "user_id": "u1"})
+        tc = ThunderCloud(_client(handler), conf)
+        with self.assertRaises(BackendError) as cm:
+            tc.parse("magnet:?xt=urn:btih:aa")
+        msg = str(cm.exception)
+        self.assertIn("人机令牌", msg)
+        self.assertIn("不是短信验证码输错", msg)
+
     def test_error_semantics_standard(self):
         from backends.thunder_cloud import _is_error
         self.assertFalse(_is_error({}))

@@ -132,7 +132,7 @@ class _CloudDrive(DriveCore):
         url = self.base_url + path
         # 人机令牌刷新的 action 是完整 URL 路径（含 /drive/v1 前缀）
         action = method + ":" + urlsplit(url).path
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 resp = self.client.request(method, url, params=params,
                                            json=json_body,
@@ -149,13 +149,19 @@ class _CloudDrive(DriveCore):
             if not _is_error(data):
                 return data
             err_code = _err_code(data)
-            if attempt == 0 and err_code in TOKEN_ERROR_CODES:
+            if attempt < 2 and err_code in TOKEN_ERROR_CODES:
                 self.backend._refresh_access_token()
                 continue
-            if attempt == 0 and err_code == CAPTCHA_ERROR_CODE:
-                self.backend._refresh_captcha_token(
+            if attempt < 2 and err_code == CAPTCHA_ERROR_CODE:
+                # 登录后刷新：user_id + captcha_sign 签名 meta；user_id 为空也不改 meta 形态
+                self.backend._refresh_captcha_at_login(
                     action, self.backend.conf.get("user_id", ""))
                 continue
+            if err_code == CAPTCHA_ERROR_CODE:
+                raise BackendError(
+                    "迅雷接口错误：人机令牌校验失败（error_code=9）——"
+                    "这不是短信验证码输错；请点「重新登录」重试，"
+                    "若仍失败请重新完成一次短信验证")
             raise BackendError(_err_text("迅雷接口错误", data))
         raise BackendError("迅雷接口错误：重试后仍失败")
 
@@ -283,22 +289,33 @@ class ThunderCloud(Backend):
         if not session_id:
             raise BackendError("迅雷登录失败：未返回 sessionID")
         self.conf["creditkey"] = data.get("creditkey", "")
+        # 登录响应 userID：登录后刷人机令牌 meta 的首要来源
+        if data.get("userID"):
+            self.conf["user_id"] = data["userID"]
         return session_id
 
-    def _refresh_captcha_token(self, action: str, user_id: str = "") -> str:
-        meta: dict[str, str] = {}
-        if user_id:
-            ts, sign = captcha_sign(self._device_id())
-            meta = {"client_version": CLIENT_VERSION, "package_name": PACKAGE_NAME,
-                    "user_id": user_id, "timestamp": ts, "captcha_sign": sign}
+    def _refresh_captcha_in_login(self, action: str, username: str) -> str:
+        """登录时刷新人机令牌：
+        meta 用账号形态（email / phone_number / username 三选一）。"""
+        if EMAIL_RE.match(username):
+            meta = {"email": username}
+        elif 11 <= len(username) <= 18:
+            meta = {"phone_number": username}
         else:
-            name = self.conf.get("login_name", "")
-            if EMAIL_RE.match(name):
-                meta = {"email": name}
-            elif 11 <= len(name) <= 18:
-                meta = {"phone_number": name}
-            else:
-                meta = {"username": name}
+            meta = {"username": username}
+        return self._captcha_init(action, meta)
+
+    def _refresh_captcha_at_login(self, action: str, user_id: str) -> str:
+        """登录后刷新人机令牌：
+        meta 固定签名形态。注意 user_id 即使为空也必须带键——服务端按
+        meta 形态区分签发场景，缺 user_id/captcha_sign 键会被当成「登录时」
+        场景签发，令牌对 drive/v1 无效（error_code=9 循环的原因）。"""
+        ts, sign = captcha_sign(self._device_id())
+        meta = {"client_version": CLIENT_VERSION, "package_name": PACKAGE_NAME,
+                "user_id": user_id or "", "timestamp": ts, "captcha_sign": sign}
+        return self._captcha_init(action, meta)
+
+    def _captcha_init(self, action: str, meta: dict) -> str:
         body = {
             "action": action,
             "captcha_token": self.conf.get("captcha_token", ""),
@@ -602,7 +619,7 @@ class ThunderCloud(Backend):
         if not username or not password:
             raise BackendError("未配置迅雷账号（手机号/密码），无法使用远程通道")
         session_id = self._core_login(username, password)
-        self._refresh_captcha_token("POST:/v1/auth/signin/token")
+        self._refresh_captcha_in_login("POST:/v1/auth/signin/token", username)
         body = {
             "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
             "provider": SIGN_PROVIDER, "signin_token": session_id,
@@ -627,7 +644,9 @@ class ThunderCloud(Backend):
         self.conf["access_token"] = data.get("access_token", "")
         self.conf["token_type"] = data.get("token_type") or "Bearer"
         self.conf["refresh_token"] = data.get("refresh_token") or self.conf.get("refresh_token", "")
-        self.conf["user_id"] = data.get("user_id") or self.conf.get("user_id", "")
+        # user_id 多来源：signin/token 的 user_id > sub > v3 登录已存的 userID
+        self.conf["user_id"] = (data.get("user_id") or data.get("sub")
+                                or self.conf.get("user_id", ""))
 
     def _refresh_access_token(self) -> None:
         refresh = self.conf.get("refresh_token") or ""
