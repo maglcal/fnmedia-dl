@@ -1,0 +1,18 @@
+[Unit]
+Description=fnmedia-dl 下载助手（多通道下载管理）
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=@ROOT@/app
+ExecStart=@ROOT@/.venv/bin/python serve.py
+KillMode=mixed
+TimeoutStopSec=25
+Restart=on-failure
+RestartSec=5
+UMask=0022
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

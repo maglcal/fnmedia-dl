@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+"""三通道适配器测试（httpx.MockTransport，全程无网络）。"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sys
+import unittest
+from pathlib import Path
+
+import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
+
+from backends.aria2 import Aria2                      # noqa: E402
+from backends.base import BackendError                 # noqa: E402
+from backends.drive_core import DriveCore, task_to_view  # noqa: E402
+from backends.thunder_cloud import (                   # noqa: E402
+    ALGORITHMS, CLIENT_ID, CLIENT_VERSION, PACKAGE_NAME, REVIEW_UA,
+    ThunderCloud, captcha_sign, device_sign)
+from backends.thunder_engine import ThunderEngine      # noqa: E402
+
+
+def _client(handler) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+# ---------------------------------------------------------------- aria2
+
+class TestAria2(unittest.TestCase):
+    def _mk(self, handler):
+        return Aria2(_client(handler), {"rpc_url": "http://aria2/jsonrpc", "secret": "s3"})
+
+    def _rpc_handler(self, store: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            method = body["method"]
+            params = body["params"]
+            # token 前缀应存在
+            self.assertEqual(params[0], "token:s3")
+            result = store.get(method)
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": body["id"], "result": result})
+        return handler
+
+    def test_add_and_list(self):
+        store = {
+            "aria2.addUri": "gid001",
+            "aria2.getVersion": {"version": "1.37.0"},
+            "aria2.tellActive": [{
+                "gid": "gid001", "status": "active",
+                "totalLength": "1000", "completedLength": "250",
+                "downloadSpeed": "100",
+                "files": [{"path": "/dl/a.iso", "uris": []}],
+            }],
+            "aria2.tellWaiting": [], "aria2.tellStopped": [],
+        }
+        a2 = self._mk(self._rpc_handler(store))
+        gid = a2.add("https://x/a.iso", directory="/dl")
+        self.assertEqual(gid, "gid001")
+        self.assertTrue(a2.status()["reachable"])
+        tasks = a2.list_tasks()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].name, "a.iso")
+        self.assertEqual(tasks[0].state, "running")
+        self.assertAlmostEqual(tasks[0].progress, 25.0)
+        self.assertEqual(tasks[0].speed, 100)
+
+    def test_error(self):
+        def handler(request):
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": "1",
+                "error": {"code": 1, "message": "bad"}})
+        a2 = self._mk(handler)
+        self.assertFalse(a2.status()["reachable"])
+        with self.assertRaises(BackendError):
+            a2.add("https://x/a.iso")
+
+
+# ---------------------------------------------------------------- drive core
+
+DRIVE_TASKS = [{
+    "id": "t1", "name": "demo", "phase": "PHASE_TYPE_RUNNING",
+    "file_size": "2000", "status_size": "500",
+    "params": {"url": "magnet:?xt=urn:btih:aa"},
+}]
+
+
+class TestDriveCore(unittest.TestCase):
+    def _mk(self, handler):
+        return DriveCore(_client(handler), "http://engine/drive/v1", lambda: {"h": "1"})
+
+    def test_parse_resource(self):
+        def handler(request):
+            self.assertEqual(request.url.path, "/drive/v1/resource/list")
+            body = json.loads(request.content)
+            self.assertEqual(body["urls"], "magnet:?xt=urn:btih:aa")
+            self.assertEqual(body["page_size"], 2000)
+            return httpx.Response(200, json={
+                "list": {"resources": [{
+                    "name": "demo.bin", "file_size": 123, "file_count": 2,
+                    "mime_type": "application/x-bittorrent", "file_id": "f1",
+                }]}})
+        core = self._mk(handler)
+        r = core.parse_resource("magnet:?xt=urn:btih:aa")
+        self.assertEqual(r.name, "demo.bin")
+        self.assertEqual(r.size, 123)
+        self.assertEqual(r.file_count, 2)
+
+    def test_create_task_body(self):
+        captured = {}
+
+        def handler(request):
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "new1"}})
+        core = self._mk(handler)
+        from backends.base import ParsedResource
+        res = ParsedResource(name="demo", size=10, file_count=1,
+                             mime_type="video/mp4", file_id="fid")
+        tid = core.create_task("https://x/a", res, "space-1",
+                               directory="/dl", parent_folder_id="pf1")
+        self.assertEqual(tid, "new1")
+        self.assertEqual(captured["type"], "user#download-url")
+        self.assertEqual(captured["space"], "space-1")
+        self.assertEqual(captured["params"]["target"], "space-1")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/dl")
+        self.assertEqual(captured["params"]["parent_folder_id"], "pf1")
+        self.assertEqual(captured["params"]["sub_file_index"], "--1,")
+        self.assertEqual(captured["file_size"], "10")
+
+    def test_set_phase_and_delete(self):
+        calls = []
+
+        def handler(request):
+            calls.append((request.method, str(request.url), request.content))
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        core.set_phase("sp", "user#download-url", "t9", "pause")
+        method, url, content = calls[0]
+        self.assertEqual(method, "PATCH")
+        body = json.loads(content)
+        self.assertEqual(json.loads(body["set_params"]["spec"]), {"phase": "pause"})
+        core.delete_task("sp", "t9")
+        self.assertEqual(calls[1][0], "DELETE")
+        self.assertIn("task_ids=t9", calls[1][1])
+
+    def test_task_to_view(self):
+        v = task_to_view("aria2-like", DRIVE_TASKS[0])
+        self.assertEqual(v.state, "running")
+        self.assertAlmostEqual(v.progress, 25.0)
+
+
+# ---------------------------------------------------------------- thunder engine
+
+PANEL_HTML = '<script>function uiauth(value){return "JWT-TOKEN-123";}</script>'
+
+
+class TestThunderEngine(unittest.TestCase):
+    def test_login_and_add(self):
+        seen = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("index.cgi/"):
+                return httpx.Response(200, text=PANEL_HTML)
+            seen.setdefault(path, []).append(request)
+            if path.endswith("/drive/v1/tasks"):
+                return httpx.Response(200, json={"tasks": [{
+                    "params": {"target": "dev-space"}}]})
+            if path.endswith("/drive/v1/resource/list"):
+                return httpx.Response(200, json={
+                    "list": {"resources": [{"name": "f", "file_size": 1}]}})
+            if path.endswith("/drive/v1/task") and request.method == "POST":
+                return httpx.Response(200, json={"task": {"id": "eng-1"}})
+            return httpx.Response(200, json={})
+
+        eng = ThunderEngine(_client(handler), {"base_url": "http://nas:2345"})
+        st = eng.status()
+        self.assertTrue(st["reachable"], st)
+        tid = eng.add("magnet:?xt=urn:btih:aa")
+        self.assertEqual(tid, "eng-1")
+        # pan-auth 头应携带从面板提取的 JWT
+        task_req = seen["/webman/3rdparty/pan-xunlei-com/index.cgi/drive/v1/task"][0]
+        self.assertEqual(task_req.headers.get("pan-auth"), "JWT-TOKEN-123")
+
+    def test_bad_panel(self):
+        def handler(request):
+            return httpx.Response(200, text="login page")
+        eng = ThunderEngine(_client(handler), {"base_url": "http://nas:2345"})
+        self.assertFalse(eng.status()["reachable"])
+
+
+# ---------------------------------------------------------------- thunder cloud
+
+class TestThunderCloudSign(unittest.TestCase):
+    def test_captcha_sign_chain(self):
+        ts, sign = captcha_sign("a" * 32)
+        self.assertTrue(sign.startswith("1."))
+        s = f"{CLIENT_ID}{CLIENT_VERSION}{PACKAGE_NAME}{'a' * 32}{ts}"
+        for algo in ALGORITHMS:
+            s = hashlib.md5((s + algo).encode()).hexdigest()
+        self.assertEqual(sign, "1." + s)
+
+    def test_device_sign(self):
+        ds = device_sign("b" * 32)
+        self.assertTrue(ds.startswith("div101." + "b" * 32))
+        inner = hashlib.sha1(f"{'b' * 32}{PACKAGE_NAME}4034a062aaa22f906fca4fefe9fb3a3021".encode())
+        # APP_ID="40", APP_KEY 拼接
+        self.assertEqual(len(ds), len("div101.") + 32 + 32)
+
+
+class TestThunderCloudFlow(unittest.TestCase):
+    def _conf(self):
+        return {"login_name": "13800000000", "password": "pw",
+                "device_id": "c" * 32, "target": "remote-1"}
+
+    def _handler(self, seen: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            path = request.url.path
+            seen.setdefault(url, []).append(request)
+            if path.endswith("/xluser.core.login/v3/login"):
+                return httpx.Response(200, json={"sessionID": "sess-1"})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct-1"})
+            if path.endswith("/auth/signin/token"):
+                return httpx.Response(200, json={
+                    "token_type": "Bearer", "access_token": "at-1",
+                    "refresh_token": "rt-1", "user_id": "u1"})
+            if path.endswith("/user/me"):
+                return httpx.Response(200, json={"user_id": "u1"})
+            if path.endswith("/drive/v1/tasks"):
+                return httpx.Response(200, json={"tasks": [{
+                    "params": {"target": "remote-1"}, "name": "runner"}]})
+            if path.endswith("/drive/v1/resource/list"):
+                return httpx.Response(200, json={
+                    "list": {"resources": [{"name": "movie", "file_size": 5}]}})
+            if path.endswith("/drive/v1/task") and request.method == "POST":
+                return httpx.Response(200, json={"task": {"id": "cloud-1"}})
+            return httpx.Response(200, json={})
+        return handler
+
+    def test_login_and_add(self):
+        seen = {}
+        saved = []
+        tc = ThunderCloud(_client(self._handler(seen)), self._conf(),
+                          persist=lambda c: saved.append(dict(c)))
+        self.assertTrue(tc.status()["reachable"])
+        tid = tc.add("magnet:?xt=urn:btih:aa")
+        self.assertEqual(tid, "cloud-1")
+        # 登录链依次发生
+        keys = list(seen)
+        self.assertIn("https://xluser-ssl.xunlei.com/xluser.core.login/v3/login", keys)
+        self.assertIn("https://xluser-ssl.xunlei.com/v1/shield/captcha/init", keys)
+        self.assertIn("https://xluser-ssl.xunlei.com/v1/auth/signin/token", keys)
+        # 业务请求带 Bearer + X-Captcha-Token
+        task_req = seen["https://api-pan.xunlei.com/drive/v1/task"][0]
+        self.assertEqual(task_req.headers["authorization"], "Bearer at-1")
+        self.assertEqual(task_req.headers["x-captcha-token"], "ct-1")
+        # 令牌已持久化
+        self.assertTrue(saved)
+        self.assertEqual(saved[-1]["access_token"], "at-1")
+
+    def test_token_refresh_on_error_code(self):
+        seen = {}
+        state = {"failed_once": False}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            path = request.url.path
+            seen.setdefault(url, []).append(request)
+            if path.endswith("/auth/signin/token"):
+                return httpx.Response(200, json={
+                    "token_type": "Bearer", "access_token": "at-1",
+                    "refresh_token": "rt-1", "user_id": "u1"})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct-1"})
+            if path.endswith("/xluser.core.login/v3/login"):
+                return httpx.Response(200, json={"sessionID": "sess-1"})
+            if path.endswith("/auth/token"):
+                return httpx.Response(200, json={
+                    "token_type": "Bearer", "access_token": "at-2",
+                    "refresh_token": "rt-2", "user_id": "u1"})
+            if path.endswith("/drive/v1/resource/list"):
+                if not state["failed_once"]:
+                    state["failed_once"] = True
+                    return httpx.Response(200, json={"error_code": 10, "error": "token expired"})
+                return httpx.Response(200, json={
+                    "list": {"resources": [{"name": "movie", "file_size": 5}]}})
+            return httpx.Response(200, json={})
+
+        conf = self._conf()
+        conf["access_token"] = "at-1"
+        conf["refresh_token"] = "rt-1"
+        tc = ThunderCloud(_client(handler), conf)
+        r = tc.parse("magnet:?xt=urn:btih:aa")
+        self.assertEqual(r.name, "movie")
+        self.assertIn("https://xluser-ssl.xunlei.com/v1/auth/token", seen)
+        self.assertEqual(conf["access_token"], "at-2")
+
+    def test_not_configured(self):
+        tc = ThunderCloud(_client(lambda r: httpx.Response(200, json={})), {})
+        st = tc.status()
+        self.assertFalse(st["configured"])
+        with self.assertRaises(BackendError):
+            tc.add("https://x/a")
+
+
+class TestThunderCloudFixes(unittest.TestCase):
+    """登录链修复回归（2026-11-05 用户实测登录失败）：
+    review_panel 透出验证数据、信用密钥一次性语义、
+    人机令牌刷新 action 全路径、错误判定、忽略代理环境变量。"""
+
+    def _conf(self):
+        return {"login_name": "13800000000", "password": "pw",
+                "device_id": "c" * 32, "target": "remote-1"}
+
+    def test_review_panel_gives_verify_data(self):
+        saved = []
+
+        def handler(request):
+            return httpx.Response(200, json={
+                "error": "review_panel", "reviewurl": "https://verify.x/step",
+                "creditkey": "ck-9"})
+
+        tc = ThunderCloud(_client(handler), self._conf(),
+                          persist=lambda c: saved.append(dict(c)))
+        st = tc.status()
+        self.assertFalse(st["reachable"])
+        self.assertIn("https://verify.x/step&deviceid=" + device_sign("c" * 32),
+                      st["detail"])
+        self.assertIn("creditkey=ck-9", st["detail"])
+        # 信任密钥自动保存，供完成验证后重试登录携带
+        self.assertEqual(saved[-1]["creditkey"], "ck-9")
+
+    def test_creditkey_sent_then_cleared(self):
+        seen = {}
+
+        def handler(request):
+            path = request.url.path
+            seen.setdefault(path, []).append(request)
+            if path.endswith("/xluser.core.login/v3/login"):
+                return httpx.Response(200, json={"sessionID": "sess-1"})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct-1"})
+            if path.endswith("/auth/signin/token"):
+                return httpx.Response(200, json={
+                    "token_type": "Bearer", "access_token": "at-1",
+                    "refresh_token": "rt-1", "user_id": "u1"})
+            return httpx.Response(200, json={})
+
+        conf = self._conf()
+        conf["creditkey"] = "ck-old"
+        tc = ThunderCloud(_client(handler), conf)
+        tc.login()
+        body = json.loads(seen["/xluser.core.login/v3/login"][0].content)
+        self.assertEqual(body["creditkey"], "ck-old")   # 重试登录时携带
+        self.assertEqual(conf["creditkey"], "")         # 成功后清空已消费密钥
+
+    def test_captcha_refresh_action_full_path(self):
+        seen = {}
+        state = {"n": 0}
+
+        def handler(request):
+            path = request.url.path
+            seen.setdefault(path, []).append(request)
+            if path.endswith("/drive/v1/resource/list"):
+                state["n"] += 1
+                if state["n"] == 1:
+                    return httpx.Response(200, json={"error_code": 9,
+                                                     "error": "captcha"})
+                return httpx.Response(200, json={
+                    "list": {"resources": [{"name": "movie", "file_size": 5}]}})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct-2"})
+            return httpx.Response(200, json={})
+
+        conf = self._conf()
+        conf.update({"access_token": "at-1", "refresh_token": "rt-1",
+                     "user_id": "u1"})
+        tc = ThunderCloud(_client(handler), conf)
+        r = tc.parse("magnet:?xt=urn:btih:aa")
+        self.assertEqual(r.name, "movie")
+        init_body = json.loads(seen["/v1/shield/captcha/init"][-1].content)
+        # action 必须是完整 URL 路径（含 /drive/v1 前缀）
+        self.assertEqual(init_body["action"], "POST:/drive/v1/resource/list")
+        # 登录后刷新走 user_id + captcha_sign 签名元数据
+        self.assertEqual(init_body["meta"]["user_id"], "u1")
+        self.assertIn("captcha_sign", init_body["meta"])
+
+    def test_error_semantics_standard(self):
+        from backends.thunder_cloud import _is_error
+        self.assertFalse(_is_error({}))
+        self.assertFalse(_is_error({"error": "success", "error_code": 0}))
+        self.assertTrue(_is_error({"error_code": 10}))
+        self.assertTrue(_is_error({"error_description": "bad"}))
+
+    def test_real_login_error_shape(self):
+        """真实登录错误（2026-11-05 探针实录）：errorCode 是字符串、
+        errorDesc 是中文文案——错误识别与展示都必须对得上。"""
+        from backends.thunder_cloud import _err_code, _err_text, _is_error
+        data = {"error": "userinfo_expired", "errorCode": "13",
+                "errorDesc": "身份信息已失效，请重新输入帐号密码[13]",
+                "error_description": "Login info expired. Please log in again"}
+
+        def handler(request):
+            return httpx.Response(200, json=data)
+
+        self.assertTrue(_is_error(data))
+        self.assertEqual(_err_code(data), 13)
+        text = _err_text("迅雷登录失败", data)
+        self.assertIn("身份信息已失效", text)      # 中文文案优先
+        self.assertIn("error_code=13", text)
+        tc = ThunderCloud(_client(handler), self._conf())
+        st = tc.status()
+        self.assertFalse(st["reachable"])
+        self.assertIn("身份信息已失效", st["detail"])
+
+    def test_manager_client_ignores_proxy_env(self):
+        import downloader
+        mgr = downloader.DownloadManager({})
+        self.assertFalse(mgr.client.trust_env)
+
+
+class TestReviewSms(unittest.TestCase):
+    """风控短信验证（review_panel）：面板内直调 sendsms/checksms。
+    背景（2026-11-05 用户实测）：reviewurl 是迅雷 App 内嵌页
+    ，独立浏览器打开白屏，只能走接口完成验证。"""
+
+    REVIEW_URL = ("https://i.xunlei.com/xlcaptcha/verify.html"
+                  "?smsEvent=34&creditkey=ck-1&mobile=189%2A%2A%2A%2A0690"
+                  "&event=login3&appid=40"
+                  "&appName=ANDROID-com.xunlei.downloadprovider"
+                  "&clientVersion=8.31.0.9726&userID=u-7&deviceid=div101.abc")
+
+    def _conf(self):
+        return {"login_name": "13800000000", "password": "pw",
+                "device_id": "c" * 32, "target": "remote-1",
+                "creditkey": "ck-1", "review_url": self.REVIEW_URL}
+
+    def test_review_state_masks_mobile(self):
+        tc = ThunderCloud(_client(lambda r: httpx.Response(200, json={})),
+                          self._conf())
+        st = tc.review_state()
+        self.assertTrue(st["active"])
+        self.assertEqual(st["mobile"], "189****0690")   # parse_qs 解码 %2A
+        self.assertEqual(st["creditkey"], "ck-1")       # 供 UI 自动填入表单
+        idle = ThunderCloud(_client(lambda r: httpx.Response(200, json={})),
+                            {"login_name": "x"})
+        self.assertFalse(idle.review_state()["active"])
+
+    @staticmethod
+    def _params(request) -> dict:
+        """sendsms/上报是 GET+JSONP：参数在查询串。"""
+        return dict(request.url.params)
+
+    @staticmethod
+    def _form(request) -> dict:
+        """checksms 是 multipart 表单 POST：解析 name="k" 后的表单值。"""
+        text = request.content.decode("utf-8", "replace")
+        return {m.group(1): m.group(2)
+                for m in re.finditer(r'name="([^"]+)"\r\n\r\n(.*?)\r\n--',
+                                     text, re.S)}
+
+    def test_send_sms_get_jsonp_shape_and_token(self):
+        """传输形状：sendsms 走 GET+JSONP+csrf_token，
+        浏览器 UA；URL 的 deviceid 改名 devicesign（原 deviceid 不再发送）。"""
+        seen = {}
+
+        def handler(request):
+            seen["request"] = request
+            return httpx.Response(200, json={"errorCode": "0", "token": "sms-tok"})
+
+        conf = self._conf()
+        tc = ThunderCloud(_client(handler), conf)
+        r = tc.review_send_sms()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["mobile"], "189****0690")
+        self.assertEqual(conf["review_token"], "sms-tok")
+        req = seen["request"]
+        self.assertEqual(req.method, "GET")
+        self.assertEqual(req.url.path, "/xluser.core.login/v3/sendsms")
+        self.assertEqual(req.headers["user-agent"], REVIEW_UA)   # 网页同形 UA
+        p = self._params(req)
+        self.assertEqual(p["smsEvent"], "34")
+        self.assertEqual(p["creditkey"], "ck-1")
+        self.assertEqual(p["appid"], "40")
+        self.assertEqual(p["userID"], "u-7")
+        self.assertEqual(p["devicesign"], "div101.abc")   # URL 的 deviceid 改名
+        self.assertNotIn("deviceid", p)                    # 原 deviceid 不再发送
+        self.assertEqual(p["csrf_token"], hashlib.md5(b"c" * 32).hexdigest())
+
+    def test_send_sms_jsonp_wrapper_and_cookie_channel(self):
+        """结果双通道：JSONP 包裹体（callback({...})）与纯 Set-Cookie 都能读。"""
+        def handler(request):
+            return httpx.Response(
+                200, content=b'cb({"errorCode":"0","token":"t-jsonp"})',
+                headers={"content-type": "text/javascript"})
+
+        conf = self._conf()
+        tc = ThunderCloud(_client(handler), conf)
+        self.assertEqual(conf.get("review_token", ""), "")
+        r = tc.review_send_sms()
+        self.assertTrue(r["ok"])
+        self.assertEqual(conf["review_token"], "t-jsonp")
+
+        def cookie_only(request):
+            return httpx.Response(200, text="not-json", headers=[
+                ("set-cookie", "errorCode=0; path=/"),
+                ("set-cookie", "token=t-cookie; path=/"),
+                ("set-cookie", "creditkey=ck-new; path=/"),
+            ])
+
+        conf2 = self._conf()
+        tc2 = ThunderCloud(_client(cookie_only), conf2)
+        r2 = tc2.review_send_sms()
+        self.assertTrue(r2["ok"])
+        self.assertEqual(conf2["review_token"], "t-cookie")
+        self.assertEqual(conf2["review_key"], "ck-new")   # 页面续期
+
+    def test_send_sms_error_shape(self):
+        """真实错误形状（探针实录）：errorCode 字符串键 + 中文 errorDesc 优先。"""
+        def handler(request):
+            return httpx.Response(200, json={
+                "error": "too_many_request", "errorCode": "1002",
+                "errorDesc": "请求过于频繁，请稍后再试[1002]",
+                "error_description": "Too many requests"})
+
+        tc = ThunderCloud(_client(handler), self._conf())
+        with self.assertRaises(BackendError) as ctx:
+            tc.review_send_sms()
+        self.assertIn("请求过于频繁", str(ctx.exception))
+
+    def test_send_sms_prefers_url_creditkey(self):
+        """sendsms/checksms 发验证链接里的 creditkey（URL 参数为准）；顶层 creditkey 是登录重试用的，
+        两者可能不是同一个值，不能拿顶层值覆盖。"""
+        seen = {}
+
+        def handler(request):
+            seen["request"] = request
+            return httpx.Response(200, json={"errorCode": "0", "token": "t"})
+
+        conf = self._conf()
+        conf["creditkey"] = "ck-conf"      # 与验证链接里的 ck-1 不同
+        tc = ThunderCloud(_client(handler), conf)
+        tc.review_send_sms()
+        self.assertEqual(self._params(seen["request"])["creditkey"], "ck-1")
+
+    def test_send_sms_expired_renews_key_then_retries(self):
+        """13 且响应续期了 creditkey：换新键原地重试（页面行为），
+        无需重登。"""
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if request.url.path.endswith("/sendsms"):
+                if not any(c.url.path.endswith("/sendsms") for c in calls[:-1]):
+                    return httpx.Response(200, json={
+                        "error": "userinfo_expired", "errorCode": "13",
+                        "creditkey": "ck-renew"})
+                return httpx.Response(200, json={"errorCode": "0", "token": "t2"})
+            return httpx.Response(200, json={"error": "review_panel",
+                                             "reviewurl": "https://i.xunlei.com/x",
+                                             "creditkey": "x"})
+
+        tc = ThunderCloud(_client(handler), self._conf())
+        r = tc.review_send_sms()
+        self.assertTrue(r["ok"])                       # 一次点击出结果
+        keys = [self._params(c)["creditkey"]
+                for c in calls if c.url.path.endswith("/sendsms")]
+        self.assertEqual(keys, ["ck-1", "ck-renew"])   # 重试换续期后的键
+        self.assertFalse(any(c.url.path.endswith("/v3/login") for c in calls))
+
+    def test_send_sms_expired_retries_after_refresh(self):
+        """13 无续期键：自动重登刷新验证会话后原地重试成功
+       （用户实测 2026-11-05：点获取验证码报 13）。"""
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if request.url.path.endswith("/sendsms"):
+                if not any(c.url.path.endswith("/sendsms") for c in calls[:-1]):
+                    return httpx.Response(200, json={
+                        "error": "userinfo_expired", "errorCode": "13",
+                        "errorDesc": "身份信息已失效，请重新输入帐号密码[13]"})
+                return httpx.Response(200, json={"errorCode": "0", "token": "sms-tok"})
+            return httpx.Response(200, json={
+                "error": "review_panel",
+                "reviewurl": ("https://i.xunlei.com/x?creditkey=ck-new"
+                              "&mobile=189%2A%2A%2A%2A0690&appid=40"
+                              "&appName=a&userID=u-7&deviceid=div101.z"),
+                "creditkey": "ck-top-new"})
+
+        conf = self._conf()
+        tc = ThunderCloud(_client(handler), conf)
+        r = tc.review_send_sms()
+        self.assertTrue(r["ok"])                                  # 一次点击出结果
+        self.assertEqual(conf["review_token"], "sms-tok")
+        self.assertIn("creditkey=ck-new", conf["review_url"])      # 会话已刷新
+        self.assertEqual(conf["creditkey"], "ck-top-new")
+        keys = [self._params(c)["creditkey"]
+                for c in calls if c.url.path.endswith("/sendsms")]
+        self.assertEqual(keys, ["ck-1", "ck-new"])   # 重试用新会话的键
+
+    def test_send_sms_expired_still_rejected(self):
+        """刷新后的新会话仍被拒：明确报「仍被迅雷拒绝」（协议/风控问题）。"""
+        def handler(request):
+            if request.url.path.endswith("/sendsms"):
+                return httpx.Response(200, json={
+                    "error": "userinfo_expired", "errorCode": "13",
+                    "errorDesc": "身份信息已失效，请重新输入帐号密码[13]"})
+            return httpx.Response(200, json={
+                "error": "review_panel",
+                "reviewurl": ("https://i.xunlei.com/x?creditkey=ck-new"
+                              "&appid=40&appName=a&deviceid=div101.z"),
+                "creditkey": "ck-top-new"})
+
+        conf = self._conf()
+        tc = ThunderCloud(_client(handler), conf)
+        with self.assertRaises(BackendError) as ctx:
+            tc.review_send_sms()
+        self.assertIn("仍被迅雷拒绝", str(ctx.exception))
+        self.assertIn("creditkey=ck-new", conf["review_url"])   # 刷新确实发生了
+
+    def test_check_sms_expired_refreshes_then_prompts_new_code(self):
+        """check 遇 13：自动刷新会话并提示重新获取短信（短信令牌随旧会话失效）。"""
+        def handler(request):
+            if request.url.path.endswith("/v3/checksms"):
+                return httpx.Response(200, json={
+                    "error": "userinfo_expired", "errorCode": "13",
+                    "errorDesc": "身份信息已失效，请重新输入帐号密码[13]"})
+            return httpx.Response(200, json={
+                "error": "review_panel",
+                "reviewurl": ("https://i.xunlei.com/x?creditkey=ck-new"
+                              "&appid=40&appName=a&userID=u-7&deviceid=div101.z"),
+                "creditkey": "ck-top-new"})
+
+        conf = self._conf()
+        conf["review_token"] = "sms-tok"
+        tc = ThunderCloud(_client(handler), conf)
+        with self.assertRaises(BackendError) as ctx:
+            tc.review_check_sms("123456")
+        self.assertIn("已自动刷新", str(ctx.exception))
+        self.assertIn("获取验证码", str(ctx.exception))
+        self.assertIn("creditkey=ck-new", conf["review_url"])
+
+    def test_check_sms_cookie_error_name_triggers_recovery(self):
+        """checksms 结果只在 Set-Cookie：error cookie 给的是错误名
+        （userinfo_expired）而非数字码，也要触发会话恢复。"""
+        def handler(request):
+            if request.url.path.endswith("/v3/checksms"):
+                return httpx.Response(200, text="err", headers=[
+                    ("set-cookie", "error=userinfo_expired; path=/"),
+                    ("set-cookie", "blogresult=13; path=/"),
+                ])
+            return httpx.Response(200, json={
+                "error": "review_panel",
+                "reviewurl": ("https://i.xunlei.com/x?creditkey=ck-new"
+                              "&appid=40&appName=a&userID=u-7&deviceid=div101.z"),
+                "creditkey": "ck-top-new"})
+
+        conf = self._conf()
+        conf["review_token"] = "sms-tok"
+        tc = ThunderCloud(_client(handler), conf)
+        with self.assertRaises(BackendError) as ctx:
+            tc.review_check_sms("123456")
+        self.assertIn("已自动刷新", str(ctx.exception))
+        self.assertIn("creditkey=ck-new", conf["review_url"])
+
+    def test_check_sms_multipart_then_report_renews_creditkey(self):
+        """checksms 走 multipart 表单 POST（跨域表单），成功后上报 /credit/v1/report，响应 code=200 的续期密钥优先。"""
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            if "/v3/checksms" in request.url.path:
+                return httpx.Response(200, json={
+                    "blogresult": "0", "creditkey": "ck-2", "securitytoken": "st"})
+            return httpx.Response(200, json={"code": 200, "creditkey": "ck-3"})
+
+        conf = self._conf()
+        conf["review_token"] = "sms-tok"
+        saved = []
+        tc = ThunderCloud(_client(handler), conf, persist=lambda c: saved.append(dict(c)))
+        r = tc.review_check_sms("123456")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["creditkey"], "ck-3")     # 上报续期值优先
+        self.assertEqual(conf["creditkey"], "ck-3")   # 续期信任密钥
+        self.assertEqual(conf["review_url"], "")      # 清掉待验证标记
+        self.assertFalse(tc.review_state()["active"])
+        self.assertEqual(saved[-1]["creditkey"], "ck-3")
+        checksms = [q for q in seen if "/v3/checksms" in q.url.path][0]
+        self.assertEqual(checksms.method, "POST")
+        self.assertTrue(checksms.headers["content-type"]
+                        .startswith("multipart/form-data"))
+        form = self._form(checksms)
+        self.assertEqual(form["token"], "sms-tok")
+        self.assertEqual(form["smsCode"], "123456")
+        self.assertEqual(form["creditkey"], "ck-1")
+        report = [q for q in seen if "/credit/v1/report" in q.url.path][0]
+        self.assertEqual(report.method, "GET")
+        rp = self._params(report)
+        self.assertEqual(rp["type"], "sms")
+        self.assertEqual(rp["scene"], "34")
+        self.assertEqual(rp["data"], "st")
+        self.assertEqual(rp["csrf_token"], hashlib.md5(b"c" * 32).hexdigest())
+
+    def test_check_sms_cookie_channel_success(self):
+        """checksms 成功结果（blogresult/securitytoken/creditkey）可能只在
+        Set-Cookie 里（跨域 iframe 页面读不到响应体），cookie 通道要能读到。"""
+        def handler(request):
+            return httpx.Response(200, text="not-json", headers=[
+                ("set-cookie", "blogresult=0; path=/"),
+                ("set-cookie", "securitytoken=st9; path=/"),
+                ("set-cookie", "creditkey=ck-c; path=/"),
+                ("set-cookie", "error=; path=/"),   # 删除型，不留在罐里
+            ])
+
+        conf = self._conf()
+        conf["review_token"] = "sms-tok"
+        tc = ThunderCloud(_client(handler), conf)
+        r = tc.review_check_sms("123456")
+        self.assertTrue(r["ok"])
+        self.assertEqual(conf["creditkey"], "ck-c")   # 无上报续期时用响应里的
+        self.assertNotIn("blogresult", conf.get("review_cookies", {}))
+        self.assertNotIn("error", conf.get("review_cookies", {}))
+
+    def test_check_sms_rejects_bad_code(self):
+        def handler(request):
+            return httpx.Response(200, json={
+                "error": "invalid_sms_code", "errorCode": "1002",
+                "errorDesc": "验证码错误"})
+
+        conf = self._conf()
+        conf["review_token"] = "sms-tok"
+        tc = ThunderCloud(_client(handler), conf)
+        with self.assertRaises(BackendError):
+            tc.review_check_sms("000000")
+        self.assertTrue(tc.review_state()["active"])  # 失败保持待验证
+
+    def test_requires_review_state(self):
+        tc = ThunderCloud(_client(lambda r: httpx.Response(200, json={})),
+                          {"login_name": "x"})
+        with self.assertRaises(BackendError):
+            tc.review_send_sms()
+        with self.assertRaises(BackendError):
+            tc.review_check_sms("123456")
+
+    def test_login_success_clears_review(self):
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/v3/login"):
+                return httpx.Response(200, json={"sessionID": "s"})
+            if path.endswith("/shield/captcha/init"):
+                return httpx.Response(200, json={"captcha_token": "ct"})
+            return httpx.Response(200, json={
+                "token_type": "Bearer", "access_token": "at",
+                "refresh_token": "rt", "user_id": "u"})
+
+        conf = self._conf()
+        conf["review_token"] = "sms-tok"
+        conf["review_key"] = "ck-x"
+        conf["review_cookies"] = {"token": "t"}
+        tc = ThunderCloud(_client(handler), conf)
+        tc.login()
+        self.assertEqual(conf["review_url"], "")
+        self.assertEqual(conf["review_token"], "")
+        self.assertEqual(conf["creditkey"], "")
+        self.assertEqual(conf["review_key"], "")
+        self.assertEqual(conf["review_cookies"], {})
+
+
+if __name__ == "__main__":
+    unittest.main()

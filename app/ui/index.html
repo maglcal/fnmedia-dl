@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞牛下载助手</title>
+<script>
+/* 挂载前缀自适应：桌面 iframe 挂在 /app/fnmedia-dl/ 下，开发模式挂 / 。
+   设置 <base> 后所有相对路径（static/、api/）自动解析到正确前缀。 */
+(function () {
+  var p = location.pathname;
+  var dir = p.endsWith("/") ? p : p + "/";
+  document.write('<base href="' + dir + '">');
+})();
+</script>
+<link rel="icon" type="image/png" href="static/favicon.png">
+<link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <img class="brand-icon" src="static/icon.png" alt="">
+    <div>
+      <h1>飞牛下载助手 <span class="badge ver" id="appVersion">v…</span></h1>
+      <span class="sub">多通道下载 · 链接解析 · 任务管理</span>
+    </div>
+  </div>
+  <div id="backendChips" class="chips"></div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="add">新建下载</button>
+  <button class="tab" data-tab="tasks">任务列表</button>
+  <button class="tab" data-tab="settings">通道设置</button>
+  <button class="tab" data-tab="about">关于</button>
+</nav>
+
+<main>
+  <!-- ============ 新建下载 ============ -->
+  <section id="tab-add" class="panel active">
+    <div class="card">
+      <div class="card-head">
+        <h2>粘贴下载链接</h2>
+        <span class="hint">每行一条，也可混排逗号分隔</span>
+      </div>
+      <textarea id="linkInput" rows="7" spellcheck="false"
+        placeholder="magnet:?xt=urn:btih:…&#10;thunder://…&#10;https://example.com/file.iso"></textarea>
+      <div class="kind-legend">
+        <span class="kind magnet">magnet</span>
+        <span class="kind thunder">thunder</span>
+        <span class="kind http">http(s) / ftp</span>
+        <span class="kind torrent">.torrent</span>
+        <span class="kind ed2k">ed2k 仅解析</span>
+      </div>
+      <div class="actions">
+        <button id="btnParse" class="btn ghost">解析链接</button>
+        <button id="btnDispatch" class="btn primary">开始下载</button>
+      </div>
+    </div>
+
+    <div class="card" id="parseCard" hidden>
+      <div class="card-head">
+        <h2>解析结果</h2>
+        <span id="parseCount" class="badge"></span>
+      </div>
+      <ul id="parseList" class="link-list"></ul>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>派发选项</h2></div>
+      <div class="form-grid">
+        <label>下载通道
+          <select id="backendSelect">
+            <option value="auto">自动（迅雷远程 → 迅雷引擎 → aria2）</option>
+            <option value="thunder_cloud">迅雷远程通道（P2SP 加速）</option>
+            <option value="thunder_engine">迅雷下载引擎（本地直连）</option>
+            <option value="aria2">aria2</option>
+          </select>
+        </label>
+        <label>保存目录<span class="opt">留空用各引擎默认</span>
+          <input id="dirInput" type="text" placeholder="/vol1/downloads">
+        </label>
+      </div>
+    </div>
+
+    <div class="card" id="dispatchCard" hidden>
+      <div class="card-head"><h2>派发结果</h2></div>
+      <ul id="dispatchList" class="link-list"></ul>
+    </div>
+  </section>
+
+  <!-- ============ 任务列表 ============ -->
+  <section id="tab-tasks" class="panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>下载任务</h2>
+        <div class="row-inline">
+          <label class="check"><input type="checkbox" id="autoRefresh" checked><span>自动刷新</span></label>
+          <button id="btnRefresh" class="btn ghost">刷新</button>
+        </div>
+      </div>
+      <div id="taskError" class="error" hidden></div>
+      <div class="table-wrap">
+        <table class="task-table">
+          <thead>
+            <tr><th>任务</th><th>通道</th><th>状态</th><th class="col-progress">进度</th><th>速度</th><th>操作</th></tr>
+          </thead>
+          <tbody id="taskBody">
+            <tr><td colspan="6" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 通道设置 ============ -->
+  <section id="tab-settings" class="panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>通道优先级</h2>
+        <span class="hint">auto 派发的降级顺序</span>
+      </div>
+      <div id="orderBox" class="order-box"></div>
+      <label class="block">默认保存目录
+        <input id="defaultDir" type="text" placeholder="留空则用各引擎默认">
+      </label>
+      <div class="row-inline dir-tools">
+        <button id="btnFillShare" class="btn ghost">填入应用共享目录</button>
+        <button id="btnCheckDir" class="btn ghost">检测目录</button>
+      </div>
+      <div id="dirStatus" class="dir-status" hidden></div>
+      <div class="auth-box">
+        <p class="hint">下载文件由下载引擎写入。留空 = 引擎默认目录（推荐先这样跑通）。
+          自定义 NAS 目录需引擎可写；如需本应用做目录检测，请到
+          <b>应用中心 → 飞牛下载助手 → 应用设置 → 授权目录</b> 授予读写权限。</p>
+        <p class="hint">已授权目录：<span id="authPaths">加载中…</span></p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>迅雷远程通道</h2>
+        <span class="tag recommend">推荐 · 无每日任务数限制</span>
+      </div>
+      <p class="hint">使用迅雷账号登录云端，任务下发到账号绑定的远程设备执行（P2SP 加速）。凭据仅保存在本机。</p>
+      <div class="form-grid">
+        <label>迅雷账号（手机号）
+          <input id="tcLogin" type="text" autocomplete="off">
+        </label>
+        <label>密码
+          <input id="tcPassword" type="password" autocomplete="new-password">
+        </label>
+        <label>信任密钥<span class="opt">风控验证时自动填入，可留空</span>
+          <input id="tcCreditKey" type="text" autocomplete="off">
+        </label>
+        <label>远程设备 target<span class="opt">留空自动发现</span>
+          <input id="tcTarget" type="text">
+        </label>
+        <label>保存目录
+          <input id="tcDir" type="text">
+        </label>
+      </div>
+      <div id="tcReviewBox" class="auth-box" hidden>
+        <p class="hint"><b>短信验证</b>（登录触发迅雷风控时出现）
+          <span id="tcReviewMobile"></span></p>
+        <div class="row-inline dir-tools">
+          <input id="tcSmsCode" type="text" placeholder="6 位短信验证码"
+                 maxlength="6" autocomplete="off" style="max-width:180px">
+          <button class="btn ghost" id="tcSmsSend">获取验证码</button>
+          <button class="btn ghost" id="tcSmsCheck">提交验证</button>
+        </div>
+        <div id="tcReviewStatus" class="dir-status" hidden></div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" data-test="thunder_cloud">测试连接</button>
+        <button class="btn ghost" id="tcLoginBtn">重新登录</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>迅雷下载引擎</h2>
+        <span class="tag warn">受每日配额限制</span>
+      </div>
+      <p class="hint">直连 NAS 上的迅雷下载引擎 web 面板，走套件端入口。</p>
+      <div class="form-grid">
+        <label>引擎面板地址
+          <input id="teUrl" type="text" placeholder="http://127.0.0.1:2345">
+        </label>
+        <label>保存目录
+          <input id="teDir" type="text">
+        </label>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" data-test="thunder_engine">测试连接</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>aria2</h2>
+        <span class="tag">通用兜底 · 无任务数限制</span>
+      </div>
+      <p class="hint">需本机或局域网内运行 aria2 并开启 RPC。</p>
+      <div class="form-grid">
+        <label>RPC 地址
+          <input id="a2Url" type="text" placeholder="http://127.0.0.1:6800/jsonrpc">
+        </label>
+        <label>RPC 密钥
+          <input id="a2Secret" type="text" autocomplete="off">
+        </label>
+        <label>保存目录
+          <input id="a2Dir" type="text">
+        </label>
+      </div>
+      <div class="actions">
+        <button class="btn ghost" data-test="aria2">测试连接</button>
+      </div>
+    </div>
+
+    <div class="actions save-bar">
+      <button id="btnSaveCfg" class="btn primary lg">保存全部设置</button>
+      <span id="cfgMsg" class="msg"></span>
+    </div>
+  </section>
+
+  <!-- ============ 关于 ============ -->
+  <section id="tab-about" class="panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>关于 飞牛下载助手</h2>
+        <span class="badge ver" id="aboutVersion">v…</span>
+      </div>
+      <p class="hint">fnmedia-dl —— 飞牛 OS 第三方下载插件。磁力 / thunder /
+        直链 / 种子一站式解析派发，支持迅雷远程（P2SP 加速）、迅雷下载引擎、
+        aria2 三通道，自动降级、任务统一管理。</p>
+      <ul class="about-list">
+        <li>软件版本：<b id="aboutVersionText">加载中…</b></li>
+        <li>项目主页：<a href="https://github.com/maglcal/fnmedia-dl"
+            target="_blank" rel="noreferrer">github.com/maglcal/fnmedia-dl</a></li>
+        <li>数据与凭据仅保存在本机，不上传任何第三方服务器。</li>
+        <li>本插件为个人自用的第三方实现，与迅雷官方无关。</li>
+      </ul>
+      <div class="actions">
+        <button class="btn" id="updateCheckBtn">检查更新</button>
+        <a class="btn ghost" href="https://github.com/maglcal/fnmedia-dl/releases"
+           target="_blank" rel="noreferrer">全部版本</a>
+      </div>
+      <div id="updateStatus" class="dir-status" hidden></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="static/app.js"></script>
+</body>
+</html>

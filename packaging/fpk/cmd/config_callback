@@ -1,0 +1,5 @@
+#!/bin/bash
+# 配置流程（授权目录等）变更后：把最新的 TRIM_DATA_ACCESSIBLE_PATHS 同步给应用。
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+fndl_sync_paths
+exit 0

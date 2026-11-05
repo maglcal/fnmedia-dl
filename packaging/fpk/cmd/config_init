@@ -1,0 +1,5 @@
+#!/bin/bash
+# 配置流程（授权目录等）变更前：同步路径清单（此阶段拿到的是旧值，callback 会覆盖为新值）。
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+fndl_sync_paths
+exit 0

@@ -1,0 +1,37 @@
+#!/bin/bash
+# fnmedia-dl 应用中心生命周期脚本的共享辅助（被 source）。
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FNDL_APP_ROOT="$(cd "${SELF_DIR}/.." && pwd)"
+FNDL_REPO_DIR=""
+for _cand in "${TRIM_APPDEST:-}/repo" "${FNDL_APP_ROOT}/target/repo" "${FNDL_APP_ROOT}/repo"; do
+  if [ -n "${_cand}" ] && [ -f "${_cand}/deploy/install.sh" ]; then
+    FNDL_REPO_DIR="$(cd "${_cand}" && pwd)"; break
+  fi
+done
+unset _cand
+FNDL_LOG="${TRIM_PKGVAR:-/tmp}/fnmedia-dl-app.log"
+mkdir -p "$(dirname "${FNDL_LOG}")" 2>/dev/null || true
+fndl_fail() {
+  [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$1" > "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+  echo "[fnmedia-dl] $1" >&2; exit 1
+}
+# 把系统路径清单（共享目录 / 授权目录）同步给应用侧。
+# systemd 服务拿不到 TRIM_* 环境变量，故落盘 state/paths.env 供 Python 读取。
+# TRIM_DATA_ACCESSIBLE_PATHS 变更时 fnOS 会走 config 流程（config_init/config_callback）。
+fndl_sync_paths() {
+  [ -n "${FNDL_REPO_DIR}" ] || return 0
+  local _out="${FNDL_REPO_DIR}/state/paths.env" _pick="" _p
+  mkdir -p "${FNDL_REPO_DIR}/state" 2>/dev/null || true
+  # 优先选 downloads 共享（默认下载目录），否则取第一个共享
+  local _oldifs="$IFS"; IFS=':'
+  for _p in ${TRIM_DATA_SHARE_PATHS:-}; do
+    [ -z "${_p}" ] && continue
+    case "${_p}" in */downloads) _pick="${_p}"; break ;; esac
+    [ -z "${_pick}" ] && _pick="${_p}"
+  done
+  IFS="${_oldifs}"
+  {
+    echo "FNDL_SHARES_DIR=${_pick}"
+    echo "FNDL_ACCESSIBLE_PATHS=${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+  } > "${_out}.tmp" 2>/dev/null && mv -f "${_out}.tmp" "${_out}" 2>/dev/null || true
+}

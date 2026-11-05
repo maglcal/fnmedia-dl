@@ -1,0 +1,10 @@
+#!/bin/bash
+# 卸载：停服务；默认保留 state（下载任务记录与配置）。
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+[ -n "${FNDL_REPO_DIR}" ] && bash "${FNDL_REPO_DIR}/deploy/uninstall.sh" >> "${FNDL_LOG}" 2>&1 || {
+  systemctl stop fnmedia-dl.service 2>/dev/null || true
+  systemctl disable fnmedia-dl.service 2>/dev/null || true
+  rm -f /etc/systemd/system/fnmedia-dl.service
+  systemctl daemon-reload 2>/dev/null || true
+}
+exit 0

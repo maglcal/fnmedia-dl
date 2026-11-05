@@ -1,0 +1,32 @@
+#!/bin/bash
+# 升级落盘后：恢复 state，补齐 venv，重新渲染并启动服务。
+set -uo pipefail
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
+[ -n "${FNDL_REPO_DIR}" ] || fndl_fail "应用文件缺失（deploy/install.sh 不存在）"
+
+BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/fnmedia-dl-upgrade-backup"
+if [ -f "${BACKUP_DIR}/state.tar.gz" ]; then
+  tar -xzf "${BACKUP_DIR}/state.tar.gz" -C "${FNDL_REPO_DIR}" >> "${FNDL_LOG}" 2>&1 \
+    || fndl_fail "恢复配置/任务记录失败：${BACKUP_DIR}/state.tar.gz"
+fi
+
+cd "${FNDL_REPO_DIR}" || fndl_fail "无法进入应用目录"
+# 依赖：venv 缺失或核心包 import 失败时统一引导（离线 wheelhouse 优先、国内镜像兜底）。
+need_deps=1
+if [ -x ".venv/bin/python" ] && .venv/bin/python -c 'import fastapi,uvicorn,httpx' >/dev/null 2>&1; then
+  need_deps=0
+fi
+if [ "$need_deps" = "1" ]; then
+  bash deploy/bootstrap_deps.sh || {
+    tail -n 14 "${FNDL_LOG}" >&2 2>/dev/null || true
+    fndl_fail "Python 运行环境准备失败（已尝试内置离线包与多个国内镜像），详见 ${FNDL_LOG}"
+  }
+fi
+bash deploy/install.sh >> "${FNDL_LOG}" 2>&1 || {
+  tail -n 12 "${FNDL_LOG}" >&2 || true
+  fndl_fail "升级后服务启动失败，详见 ${FNDL_LOG}"
+}
+rm -rf "${BACKUP_DIR}"
+# 同步共享目录/授权目录清单给应用（默认下载目录等）
+fndl_sync_paths
+exit 0

@@ -1,0 +1,10 @@
+dist/
+.tools/
+packaging/fpk/.build/
+__pycache__/
+*.pyc
+.venv/
+state/
+logs/
+*.fpk
+.DS_Store
