@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from typing import Callable
@@ -97,12 +98,30 @@ def _is_error(data: dict) -> bool:
                 or (data.get("errorDesc") or "").strip())
 
 
+def _pkg_version() -> str:
+    """运行时版本（诊断用）：与 main.py 同源——向上找 VERSION 文件。
+
+    错误文案带上它，一眼区分「装了新包但服务进程没重启」（文案版本旧）
+    与「真跑着新代码」（文案版本新）。"""
+    here = os.path.abspath(__file__)
+    for _ in range(4):
+        here = os.path.dirname(here)
+        vf = os.path.join(here, "VERSION")
+        if os.path.isfile(vf):
+            try:
+                with open(vf, encoding="utf-8") as fh:
+                    return fh.read().strip()
+            except OSError:
+                break
+    return "0.0.0"
+
+
 def _err_text(prefix: str, data: dict) -> str:
     # errorDesc 是中文人读文案（error_description 是英文），优先中文
     detail = (data.get("errorDesc") or data.get("error_description")
               or data.get("error") or "未知错误")
     code = data.get("error_code") or data.get("errorCode") or 0
-    return f"{prefix}：{detail}（error_code={code}）"
+    return f"{prefix}：{detail}（error_code={code} · v{_pkg_version()}）"
 
 
 def device_sign(device_id: str) -> str:
@@ -158,10 +177,12 @@ class _CloudDrive(DriveCore):
                     action, self.backend.conf.get("user_id", ""))
                 continue
             if err_code == CAPTCHA_ERROR_CODE:
+                uid = self.backend.conf.get("user_id", "")
                 raise BackendError(
                     "迅雷接口错误：人机令牌校验失败（error_code=9）——"
                     "这不是短信验证码输错；请点「重新登录」重试，"
-                    "若仍失败请重新完成一次短信验证")
+                    "若仍失败请重新完成一次短信验证"
+                    f"（v{_pkg_version()}，user_id={'已取到' if uid else '空'}）")
             raise BackendError(_err_text("迅雷接口错误", data))
         raise BackendError("迅雷接口错误：重试后仍失败")
 
@@ -289,9 +310,11 @@ class ThunderCloud(Backend):
         if not session_id:
             raise BackendError("迅雷登录失败：未返回 sessionID")
         self.conf["creditkey"] = data.get("creditkey", "")
-        # 登录响应 userID：登录后刷人机令牌 meta 的首要来源
-        if data.get("userID"):
-            self.conf["user_id"] = data["userID"]
+        # 登录响应 userID：登录后刷人机令牌 meta 的首要来源；
+        # 键名防御（userID/userid/user_id 都收）
+        uid = data.get("userID") or data.get("userid") or data.get("user_id")
+        if uid:
+            self.conf["user_id"] = uid
         return session_id
 
     def _refresh_captcha_in_login(self, action: str, username: str) -> str:
@@ -604,6 +627,10 @@ class ThunderCloud(Backend):
             self.conf["creditkey"] = renewed
         elif (data.get("creditkey") or "").strip():
             self.conf["creditkey"] = data["creditkey"].strip()
+        else:
+            # 两处都没有续期值：沿用本轮验证会话的密钥重登（页面场景宿主
+            # 拿不到续期值时同样带原 key 继续），空凭据重登等于没验证
+            self.conf["creditkey"] = self._review_creditkey()
         self.conf["review_url"] = ""
         self.conf["review_token"] = ""
         self.conf["review_key"] = ""
