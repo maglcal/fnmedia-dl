@@ -695,28 +695,25 @@ class ThunderCloud(Backend):
     # ------------------------------------------------------------ 目标设备
 
     def _target_of(self) -> str:
-        """目标设备必须仍在在线设备（user#runner）列表里才使用——
-        设备重建/换绑后旧 target 会把任务建进无人执行的「幽灵空间」：
-        任务永远排队中、迅雷面板看不到（0.1.18 暂停静默失效同类坑）。
-        设备发现失败时不阻断（回退配置值，可用性优先）。"""
+        """目标设备空间：配置值优先（0.1.28 回退老行为）——0.1.26 加的
+        「不在在线列表就自动改发到 online[0]」在多设备/发现口径不一致的场景
+        会把任务发去别的设备空间（用户实测「派发成功但迅雷里面没有」）。
+        配置值疑似失效时 status() 会提示，但不擅自改道。未配置时才用
+        发现到的首个在线设备。"""
         conf_t = (self.conf.get("target") or "").strip()
+        if conf_t:
+            return conf_t
+        if self._target:
+            return self._target
         try:
             online = [t["target"] for t in self.core.device_targets()]
         except BackendError:
-            online = None                      # 发现失败 ≠ 没有设备
-        if conf_t and (online is None or conf_t in online):
-            return conf_t
-        if self._target and (online is None or self._target in online):
-            return self._target
+            online = []
         if online:
             self._target = online[0]
             return self._target
-        if conf_t:
-            return conf_t                      # 发现失败但有配置值：尽力而为
-        if online is None:
-            raise BackendError("远程设备发现失败，且未配置目标设备"
-                               "（请在设置里填写「目标设备」或稍后重试）")
-        raise BackendError("当前迅雷账号下未发现远程下载设备（请先在迅雷 App 中绑定远程设备）")
+        raise BackendError("当前迅雷账号下未发现远程下载设备（请先在迅雷 App 中绑定远程设备，"
+                           "或在设置里填写「目标设备」）")
 
     # ------------------------------------------------------------ 接口
 

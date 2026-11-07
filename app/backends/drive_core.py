@@ -87,6 +87,24 @@ def scalar_int(v, default: int = 0) -> int:
         return default
 
 
+def _dbg(msg: str) -> None:
+    """诊断日志（state/dispatch.log，封顶 512KB）：目录解析/建任务关键事件，
+    出问题时一眼定位是哪层断的。记录失败静默——诊断只许帮忙不许添乱。"""
+    try:
+        import time as _time
+        from pathlib import Path as _P
+        import config as _cfg
+        p = _P(_cfg.STATE_DIR) / "dispatch.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > 512 * 1024:
+            p.write_text("", encoding="utf-8")
+        with p.open("a", encoding="utf-8") as f:
+            f.write(_time.strftime("%m-%d %H:%M:%S") + " "
+                    + str(msg)[:300] + "\n")
+    except Exception:
+        pass
+
+
 def _norm_dir(path: str) -> str:
     """目录路径归一：clean + 尾斜杠。"""
     p = (path or "").replace("\\", "/").strip()
@@ -194,15 +212,34 @@ class DriveCore:
             return {}
 
     def _folders(self, space: str, parent_id: str = "") -> list[dict]:
-        """目录表（标准接口同参）：with 两个 category 选项
-        让目录项带 params.RealPath/AliasPath 供根目录匹配。"""
-        data = self._request("GET", "/files", params={
-            "space": space, "limit": "200", "parent_id": parent_id or "",
-            "filters": json.dumps({"kind": {"eq": "drive#folder"}}),
-            "page_token": "",
-            "with": ["withCategoryDiskMountPath", "withCategoryDownloadPath"],
-        })
-        return [f for f in (data.get("files") or []) if isinstance(f, dict)]
+        """目录表：两种参数形状依次尝试（0.1.28 用户实测 扩展形状在其环境失败）。
+
+        A) 扩展形状：带 with=withCategoryDiskMountPath/
+           withCategoryDownloadPath，目录项带 params.RealPath 可精确匹配下载根。
+        B) 空间形状：无 with、多带 device_space= 空参数（同生态实测可用）；
+           目录项无 RealPath 时按名称/parent_id 兜底匹配。"""
+        filters = json.dumps({"kind": {"eq": "drive#folder"}},
+                             separators=(",", ":"))
+        common = {"space": space, "limit": "200", "parent_id": parent_id or "",
+                  "filters": filters, "page_token": ""}
+        saw_ok, last_err = False, ""
+        for extra in (
+                {"with": ["withCategoryDiskMountPath", "withCategoryDownloadPath"]},
+                {"device_space": ""}):
+            try:
+                data = self._request("GET", "/files",
+                                     params=dict(common, **extra))
+            except BackendError as exc:
+                last_err = str(exc)[:120]
+                continue
+            saw_ok = True
+            files = [f for f in (data.get("files") or []) if isinstance(f, dict)]
+            if files:
+                return files
+        if not saw_ok:
+            raise BackendError(
+                f"引擎目录表查询失败（扩展/空间两种参数形状均报错）：{last_err}")
+        return []
 
     def _make_folder(self, space: str, parent_id: str, name: str) -> dict:
         """建子目录：POST /drive/v1/files kind=drive#folder。"""
@@ -268,25 +305,32 @@ class DriveCore:
             return root_id, root_path
         if root_path and nd.startswith(root_path):
             rel = nd[len(root_path):]             # 根下绝对路径 → 相对段
-        elif dest.startswith("/") and root_path:
-            raise BackendError(
-                f"下载目录 {dest} 不在引擎下载根目录 {root_path} 之下——"
-                f"请改成根下相对路径（如 电影/2025），或留空用下载根目录")
+        elif dest.startswith("/"):
+            # 根外/根未知的绝对路径：不硬拒（0.1.26 硬报错是回归）——
+            # 保留根 id 让任务能开始下载，路径原样给引擎尽力落盘
+            return root_id, dest
         else:
-            rel = nd.lstrip("/")                  # 相对路径（根路径未知时绝对路径也按名走）
+            rel = nd.lstrip("/")                  # 相对路径
 
+        target = _norm_dir((root_path or "") + rel)
         pid, ppath = root_id, root_path
-        for seg in [s for s in rel.split("/") if s]:
-            child = None
-            for f in self._folders(space, pid):
-                if ((f.get("name") or "").strip() == seg
-                        or _folder_path(f) == ppath + seg + "/"):
-                    child = f
-                    break
-            if child is None:
-                child = self._make_folder(space, pid, seg)
-            pid = str(child.get("id"))
-            ppath = ppath + seg + "/"
+        try:
+            for seg in [s for s in rel.split("/") if s]:
+                child = None
+                for f in self._folders(space, pid):
+                    if ((f.get("name") or "").strip() == seg
+                            or _folder_path(f) == ppath + seg + "/"):
+                        child = f
+                        break
+                if child is None:
+                    child = self._make_folder(space, pid, seg)
+                pid = str(child.get("id"))
+                ppath = ppath + seg + "/"
+        except BackendError:
+            # 子目录解析/创建失败（常见：引擎账号对该目录无读写权）→ 保留
+            # 已解析到的目录 id 让任务能开始下载，完整目标路径给引擎尽力落盘
+            _dbg(f"子目录解析降级: space={space} 目标={target} → 用 {pid}")
+            return pid, target
         return pid, ppath
 
     # ------------------------------------------------------------ 建任务
@@ -297,22 +341,21 @@ class DriveCore:
         """创建任务。parent_folder_id 为空时按 directory 解析真实下载目录——
         这是任务真正开始下载的必要字段（缺省任务永远停在排队中）。
 
-        目录解析只是增强，失败不挡道（0.1.27 用户实测回归）：解析/建目录失败
-        （目录在识别出的下载根之外、引擎账号对该目录无读写权等）时回退
-        0.1.26 之前的直传行为——把设置的目录原样交给引擎落盘，老版本一直
-        可以这样直接下载到设置目录。仅当未设置目录且下载根解析失败时才报错
-        （两字段全空的任务会永远停在排队中，静默建出来比报错更糟）。"""
+        解析是阶梯式尽力而为（0.1.28）：完整解析 → 子目录失败降级用根 id +
+        目标路径 → 根外绝对路径保留根 id + 原样路径。只有完全拿不到目录 id
+        （目录表查询全挂）才报错——绝不静默建「排队中」死任务。"""
         if parent_folder_id:
             pfid = parent_folder_id
             pfpath = parent_folder_path or directory or ""
         else:
-            dest = (directory or "").strip()
             try:
-                pfid, pfpath = self.resolve_dest_folder(space, dest)
-            except BackendError:
-                if not dest:
-                    raise
-                pfid, pfpath = "", directory
+                pfid, pfpath = self.resolve_dest_folder(
+                    space, (directory or "").strip())
+            except BackendError as exc:
+                _dbg(f"目录解析失败: dir={directory[:40]!r} → {str(exc)[:120]}")
+                raise
+            _dbg(f"目录解析: dir={directory[:40]!r} → id={pfid[:16]} "
+                 f"path={pfpath[:40]}")
         name = resource.name or url[:80]
         body = {
             "type": "user#download-url",
@@ -336,6 +379,7 @@ class DriveCore:
         tid = task.get("id") or ""
         if not tid:
             raise BackendError(f"创建任务失败：{json.dumps(data, ensure_ascii=False)[:200]}")
+        _dbg(f"建任务成功: id={tid} parent={pfid[:16]}")
         return str(tid)   # 引擎 id 可能是整型，统一字符串防 unified_tasks 匹配失败
 
     # ------------------------------------------------------------ 列表
@@ -350,7 +394,7 @@ class DriveCore:
         filters: dict = {"type": {"in": TASK_TYPES}}
         if active_only:
             filters["phase"] = {"in": ACTIVE_PHASES}
-        filters_s = json.dumps(filters)
+        filters_s = json.dumps(filters, separators=(",", ":"))
         out: list[dict] = []
         page_token = ""
         for _ in range(20):        # 安全上限，防异常响应导致死循环
@@ -375,7 +419,7 @@ class DriveCore:
         引擎会静默忽略（暂停卡住不翻转的原因）。先查给定 space，
         找不到再逐个查设备空间。只按 type 过滤（不枚举 phase，
         防 phase 拼写变体漏掉任务）。"""
-        filters = json.dumps({"type": {"in": TASK_TYPES}})
+        filters = json.dumps({"type": {"in": TASK_TYPES}}, separators=(",", ":"))
         spaces: list[str] = []
         if space:
             spaces.append(space)

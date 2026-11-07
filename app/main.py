@@ -117,10 +117,13 @@ def _queue() -> tqmod.TaskQueue:
     return tqmod.TaskQueue(Path(cfgmod.STATE_DIR) / "queue.json")
 
 
-def _queue_dispatch(mgr: DownloadManager):
-    """队列派发闭包：auto 降级链 + 全局默认目录兜底。"""
+def _queue_dispatch(mgr: DownloadManager, backend: str = "auto"):
+    """队列派发闭包：沿用界面所选通道（0.1.28 前硬编码 auto——无视用户的
+    通道选择，任务可能被降级链派去别的通道，「派发成功」但迅雷里没有），
+    未选/定时派发用 auto 降级链；全局默认目录兜底。"""
     def _fn(url: str, directory: str | None) -> dict:
-        return mgr.dispatch(linksmod.parse_line(url), backend="auto",
+        return mgr.dispatch(linksmod.parse_line(url),
+                            backend=backend or "auto",
                             directory=directory
                             or mgr.cfg.get("default_dir") or None)
     return _fn
@@ -517,12 +520,16 @@ def queue_remove(item_id: str):
     return {"ok": True, **q.snapshot()}
 
 
+class QueueRunReq(BaseModel):
+    backend: str = "auto"
+
+
 @app.post("/api/queue/run")
-def queue_run():
-    """立即派发全部待发项（auto 降级链）。"""
+def queue_run(req: QueueRunReq | None = None):
+    """立即派发全部待发项。backend 沿用界面通道选择（缺省 auto 降级链）。"""
     mgr = _manager()
     q = _queue()
-    results = q.run_now(_queue_dispatch(mgr))
+    results = q.run_now(_queue_dispatch(mgr, (req.backend if req else "auto")))
     return {"ok": True, "results": results, **q.snapshot()}
 
 

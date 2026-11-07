@@ -175,6 +175,28 @@ class TestDriveCore(unittest.TestCase):
                    {"id": "b", "name": "bbb", "parent_id": "root-9"}]))
         self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
 
+    def test_folders_shape_retry_space_shape(self):
+        """目录列表 扩展形状（带 with）为空/报错时自动换 空间形状
+        （无 with + device_space= 空参数，同生态实测可用）——0.1.28 用户
+        实测其环境 扩展形状取不到目录表，整条解析链跟着崩。"""
+        seen = []
+
+        def handler(request):
+            if request.url.path.endswith("/files") and request.method == "GET":
+                seen.append(dict(request.url.params))
+                if "with" in request.url.params:
+                    return httpx.Response(200, json={"files": []})
+                return httpx.Response(200, json={"files": [
+                    {"id": "a", "name": "电影", "parent_id": "root-9"},
+                    {"id": "b", "name": "动漫", "parent_id": "root-9"}]})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
+        self.assertEqual(len(seen), 2)          # 两种形状都试过
+        self.assertIn("with", seen[0])
+        self.assertNotIn("with", seen[1])
+        self.assertIn("device_space", seen[1])
+
     def test_resolve_subdir_walk_and_create(self):
         """子目录逐段解析，缺级自动建。"""
         made = []
@@ -201,14 +223,14 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(made, [{"parent_id": "sub-1", "name": "2025",
                                  "space": "sp", "kind": "drive#folder"}])
 
-    def test_resolve_rejects_dir_outside_root(self):
-        """根外绝对目录显式报错（静默建进错误目录 = 假成功）。"""
+    def test_resolve_outside_root_keeps_root_id(self):
+        """根外绝对目录不再报错（0.1.26 硬拒是回归）：保留根 id 让任务能
+        开始下载，路径原样给引擎尽力落盘。"""
         core = self._mk(self._folder_handler(
             config={"download_paths": ["/downloads"]},
             files=[{"id": "dir-1", "name": "downloads", "params": {"RealPath": "/downloads/"}}]))
-        with self.assertRaises(BackendError) as cm:
-            core.resolve_dest_folder("sp", "/vol1/other")
-        self.assertIn("/downloads/", str(cm.exception))
+        self.assertEqual(core.resolve_dest_folder("sp", "/vol1/other"),
+                         ("dir-1", "/vol1/other"))
 
     def test_create_task_resolves_parent_folder(self):
         """未显式给 parent_folder_id 时自动解析——这是任务开始下载的必要字段。"""
@@ -231,11 +253,12 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
         self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
 
-    # ---- 解析失败回退直传（0.1.27 用户实测回归：0.1.26 对无权限/根外目录硬报错，
-    #      老版本把目录原样交给引擎一直能直接下载到设置目录） ----
+    # ---- 解析阶梯式降级（0.1.28）：id 缺省任务永远不启动——只要还解析得出
+    #      目录 id 就带上 id 让任务能下载，路径尽力而为；全解析失败才报错 ----
 
-    def test_create_task_fallback_when_folder_setup_denied(self):
-        """建目录被拒（引擎账号对该目录无读写权）→ 回退直传目录原样。"""
+    def test_create_task_partial_when_folder_setup_denied(self):
+        """建目录被拒（引擎账号对该目录无读写权）→ 降级用根 id +
+        完整目标路径，任务照常能开始下载。"""
         captured = {}
 
         def handler(request):
@@ -255,11 +278,12 @@ class TestDriveCore(unittest.TestCase):
         tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
                                "sp", directory="电影/2025")
         self.assertEqual(tid, "t-1")
-        self.assertEqual(captured["params"]["parent_folder_id"], "")
-        self.assertEqual(captured["params"]["parent_folder_path"], "电影/2025")
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"],
+                         "/downloads/电影/2025/")
 
-    def test_create_task_fallback_when_dir_outside_root(self):
-        """根外绝对目录不再报错：直传给引擎（0.1.26 前的老行为）。"""
+    def test_create_task_keeps_root_for_dir_outside_root(self):
+        """根外绝对目录：保留根 id + 路径原样（不报错也不丢 id）。"""
         captured = {}
 
         def handler(request):
@@ -276,28 +300,24 @@ class TestDriveCore(unittest.TestCase):
         tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
                                "sp", directory="/vol1/media/剧集")
         self.assertEqual(tid, "t-2")
-        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
         self.assertEqual(captured["params"]["parent_folder_path"],
                          "/vol1/media/剧集")
 
-    def test_create_task_fallback_when_root_unresolvable(self):
-        """目录表为空时：有设置目录 → 直传老形状（id 空 + 原样路径）。"""
-        captured = {}
-
+    def test_create_task_no_silent_task_when_root_unresolvable(self):
+        """目录表全挂、任何 id 都拿不到时显式报错——静默建 id 空的任务 =
+        永远排队中（0.1.27 回退直传已被用户实测证明不启动下载）。"""
         def handler(request):
             path = request.url.path
             if path.endswith("/device/config"):
                 return httpx.Response(200, json={})
             if path.endswith("/files") and request.method == "GET":
                 return httpx.Response(200, json={"files": []})
-            captured.update(json.loads(request.content))
             return httpx.Response(200, json={"task": {"id": "t-3"}})
         core = self._mk(handler)
-        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
-                               "sp", directory="/vol1/media")
-        self.assertEqual(tid, "t-3")
-        self.assertEqual(captured["params"]["parent_folder_id"], "")
-        self.assertEqual(captured["params"]["parent_folder_path"], "/vol1/media")
+        with self.assertRaises(BackendError):
+            core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                             "sp", directory="/vol1/media")
 
     def test_create_task_empty_dir_needs_resolvable_root(self):
         """无设置目录且下载根解析失败 → 显式报错

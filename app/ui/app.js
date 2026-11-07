@@ -944,7 +944,7 @@ on("#btnEnqueueRun", "click", async () => {
   if (btn) btn.disabled = true;
   try {
     await enqueue(text, $("#dirInput").value.trim() || null);
-    const r = await API.send("/api/queue/run", "POST", {});
+    const r = await API.send("/api/queue/run", "POST", { backend: $("#backendSelect").value || "auto" });
     const results = r.results || [];
     toast(`派发完成：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
     renderQueue(r);
@@ -959,7 +959,7 @@ on("#btnQueueRun", "click", async () => {
   const btn = $("#btnQueueRun");
   if (btn) btn.disabled = true;
   try {
-    const r = await API.send("/api/queue/run", "POST", {});
+    const r = await API.send("/api/queue/run", "POST", { backend: $("#backendSelect").value || "auto" });
     const results = r.results || [];
     toast(`队列派发完成：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
     renderQueue(r);
