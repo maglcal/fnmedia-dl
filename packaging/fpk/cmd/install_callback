@@ -28,7 +28,13 @@ fndl_sync_paths
 xd_pick="$(printf '%s' "${wizard_xunlei_docker:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
 if [ "${xd_pick}" = "deploy" ]; then
   if [ -n "${FNDL_REPO_DIR}" ] && [ -x "${FNDL_REPO_DIR}/.venv/bin/python" ]; then
-    ( cd "${FNDL_REPO_DIR}" && nohup ./.venv/bin/python app/xunlei_docker.py run >> "${FNDL_LOG}" 2>&1 & )
+    # 向导里选了「自己设置」的存放位置则透传给部署脚本（已在 install_init 校验过）
+    xd_cmd=( ./.venv/bin/python app/xunlei_docker.py run )
+    xd_data_mode="$(printf '%s' "${wizard_xunlei_data_mode:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
+    xd_dl_mode="$(printf '%s' "${wizard_xunlei_dl_mode:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
+    [ "${xd_data_mode}" = "custom" ] && xd_cmd+=( --data-dir "${wizard_xunlei_data_dir}" )
+    [ "${xd_dl_mode}" = "custom" ] && xd_cmd+=( --dl-dir "${wizard_xunlei_dl_dir}" )
+    ( cd "${FNDL_REPO_DIR}" && nohup "${xd_cmd[@]}" >> "${FNDL_LOG}" 2>&1 & )
     echo "[fnmedia-dl] 已在后台自动部署 Docker 版迅雷（cnk3x/xunlei），进度见管理页「迅雷下载引擎」卡片" >> "${FNDL_LOG}"
   else
     echo "[fnmedia-dl] 未找到应用 Python 环境，跳过 Docker 版迅雷自动部署；可稍后在管理页「迅雷下载引擎」卡片点「一键部署」" >> "${FNDL_LOG}"

@@ -212,23 +212,43 @@ def backends_test(req: BackendTestReq):
 
 # ------------------------------------------------------------ Docker 版迅雷一键部署
 
+class XdDeployIn(BaseModel):
+    data_dir: str = ""   # Docker 版配置文件存放位置（空 = 默认应用数据共享）
+    dl_dir: str = ""     # 下载文件存放位置（空 = 默认应用下载共享）
+
+
 @app.get("/api/xunlei_docker/status")
 def xd_status():
+    def_data, def_dl = xdmod.default_dirs()
     return {
         "deploy": xdmod.progress(),
         "running": xdmod.running(),
         "container": xdmod.container_state(),
         "docker": xdmod.docker_bin() is not None,
         "panel_url": xdmod.PANEL_URL,
+        "default_data_dir": def_data,
+        "default_dl_dir": def_dl,
     }
 
 
 @app.post("/api/xunlei_docker/deploy")
-def xd_deploy():
+def xd_deploy(body: XdDeployIn = XdDeployIn()):
     """一键部署 Docker 版迅雷：独立后台进程执行（服务重启不影响），
-    进度走 GET /api/xunlei_docker/status 轮询。"""
+    进度走 GET /api/xunlei_docker/status 轮询。
+    body 可选传 data_dir/dl_dir 自定义配置/下载存放位置（空 = 用默认）。"""
     if xdmod.running():
         raise HTTPException(400, "已有部署正在进行，请稍候")
+    opts = body or XdDeployIn()
+    # 向导/API 传入的路径视为不可信输入，先二次校验再交给部署进程
+    try:
+        xdmod._volume_dirs(opts.data_dir, opts.dl_dir)
+    except xdmod.DeployError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    argv = ["run"]
+    if opts.data_dir.strip():
+        argv += ["--data-dir", opts.data_dir.strip()]
+    if opts.dl_dir.strip():
+        argv += ["--dl-dir", opts.dl_dir.strip()]
     log = Path(cfgmod.STATE_DIR) / "xunlei-deploy.log"
     logfh = None
     try:
@@ -238,7 +258,7 @@ def xd_deploy():
         logfh = None  # 日志不可写不阻塞部署
     try:
         subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve().parent / "xunlei_docker.py"), "run"],
+            [sys.executable, str(Path(__file__).resolve().parent / "xunlei_docker.py"), *argv],
             start_new_session=True,
             stdout=logfh if logfh is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT)

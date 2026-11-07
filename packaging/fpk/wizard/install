@@ -33,7 +33,7 @@
     "items": [
       {
         "type": "tips",
-        "helpText": "「迅雷下载引擎」通道需要 Docker 版迅雷（cnk3x/xunlei）的 web 面板。\n\n选「帮我自动部署」：安装完成后插件会自动拉取镜像、启动容器（数据持久化在应用共享目录）、并配好面板地址，随后你在管理页登录迅雷账号即可使用。部署进度与结果见管理页「迅雷下载引擎」卡片；需要 NAS 已安装并启用 Docker（应用中心 → Docker）。\n\n已在用 Docker / 群晖套件版迅雷：选第二项，装好后在管理页填面板地址。\n\n应用中心官方原生迅雷（社区版）没有本地面板接口，不支持直连，请改用「迅雷远程」通道。"
+        "helpText": "「迅雷下载引擎」通道需要 Docker 版迅雷（cnk3x/xunlei）的 web 面板。\n\n选「帮我自动部署」：安装完成后插件会自动拉取镜像、启动容器、并配好面板地址，随后你在管理页登录迅雷账号即可使用。部署进度与结果见管理页「迅雷下载引擎」卡片；需要 NAS 已安装并启用 Docker（应用中心 → Docker）。\n\n首次登录迅雷账号后，面板会弹出「内测邀请码」输入框，填「迅雷牛通」（注意是「通」字，官方内测码）即可激活；若提示码已失效，可到 https://docs.qq.com/form/page/DQUJXZUdtRlNGWkxr#/fill 重新申请一个。\n\n下方可为 Docker 版迅雷指定两个存放位置（选「帮我自动部署」时生效）：配置文件位置存放迅雷账号/配置（重装不丢），下载文件位置是下载内容的保存目录。不确定就用默认——默认放在应用共享目录，重装/升级不会丢数据。\n\n已在用 Docker / 群晖套件版迅雷：选第二项，装好后在管理页填面板地址。\n\n应用中心官方原生迅雷（社区版）没有本地面板接口，不支持直连，请改用「迅雷远程」通道。"
       },
       {
         "type": "radio",
@@ -48,6 +48,44 @@
         "rules": [
           { "required": true, "message": "请选择一项" }
         ]
+      },
+      {
+        "type": "radio",
+        "field": "wizard_xunlei_data_mode",
+        "label": "Docker 版配置文件存放位置（账号 / 配置持久化，自动部署时生效）",
+        "initValue": "default",
+        "options": [
+          { "label": "用默认位置（应用数据共享目录，推荐）", "value": "default" },
+          { "label": "自己设置", "value": "custom" }
+        ],
+        "rules": [
+          { "required": true, "message": "请选择一项" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_xunlei_data_dir",
+        "label": "配置文件存放位置（上一项选「自己设置」时填写，NAS 绝对路径，如 /vol1/1000/docker/xunlei/data）",
+        "initValue": ""
+      },
+      {
+        "type": "radio",
+        "field": "wizard_xunlei_dl_mode",
+        "label": "下载文件存放位置（下载内容保存目录，自动部署时生效）",
+        "initValue": "default",
+        "options": [
+          { "label": "用默认位置（应用下载共享目录，推荐）", "value": "default" },
+          { "label": "自己设置", "value": "custom" }
+        ],
+        "rules": [
+          { "required": true, "message": "请选择一项" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_xunlei_dl_dir",
+        "label": "下载文件存放位置（上一项选「自己设置」时填写，NAS 绝对路径，如 /vol1/1000/downloads）",
+        "initValue": ""
       }
     ]
   }

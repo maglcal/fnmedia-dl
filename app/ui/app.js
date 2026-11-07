@@ -4,6 +4,15 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+/* 空安全事件绑定：HTML 元素缺失时跳过并告警，绝不让单个缺失元素把
+   整个脚本剩下的初始化全部带崩（0.1.20「关于/版本/更新失踪」的回归背景：
+   顶层一处 null.addEventListener 抛异常 → 其后所有绑定和 init 全灭）。 */
+function on(sel, ev, fn, opts) {
+  const el = $(sel);
+  if (el) el.addEventListener(ev, fn, opts);
+  else console.warn("[fnmedia-dl] 绑定跳过（元素不存在）：", sel);
+}
+
 const API = {
   // 所有请求走相对路径（配合 <base> 前缀自适应），绝对路径会在
   // /app/fnmedia-dl/ 挂载形态下打到应用外面导致 404。
@@ -35,6 +44,7 @@ async function errText(r) {
 
 function toast(msg) {
   const el = $("#toast");
+  if (!el) return;
   el.textContent = msg;
   el.hidden = false;
   clearTimeout(el._t);
@@ -91,7 +101,7 @@ async function loadChips() {
 }
 
 /* ---------------- 解析 ---------------- */
-$("#btnParse").addEventListener("click", async () => {
+on("#btnParse", "click", async () => {
   const text = $("#linkInput").value.trim();
   if (!text) return toast("请先粘贴链接");
   try {
@@ -127,7 +137,7 @@ function esc(s) {
 }
 
 /* ---------------- 派发 ---------------- */
-$("#btnDispatch").addEventListener("click", async () => {
+on("#btnDispatch", "click", async () => {
   const text = $("#linkInput").value.trim();
   if (!text) return toast("请先粘贴链接");
   const btn = $("#btnDispatch");
@@ -250,7 +260,7 @@ function renderTasks(tasks, backendErrors) {
   });
 }
 
-$("#btnRefresh").addEventListener("click", loadTasks);
+on("#btnRefresh", "click", loadTasks);
 
 /* ---------------- 下载历史查重 ---------------- */
 async function checkHistory() {
@@ -280,15 +290,17 @@ async function checkHistory() {
   }
 }
 
-$("#btnHistory").addEventListener("click", checkHistory);
-$("#historyInput").addEventListener("keydown", (e) => {
+on("#btnHistory", "click", checkHistory);
+on("#historyInput", "keydown", (e) => {
   if (e.key === "Enter") checkHistory();
 });
 
 function scheduleAutoRefresh() {
   clearInterval(taskTimer);
   taskTimer = setInterval(() => {
-    if ($("#autoRefresh").checked && $("#tab-tasks").classList.contains("active")) {
+    const auto = $("#autoRefresh");
+    const tasks = $("#tab-tasks");
+    if (auto && auto.checked && tasks && tasks.classList.contains("active")) {
       loadTasks();
     }
   }, 5000);
@@ -371,13 +383,13 @@ async function loadFs() {
   }
 }
 
-$("#btnFillShare").addEventListener("click", () => {
+on("#btnFillShare", "click", () => {
   if (!shareDirCached) return;
   $("#defaultDir").value = shareDirCached;
   toast("已填入应用共享目录，记得保存设置");
 });
 
-$("#btnCheckDir").addEventListener("click", async () => {
+on("#btnCheckDir", "click", async () => {
   const dir = $("#defaultDir").value.trim();
   const box = $("#dirStatus");
   if (!dir) { toast("先在上方填写要检测的目录"); return; }
@@ -426,7 +438,7 @@ async function saveConfig() {
   await API.send("/api/config", "PUT", { config: cfg });
 }
 
-$("#btnSaveCfg").addEventListener("click", async () => {
+on("#btnSaveCfg", "click", async () => {
   try {
     await saveConfig();
     $("#cfgMsg").textContent = "已保存";
@@ -474,7 +486,7 @@ $$("button[data-test]").forEach((btn) => {
 });
 
 /* 迅雷重新登录 */
-$("#tcLoginBtn").addEventListener("click", async () => {
+on("#tcLoginBtn", "click", async () => {
   $("#tcLoginBtn").disabled = true;
   try {
     $("#btnSaveCfg").click();
@@ -500,8 +512,9 @@ function xdRender(s) {
   const btn = $("#btnDeployXd");
   const d = (s && s.deploy) || {};
   const active = !!s && (s.running || (!d.done && d.stage !== "idle" && d.stage !== "error"));
-  box.hidden = false;
-  btn.disabled = active;
+  if (box) box.hidden = false;
+  if (btn) btn.disabled = active;
+  if (!box) return active;
   if (active) {
     box.className = "dir-status";
     box.textContent = `部署中：${d.detail || d.stage || "…"}（${d.percent || 0}%）`;
@@ -524,11 +537,39 @@ function xdRender(s) {
   return active;
 }
 
+/* 目录选项（默认 / 自己设置）：radio 联动输入框可用状态 */
+function xdPick(name) {
+  const el = $(`input[name="${name}"]:checked`);
+  return el ? el.value : "default";
+}
+
+$$('input[name="xdDataMode"]').forEach((r) => r.addEventListener("change", () => {
+  const t = $("#xdDataDir");
+  if (t) t.disabled = xdPick("xdDataMode") !== "custom";
+}));
+$$('input[name="xdDlMode"]').forEach((r) => r.addEventListener("change", () => {
+  const t = $("#xdDlDir");
+  if (t) t.disabled = xdPick("xdDlMode") !== "custom";
+}));
+
+function xdDirBody() {
+  const body = {};
+  if (xdPick("xdDataMode") === "custom") body.data_dir = ($("#xdDataDir").value || "").trim();
+  if (xdPick("xdDlMode") === "custom") body.dl_dir = ($("#xdDlDir").value || "").trim();
+  return body;
+}
+
 async function loadXdStatus() {
   try {
-    xdRender(await API.get("/api/xunlei_docker/status"));
+    const s = await API.get("/api/xunlei_docker/status");
+    const dd = $("#xdDataDefault");
+    const dl = $("#xdDlDefault");
+    if (dd) dd.textContent = s.default_data_dir || "应用数据共享目录";
+    if (dl) dl.textContent = s.default_dl_dir || "应用下载共享目录";
+    xdRender(s);
   } catch (e) {
     const box = $("#xdDeployStatus");
+    if (!box) return;
     box.hidden = false;
     box.className = "dir-status bad";
     box.textContent = "部署状态获取失败：" + e.message;
@@ -551,31 +592,40 @@ function xdStartPoll() {
     const d = s.deploy || {};
     if (d.done && d.stage !== "error") {
       // 成功后自动回填面板地址并保存，用户零操作
-      if (!$("#teUrl").value.trim()) $("#teUrl").value = s.panel_url;
+      const teUrl = $("#teUrl");
+      if (teUrl && !teUrl.value.trim()) teUrl.value = s.panel_url;
       try { await saveConfig(); } catch { /* 保存失败不影响部署结果展示 */ }
-      toast("✓ Docker 版迅雷已就绪，打开面板登录迅雷账号即可使用");
+      toast("✓ Docker 版迅雷已就绪，打开面板登录迅雷账号，激活内测码填「迅雷牛通」即可使用");
       loadChips();
     }
   }, 2500);
 }
 
-$("#btnDeployXd").addEventListener("click", async () => {
-  if (!confirm("将自动拉取 cnk3x/xunlei 镜像并启动容器" +
-    "（数据持久化到应用共享目录），继续？\n需要 NAS 已安装并启用 Docker（应用中心 → Docker）。")) return;
+on("#btnDeployXd", "click", async () => {
+  const opts = xdDirBody();
+  const dirNote =
+    (opts.data_dir ? `配置文件存放位置：${opts.data_dir}` : "配置文件存放位置：默认（应用数据共享）") + "\n" +
+    (opts.dl_dir ? `下载文件存放位置：${opts.dl_dir}` : "下载文件存放位置：默认（应用下载共享）");
+  if (!confirm("将自动拉取 cnk3x/xunlei 镜像并启动容器，继续？\n" +
+    dirNote + "\n需要 NAS 已安装并启用 Docker（应用中心 → Docker）。")) return;
   const btn = $("#btnDeployXd");
   const box = $("#xdDeployStatus");
-  btn.disabled = true;
-  box.hidden = false;
-  box.className = "dir-status";
-  box.textContent = "部署中：准备…";
+  if (btn) btn.disabled = true;
+  if (box) {
+    box.hidden = false;
+    box.className = "dir-status";
+    box.textContent = "部署中：准备…";
+  }
   try {
-    const r = await API.send("/api/xunlei_docker/deploy", "POST", {});
+    const r = await API.send("/api/xunlei_docker/deploy", "POST", opts);
     toast(r.detail || "已开始部署…");
     xdStartPoll();
   } catch (e) {
-    box.className = "dir-status bad";
-    box.textContent = "✗ " + e.message;
-    btn.disabled = false;
+    if (box) {
+      box.className = "dir-status bad";
+      box.textContent = "✗ " + e.message;
+    }
+    if (btn) btn.disabled = false;
   }
 });
 
@@ -605,7 +655,7 @@ function tcReviewMsg(text, ok) {
   el.textContent = text;
 }
 
-$("#tcSmsSend").addEventListener("click", async () => {
+on("#tcSmsSend", "click", async () => {
   const btn = $("#tcSmsSend");
   btn.disabled = true;
   btn.textContent = "发送中…";
@@ -622,7 +672,7 @@ $("#tcSmsSend").addEventListener("click", async () => {
   }
 });
 
-$("#tcSmsCheck").addEventListener("click", async () => {
+on("#tcSmsCheck", "click", async () => {
   const btn = $("#tcSmsCheck");
   btn.disabled = true;
   btn.textContent = "提交中…";
@@ -654,15 +704,18 @@ async function loadVersion() {
   try {
     const h = await API.get("/api/health");
     const v = "v" + (h.version || "?");
-    $("#appVersion").textContent = v;
-    $("#aboutVersion").textContent = v;
-    $("#aboutVersionText").textContent = `${h.name || "fnmedia-dl"} ${v}`;
+    const top = $("#appVersion");
+    const about = $("#aboutVersion");
+    const aboutText = $("#aboutVersionText");
+    if (top) top.textContent = v;
+    if (about) about.textContent = v;
+    if (aboutText) aboutText.textContent = `${h.name || "fnmedia-dl"} ${v}`;
   } catch {
     /* 版本显示失败不影响主功能 */
   }
 }
 
-$("#updateCheckBtn").addEventListener("click", async () => {
+on("#updateCheckBtn", "click", async () => {
   const btn = $("#updateCheckBtn");
   const st = $("#updateStatus");
   btn.disabled = true;
@@ -697,7 +750,7 @@ $("#updateCheckBtn").addEventListener("click", async () => {
 /* ---------------- 一键在线更新（下载 fpk → 替换 → 重启，带进度） ---------------- */
 const UPD = { url: "", target: "", timer: null };
 
-$("#updateRunBtn").addEventListener("click", async () => {
+on("#updateRunBtn", "click", async () => {
   if (!UPD.url) return;
   const st = $("#updateStatus");
   const box = $("#updateProgressBox");
@@ -788,7 +841,14 @@ $("#updateRunBtn").addEventListener("click", async () => {
   }, 1000);
 });
 
-/* ---------------- init ---------------- */
-loadChips();
-loadVersion();
-scheduleAutoRefresh();
+/* ---------------- init ----------------
+   顶层执行到这说明脚本未被中途异常带崩；给页面看门狗一个就绪信号。
+   看门狗见 index.html 尾部（脚本没跑起来时给用户明确提示而不是静默残废）。 */
+try {
+  loadChips();
+  loadVersion();
+  scheduleAutoRefresh();
+  window.__fnmediaReady = true;
+} catch (e) {
+  console.error("[fnmedia-dl] 初始化异常：", e);
+}

@@ -26,4 +26,25 @@ case "${xd_raw}" in
   ""|deploy|existing|skip) ;;
   *) fndl_fail "「Docker 版迅雷」选项取值无效，请返回上一步重新选择。" ;;
 esac
+
+# —— Docker 版存放位置（默认 / 自己设置；路径同样视为不可信输入）——
+# mode 取值：default = 用默认位置；custom = 用下方文本框路径（必须绝对路径）。
+xd_data_mode="$(printf '%s' "${wizard_xunlei_data_mode:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
+xd_dl_mode="$(printf '%s' "${wizard_xunlei_dl_mode:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
+case "${xd_data_mode}" in ""|default|custom) ;; *) fndl_fail "「配置文件存放位置」选项取值无效，请返回上一步重新选择。" ;; esac
+case "${xd_dl_mode}" in ""|default|custom) ;; *) fndl_fail "「下载文件存放位置」选项取值无效，请返回上一步重新选择。" ;; esac
+_fndl_check_xd_dir() {
+  # $1 = 模式 $2 = 路径 $3 = 中文名
+  [ "$1" = "custom" ] || return 0
+  [ -n "$2" ] || fndl_fail "已选「自己设置」，请填写$3（NAS 绝对路径，如 /vol1/1000/downloads）"
+  case "$2" in
+    /*) ;;
+    *) fndl_fail "$3必须是绝对路径（以 / 开头）：$2" ;;
+  esac
+  case "$2" in
+    *..*|*$'\n'*|*$'\t'*) fndl_fail "$3不合法：$2" ;;
+  esac
+}
+_fndl_check_xd_dir "${xd_data_mode}" "${wizard_xunlei_data_dir:-}" "配置文件存放位置"
+_fndl_check_xd_dir "${xd_dl_mode}" "${wizard_xunlei_dl_dir:-}" "下载文件存放位置"
 exit 0

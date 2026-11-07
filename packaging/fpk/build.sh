@@ -59,6 +59,10 @@ fi
 
 MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
 sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+# UI 资源版本戳（?v=@VERSION@）防浏览器旧缓存：与 manifest 同步替换
+if [ -f "${STAGE}/app/repo/app/ui/index.html" ]; then
+  sed -i "s/@VERSION@/${MANIFEST_VER}/g" "${STAGE}/app/repo/app/ui/index.html"
+fi
 cp "${FPK_DIR}/ICON.PNG" "${FPK_DIR}/ICON_256.PNG" "${STAGE}/" 2>/dev/null || true
 cp -a "${FPK_DIR}/app/ui/." "${STAGE}/app/ui/"
 cp -a "${FPK_DIR}/cmd" "${STAGE}/cmd"

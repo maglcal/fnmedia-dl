@@ -6,15 +6,21 @@
 <title>飞牛下载助手</title>
 <script>
 /* 挂载前缀自适应：桌面 iframe 挂在 /app/fnmedia-dl/ 下，开发模式挂 / 。
-   设置 <base> 后所有相对路径（static/、api/）自动解析到正确前缀。 */
+   设置 <base> 后所有相对路径（static/、api/）自动解析到正确前缀。
+   健壮性（0.1.21）：① 路径以文件名结尾（…/index.html）时先剥掉文件名，
+   否则 base 算错会让 app.js 404、页面脚本全灭；② 若宿主已注入过 <base>
+   （HTML 里第一个 base 生效），直接改它的 href，而不是再写一个无效的。 */
 (function () {
   var p = location.pathname;
-  var dir = p.endsWith("/") ? p : p + "/";
-  document.write('<base href="' + dir + '">');
+  var dir = p.endsWith("/") ? p
+    : (/\.[^/]+$/.test(p) ? p.replace(/[^/]+$/, "") : p + "/");
+  var b = document.querySelector("base");
+  if (b) { b.setAttribute("href", dir); }
+  else { document.write('<base href="' + dir + '">'); }
 })();
 </script>
 <link rel="icon" type="image/png" href="static/favicon.png">
-<link rel="stylesheet" href="static/app.css">
+<link rel="stylesheet" href="static/app.css?v=@VERSION@">
 </head>
 <body>
 
@@ -193,10 +199,37 @@
         <b>不支持应用中心官方原生迅雷（社区版）</b>——那套没有本地面板接口，请改用
         「迅雷远程」通道投递（原生迅雷会把 NAS 注册为你迅雷账号的远程设备）。
         没装 Docker 版迅雷？点下方「一键部署」，自动装好并配好面板地址。</p>
+      <div class="xd-opts">
+        <div class="xd-opts-title">Docker 版存放位置（「一键部署」时生效）</div>
+        <div class="xd-opt-row">
+          <span class="xd-opt-name">配置文件存放位置</span>
+          <div class="xd-opt-choices">
+            <label class="xd-opt"><input type="radio" name="xdDataMode" value="default" checked>
+              用默认（<span id="xdDataDefault" class="xd-path">应用数据共享目录</span>）</label>
+            <label class="xd-opt xd-custom"><input type="radio" name="xdDataMode" value="custom">自己设置：</label>
+            <input id="xdDataDir" type="text" disabled
+              placeholder="如 /vol1/1000/docker/xunlei/data">
+          </div>
+        </div>
+        <div class="xd-opt-row">
+          <span class="xd-opt-name">下载文件存放位置</span>
+          <div class="xd-opt-choices">
+            <label class="xd-opt"><input type="radio" name="xdDlMode" value="default" checked>
+              用默认（<span id="xdDlDefault" class="xd-path">应用下载共享目录</span>）</label>
+            <label class="xd-opt xd-custom"><input type="radio" name="xdDlMode" value="custom">自己设置：</label>
+            <input id="xdDlDir" type="text" disabled
+              placeholder="如 /vol1/1000/downloads">
+          </div>
+        </div>
+      </div>
       <div class="actions">
         <button id="btnDeployXd" class="btn primary">🚀 一键部署 Docker 版迅雷</button>
       </div>
       <div id="xdDeployStatus" class="dir-status" hidden></div>
+      <p class="hint">🔑 首次打开面板：登录迅雷账号后会弹出<b>内测邀请码</b>输入框，填
+        <code>迅雷牛通</code>（注意是「通」字，官方内测码）即可激活。若提示码已失效，可到
+        <a href="https://docs.qq.com/form/page/DQUJXZUdtRlNGWkxr#/fill" target="_blank" rel="noreferrer">官方申请页</a>
+        重新领取一个。</p>
       <details class="hint">
         <summary>📦 手动安装说明（不用一键部署时点开）</summary>
         <div class="install-guide">
@@ -208,7 +241,8 @@
     image: cnk3x/xunlei:latest
     restart: unless-stopped
     network_mode: host        # bridge 则加 ports: ["2345:2345"]
-    cap_add: [SYS_ADMIN]
+    cap_add: [SYS_ADMIN, SYS_CHROOT]
+    security_opt: ["apparmor=unconfined"]   # 不加会报 mount: permission denied
     environment:
       - XL_UID=1000           # 改成你自己的 UID/GID（通常 1000）
       - XL_GID=1000
@@ -218,7 +252,9 @@
       - /vol1/1000/downloads:/xunlei/downloads          # 下载目录，按需改</pre>
           <p>要点：首次打开面板要登录迅雷账号并填内测邀请码「迅雷牛通」；
             上方「保存目录」照抄面板里显示的路径（如 <code>/downloads</code>），留空用引擎默认目录；
-            数据目录 <code>/xunlei/data</code> 必须持久化，否则重装要重新登录。</p>
+            数据目录 <code>/xunlei/data</code> 必须持久化，否则重装要重新登录。
+            若容器日志报 <code>mount: permission denied</code>：是宿主安全策略拦了容器内挂载，
+            按上面补 <code>security_opt</code>；仍不行改用 <code>privileged: true</code>。</p>
         </div>
       </details>
       <div class="form-grid">
@@ -299,6 +335,21 @@
 </main>
 
 <div id="toast" class="toast" hidden></div>
-<script src="static/app.js"></script>
+<script src="static/app.js?v=@VERSION@"></script>
+<script>
+/* 脚本加载看门狗：app.js 因缓存/网络/base 解析失败没跑起来时，页面会
+   静默变「残废」（tab 点不动、版本号不显示、在线更新失踪）。这里兜底给出
+   明确提示，把神秘故障变成一条可操作的信息。 */
+setTimeout(function () {
+  if (window.__fnmediaReady !== true) {
+    var d = document.createElement("div");
+    d.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:9999;" +
+      "padding:10px 16px;background:#b45309;color:#fff;font-size:13px;text-align:center";
+    d.textContent = "⚠ 页面脚本未能完整加载（可能是缓存或网络问题），" +
+      "请强制刷新页面（Ctrl+F5 或 Ctrl+Shift+R）后重试";
+    document.body.appendChild(d);
+  }
+}, 2500);
+</script>
 </body>
 </html>

@@ -123,6 +123,15 @@ main {
 .card-head h2 { margin: 0; font-size: 16px; }
 .hint { color: var(--muted); font-size: 12.5px; margin: 2px 0; }
 details.hint summary { cursor: pointer; color: var(--warn); user-select: none; }
+.xd-opts { margin: 10px 0 2px; display: grid; gap: 10px; }
+.xd-opts-title { font-size: 12px; font-weight: 600; color: var(--muted); }
+.xd-opt-row { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; align-items: center; font-size: 13px; }
+.xd-opt-name { white-space: nowrap; font-weight: 600; }
+.xd-opt-choices { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.xd-opt-choices label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+.xd-opt-choices .xd-custom { color: var(--muted); }
+.xd-opt-choices input[type="text"] { flex: 1 1 220px; min-width: 180px; }
+.xd-path { color: var(--muted); word-break: break-all; }
 .install-guide { margin-top: 8px; }
 .install-guide p { margin: 6px 0; line-height: 1.7; }
 .install-guide pre {

@@ -104,13 +104,22 @@ cd app && python serve.py --http 127.0.0.1:8787
 
 不需要手动写 compose：安装向导选「没装，请帮我自动部署」，或在管理页
 「迅雷下载引擎」卡片点 **「🚀 一键部署 Docker 版迅雷」**。插件会自动
-检测 Docker → 拉取 `cnk3x/xunlei` 镜像 → 启动容器（数据持久化在应用共享
-目录 `fnmedia-dl/xunlei`，下载目录映射内置共享 `fnmedia-dl/downloads`）→
-配好面板地址。部署完成后打开面板 `http://NAS-IP:2345` 登录迅雷账号即可。
+检测 Docker → 拉取 `cnk3x/xunlei` 镜像 → 启动容器 → 配好面板地址。
+部署完成后打开面板 `http://NAS-IP:2345` 登录迅雷账号即可。首次登录后面板会
+弹出**内测邀请码**输入框，填 `迅雷牛通`（注意是「通」字，官方内测码）激活；
+若提示码已失效，可到[官方申请页](https://docs.qq.com/form/page/DQUJXZUdtRlNGWkxr#/fill)
+重新领取。
+
+**存放位置可选**：部署前可为「Docker 版配置文件存放位置」（账号/配置持久化）
+和「下载文件存放位置」各自选择**用默认还是自己设置**（安装向导和管理页都有
+此选项）。默认分别放在应用数据共享目录与应用下载共享目录（重装升级不丢
+数据）；自己设置时填 NAS 绝对路径（如 `/vol1/1000/docker/xunlei/data`、
+`/vol1/1000/downloads`）。
 
 前提：NAS 已安装并启用 Docker（应用中心 → Docker）。部署只管理插件自建的
 容器 `fnmedia-dl-xunlei`，不碰你自己已有的任何容器；重复点击幂等（已在跑
-就直接复用）。
+就直接复用）。若旧版本部署的容器起不来（日志报 `mount: permission denied`），
+再点一次「一键部署」会自动清理重建修复。
 
 ### 手动部署
 
@@ -124,7 +133,8 @@ services:
     image: cnk3x/xunlei:latest
     restart: unless-stopped
     network_mode: host        # bridge 则加 ports: ["2345:2345"] 并按需改外端口
-    cap_add: [SYS_ADMIN]
+    cap_add: [SYS_ADMIN, SYS_CHROOT]
+    security_opt: ["apparmor=unconfined"]   # 不加会报 mount: permission denied
     environment:
       - XL_UID=1000           # 改成你自己的 UID/GID（通常 1000），避免下载文件属主是 root
       - XL_GID=1000
@@ -136,6 +146,11 @@ services:
 
 要点：
 
+- **挂载权限**：引擎启动时会在容器内 bind mount（构建套件运行环境），默认的
+  AppArmor 策略会拦截，容器日志报 `… mount: permission denied` 后退出。
+  上面的 `cap_add` + `security_opt: apparmor=unconfined` 即为解法
+  （[cnk3x/xunlei#108](https://github.com/cnk3x/xunlei/issues/108)）；个别环境仍
+  被拦时改用 `privileged: true`（并可加 `security_opt: ["seccomp=unconfined"]`）。
 - 首次打开面板要登录迅雷账号并填内测邀请码（`迅雷牛通`），跟应用中心旧版一致。
 - 面板里显示的下载路径是去掉 `/xunlei` 前缀的（如 `/downloads`）；本插件「保存目录」
   照抄面板里显示的路径即可，留空则用引擎默认目录。
