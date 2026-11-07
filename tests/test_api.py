@@ -197,66 +197,6 @@ class TestAPI(unittest.TestCase):
         r3 = self.client.post("/api/history/check", json={"links": []})
         self.assertEqual(r3.status_code, 400)
 
-    def test_retry_quota_switch_message(self):
-        """重试撞配额自动换通道：响应带 switched/message 供前端提示。"""
-        eng = FakeBackend("thunder_engine", "引擎")
-        self._patch_backends({"thunder_engine": eng,
-                              "aria2": FakeBackend("aria2", "aria2")})
-        r = self.client.post("/api/tasks", json={
-            "links": ["https://x/q.iso"], "backend": "thunder_engine"})
-        tid = r.json()["results"][0]["id"]
-        eng._add_ok = False
-        eng._add_error = "HTTP 402: task_create_count_limit 任务创建次数达到上限"
-        r = self.client.post(f"/api/tasks/thunder_engine/{tid}/retry")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertTrue(body["switched"])
-        self.assertEqual(body["backend"], "aria2")
-        self.assertIn("配额", body["message"])
-
-    # ------------------------------------------------ 任务队列（每日定时派发）
-
-    def test_queue_state_empty(self):
-        r = self.client.get("/api/queue")
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(body["items"], [])
-        self.assertIn("settings", body)
-
-    def test_queue_flow(self):
-        self._patch_backends({"aria2": FakeBackend("aria2", "aria2")})
-        # 入队
-        r = self.client.post("/api/queue", json={"links": ["https://x/a.iso"]})
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(len(body["items"]), 1)
-        qid = body["items"][0]["id"]
-        self.assertEqual(body["items"][0]["status"], "queued")
-        # 空请求拒绝
-        r = self.client.post("/api/queue", json={"links": []})
-        self.assertEqual(r.status_code, 400)
-        # 定时设置（含非法时间）
-        r = self.client.post("/api/queue/settings",
-                             json={"enabled": True, "time": "00:05"})
-        self.assertEqual(r.status_code, 200)
-        self.assertTrue(r.json()["settings"]["enabled"])
-        r = self.client.post("/api/queue/settings",
-                             json={"enabled": True, "time": "99:99"})
-        self.assertEqual(r.status_code, 400)
-        # 立即派发
-        r = self.client.post("/api/queue/run", json={})
-        self.assertEqual(r.status_code, 200)
-        body = r.json()
-        self.assertEqual(len(body["results"]), 1)
-        self.assertTrue(body["results"][0]["ok"])
-        self.assertEqual(body["items"][0]["status"], "done")
-        # 移除 + 二次移除 404
-        r = self.client.delete(f"/api/queue/{qid}")
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["items"], [])
-        r = self.client.delete(f"/api/queue/{qid}")
-        self.assertEqual(r.status_code, 404)
-
     def test_config_roundtrip(self):
         r = self.client.put("/api/config", json={"config": {
             "default_dir": "/data/dl",

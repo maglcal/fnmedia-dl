@@ -26,11 +26,6 @@
   POST /api/history/check    下载历史查重（是否下载过某链接）
   POST /api/tasks/{backend}/{id}/pause|resume|retry
   DELETE /api/tasks/{backend}/{id}
-  GET  /api/queue            任务队列与定时设置
-  POST /api/queue            链接入队
-  DELETE /api/queue/{id}     移除队列项
-  POST /api/queue/run        立即派发全部待发项
-  POST /api/queue/settings   每日定时派发设置
 """
 from __future__ import annotations
 
@@ -39,8 +34,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 from pathlib import Path
 
 import httpx
@@ -51,7 +44,6 @@ from pydantic import BaseModel
 
 import config as cfgmod
 import links as linksmod
-import taskqueue as tqmod
 import updater as updmod
 import xunlei_docker as xdmod
 from backends.base import BackendError
@@ -111,19 +103,6 @@ async def _admin_guard(request, call_next):
 
 def _manager() -> DownloadManager:
     return DownloadManager(cfgmod.load())
-
-
-def _queue() -> tqmod.TaskQueue:
-    return tqmod.TaskQueue(Path(cfgmod.STATE_DIR) / "queue.json")
-
-
-def _queue_dispatch(mgr: DownloadManager):
-    """队列派发闭包：auto 降级链 + 全局默认目录兜底。"""
-    def _fn(url: str, directory: str | None) -> dict:
-        return mgr.dispatch(linksmod.parse_line(url), backend="auto",
-                            directory=directory
-                            or mgr.cfg.get("default_dir") or None)
-    return _fn
 
 
 # ------------------------------------------------------------ 页面
@@ -218,9 +197,6 @@ def backends_status():
     out = {}
     for key, impl in mgr.backends().items():
         out[key] = {"label": impl.label, **impl.status()}
-    if "thunder_engine" in out:
-        # 今日配额用量（非会员每日创建次数有限），UI 引擎卡展示
-        out["thunder_engine"]["quota"] = mgr.quota.snapshot()
     return out
 
 
@@ -466,17 +442,14 @@ def resume_task(backend: str, task_id: str):
 
 @app.post("/api/tasks/{backend}/{task_id}/retry")
 def retry_task(backend: str, task_id: str):
-    """失败/已清理任务重试：删旧任务后按原始链接原通道重新派发；
-    原通道撞每日配额时自动换通道（结果带 switched/message）。"""
+    """失败/已清理任务重试：删旧任务后按原始链接原通道重新派发。"""
     mgr = _manager()
     try:
         res = mgr.retry(backend, task_id)
     except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误
         raise HTTPException(502, str(exc))
     return {"ok": True, "backend": res.get("backend"),
-            "id": res.get("id"), "label": res.get("label"),
-            "switched": bool(res.get("switched")),
-            "message": res.get("message", "")}
+            "id": res.get("id"), "label": res.get("label")}
 
 
 @app.delete("/api/tasks/{backend}/{task_id}")
@@ -491,80 +464,6 @@ def _control(action: str, backend: str, task_id: str):
     except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误
         raise HTTPException(502, str(exc))
     return {"ok": True}
-
-
-# ------------------------------------------------------------ 任务队列（每日定时派发）
-
-@app.get("/api/queue")
-def queue_state():
-    return {"ok": True, **_queue().snapshot()}
-
-
-class QueueAddReq(BaseModel):
-    links: list[str] = []
-    text: str = ""
-    directory: str | None = None
-
-
-@app.post("/api/queue")
-def queue_add(req: QueueAddReq):
-    urls = [u.strip() for u in req.links if u.strip()]
-    if req.text.strip():
-        urls.extend(li.url for li in linksmod.parse_text(req.text) if li.url)
-    if not urls:
-        raise HTTPException(400, "没有可入队的链接")
-    q = _queue()
-    added = q.add(urls, directory=req.directory or None)
-    return {"ok": True, "added": [i["id"] for i in added], **q.snapshot()}
-
-
-@app.delete("/api/queue/{item_id}")
-def queue_remove(item_id: str):
-    q = _queue()
-    if not q.remove(item_id):
-        raise HTTPException(404, "队列项不存在")
-    return {"ok": True, **q.snapshot()}
-
-
-@app.post("/api/queue/run")
-def queue_run():
-    """立即派发全部待发项（auto 降级链）。"""
-    mgr = _manager()
-    q = _queue()
-    results = q.run_now(_queue_dispatch(mgr))
-    return {"ok": True, "results": results, **q.snapshot()}
-
-
-class QueueSettingsReq(BaseModel):
-    enabled: bool = False
-    time: str = "00:05"
-
-
-@app.post("/api/queue/settings")
-def queue_settings(req: QueueSettingsReq):
-    q = _queue()
-    try:
-        q.set_settings(enabled=req.enabled, time_str=req.time)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    return {"ok": True, **q.snapshot()}
-
-
-@app.on_event("startup")
-def _queue_worker_start():
-    """队列定时派发守护线程：每 30s 检查一次，到点且当天未跑过则派发待发项。"""
-    def _loop():
-        while True:
-            time.sleep(30)
-            try:
-                q = _queue()
-                if not q.should_run():
-                    continue
-                mgr = _manager()
-                q.tick(_queue_dispatch(mgr))
-            except Exception:  # noqa: BLE001 - 后台线程绝不因异常退出
-                pass
-    threading.Thread(target=_loop, daemon=True, name="queue-ticker").start()
 
 
 @app.exception_handler(Exception)

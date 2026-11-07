@@ -94,27 +94,6 @@
       <div class="card-head"><h2>派发结果</h2></div>
       <ul id="dispatchList" class="link-list"></ul>
     </div>
-
-    <div class="card">
-      <div class="card-head">
-        <h2>📥 任务队列</h2>
-        <span class="hint">配额紧张先入队，每天定时自动派发</span>
-      </div>
-      <p class="hint">迅雷下载引擎每日任务创建次数有限：把不急的链接放进队列，
-        开启「每日定时派发」后每天到点自动放行（自动选通道，配额重置后额度自动到位）；
-        也可随时点「立即派发」手动放行。</p>
-      <div class="row-inline dir-tools">
-        <button id="btnEnqueue" class="btn ghost">＋ 把上方链接加入队列</button>
-        <button id="btnQueueRun" class="btn ghost">▶ 立即派发待发项</button>
-      </div>
-      <div class="row-inline dir-tools">
-        <label class="check"><input type="checkbox" id="queueAuto"><span>每日定时派发</span></label>
-        <input id="queueTime" type="time" value="00:05" style="max-width:110px">
-        <button id="btnQueueSave" class="btn ghost">保存定时设置</button>
-      </div>
-      <div id="queueStatus" class="dir-status" hidden></div>
-      <ul id="queueList" class="link-list"></ul>
-    </div>
   </section>
 
   <!-- ============ 任务列表 ============ -->
@@ -220,7 +199,6 @@
         <b>不支持应用中心官方原生迅雷（社区版）</b>——那套没有本地面板接口，请改用
         「迅雷远程」通道投递（原生迅雷会把 NAS 注册为你迅雷账号的远程设备）。
         没装 Docker 版迅雷？点下方「一键部署」，自动装好并配好面板地址。</p>
-      <p class="hint" id="teQuota"></p>
       <div class="xd-opts">
         <div class="xd-opts-title">Docker 版存放位置（「一键部署」时生效）</div>
         <div class="xd-opt-row">
