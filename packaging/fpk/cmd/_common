@@ -22,16 +22,24 @@ fndl_sync_paths() {
   [ -n "${FNDL_REPO_DIR}" ] || return 0
   local _out="${FNDL_REPO_DIR}/state/paths.env" _pick="" _p
   mkdir -p "${FNDL_REPO_DIR}/state" 2>/dev/null || true
-  # 优先选 downloads 共享（默认下载目录），否则取第一个共享
-  local _oldifs="$IFS"; IFS=':'
+  # 优先选 downloads 共享（默认下载目录），否则取第一个共享；
+  # 数据共享（非 downloads）单列 FNDL_DATA_DIR（Docker 版迅雷持久化等）。
+  local _oldifs="$IFS" _data="" _fb=""; IFS=':'
   for _p in ${TRIM_DATA_SHARE_PATHS:-}; do
     [ -z "${_p}" ] && continue
-    case "${_p}" in */downloads) _pick="${_p}"; break ;; esac
-    [ -z "${_pick}" ] && _pick="${_p}"
+    case "${_p}" in
+      */downloads) [ -z "${_pick}" ] && _pick="${_p}" ;;
+      *)
+        [ -z "${_data}" ] && _data="${_p}"
+        [ -z "${_fb}" ] && _fb="${_p}"
+        ;;
+    esac
   done
   IFS="${_oldifs}"
+  [ -z "${_pick}" ] && _pick="${_fb}"
   {
     echo "FNDL_SHARES_DIR=${_pick}"
+    echo "FNDL_DATA_DIR=${_data}"
     echo "FNDL_ACCESSIBLE_PATHS=${TRIM_DATA_ACCESSIBLE_PATHS:-}"
   } > "${_out}.tmp" 2>/dev/null && mv -f "${_out}.tmp" "${_out}" 2>/dev/null || true
 }

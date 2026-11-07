@@ -11,6 +11,8 @@
   GET  /api/update/progress  更新进度轮询（stage/percent/detail）
   GET  /api/backends         各下载通道状态
   POST /api/backends/test    单通道连通性测试
+  GET  /api/xunlei_docker/status   Docker 版迅雷部署状态
+  POST /api/xunlei_docker/deploy   一键部署 Docker 版迅雷（cnk3x/xunlei，后台执行）
   GET  /api/thunder_cloud/review         迅雷风控短信验证状态
   POST /api/thunder_cloud/review/send    获取短信验证码
   POST /api/thunder_cloud/review/check   提交短信验证码
@@ -29,6 +31,8 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -41,6 +45,7 @@ from pydantic import BaseModel
 import config as cfgmod
 import links as linksmod
 import updater as updmod
+import xunlei_docker as xdmod
 from backends.base import BackendError
 from downloader import DownloadManager
 
@@ -77,6 +82,23 @@ async def _no_cache_ui(request, call_next):
     if any(t in ct for t in ("text/html", "javascript", "text/css")):
         resp.headers["Cache-Control"] = "no-cache"
     return resp
+
+
+_MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+@app.middleware("http")
+async def _admin_guard(request, call_next):
+    """管理接口鉴权（官方网关规范）：统一网关转发时注入 X-Trim-Userid/Isadmin/Username，
+    写操作只放行管理员（X-Trim-Isadmin: true）。
+    不信任客户端自带的 uid；无任何 X-Trim-* 头 = 未经网关（本地调试/兼容环境），放行。"""
+    if request.method in _MUTATING:
+        headers = request.headers
+        via_gateway = any(k.startswith("x-trim-") for k in headers)
+        if via_gateway and headers.get("x-trim-isadmin", "").lower() != "true":
+            return JSONResponse(status_code=403,
+                                content={"detail": "仅管理员可执行此操作"})
+    return await call_next(request)
 
 
 def _manager() -> DownloadManager:
@@ -186,6 +208,46 @@ def backends_test(req: BackendTestReq):
     if not impl:
         raise HTTPException(404, f"未知通道：{req.backend}")
     return {"backend": req.backend, **impl.status()}
+
+
+# ------------------------------------------------------------ Docker 版迅雷一键部署
+
+@app.get("/api/xunlei_docker/status")
+def xd_status():
+    return {
+        "deploy": xdmod.progress(),
+        "running": xdmod.running(),
+        "container": xdmod.container_state(),
+        "docker": xdmod.docker_bin() is not None,
+        "panel_url": xdmod.PANEL_URL,
+    }
+
+
+@app.post("/api/xunlei_docker/deploy")
+def xd_deploy():
+    """一键部署 Docker 版迅雷：独立后台进程执行（服务重启不影响），
+    进度走 GET /api/xunlei_docker/status 轮询。"""
+    if xdmod.running():
+        raise HTTPException(400, "已有部署正在进行，请稍候")
+    log = Path(cfgmod.STATE_DIR) / "xunlei-deploy.log"
+    logfh = None
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        logfh = open(log, "a", encoding="utf-8")
+    except OSError:
+        logfh = None  # 日志不可写不阻塞部署
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve().parent / "xunlei_docker.py"), "run"],
+            start_new_session=True,
+            stdout=logfh if logfh is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT)
+    finally:
+        # Popen 已把句柄带入子进程，父进程这份及时关闭（避免句柄泄漏）
+        if logfh is not None:
+            logfh.close()
+    return {"ok": True, "started": True,
+            "detail": "已开始部署：拉取镜像可能需要几分钟，进度见卡片内状态"}
 
 
 # ------------------------------------------------------------ 迅雷风控短信验证

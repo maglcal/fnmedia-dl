@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import tarfile
 import tempfile
@@ -224,6 +225,34 @@ class TestRequirementsChanged(unittest.TestCase):
         tree.mkdir()
         (tree / "requirements.txt").write_text("a==1\n")
         self.assertFalse(updater._requirements_changed(tree))
+
+
+class TestRestartService(unittest.TestCase):
+    """重启策略：systemd 托管自终止（免 root），否则退回 systemctl。"""
+
+    def test_systemd_self_terminate(self):
+        from unittest import mock
+        with mock.patch.dict("os.environ", {"INVOCATION_ID": "test-id"}), \
+             mock.patch.object(updater.subprocess, "Popen") as popen:
+            self.assertTrue(updater._restart_service())
+        args = popen.call_args[0][0]
+        self.assertIn(f"kill -TERM {os.getpid()}", args[2])
+
+    def test_fallback_systemctl(self):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+        with mock.patch.dict("os.environ", env, clear=True), \
+             mock.patch.object(updater.shutil, "which", return_value="/bin/systemctl"), \
+             mock.patch.object(updater.subprocess, "Popen") as popen:
+            self.assertTrue(updater._restart_service())
+        self.assertIn("systemctl restart", popen.call_args[0][0][2])
+
+    def test_no_restart_means_returns_false(self):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k != "INVOCATION_ID"}
+        with mock.patch.dict("os.environ", env, clear=True), \
+             mock.patch.object(updater.shutil, "which", return_value=None):
+            self.assertFalse(updater._restart_service())
 
 
 if __name__ == "__main__":

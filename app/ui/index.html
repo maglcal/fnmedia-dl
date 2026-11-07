@@ -189,7 +189,38 @@
         <h2>迅雷下载引擎</h2>
         <span class="tag warn">受每日配额限制</span>
       </div>
-      <p class="hint">直连 NAS 上的迅雷下载引擎 web 面板，走套件端入口。</p>
+      <p class="hint">直连「群晖套件系」迅雷 web 面板（cnk3x Docker 版等，走套件端入口）。
+        <b>不支持应用中心官方原生迅雷（社区版）</b>——那套没有本地面板接口，请改用
+        「迅雷远程」通道投递（原生迅雷会把 NAS 注册为你迅雷账号的远程设备）。
+        没装 Docker 版迅雷？点下方「一键部署」，自动装好并配好面板地址。</p>
+      <div class="actions">
+        <button id="btnDeployXd" class="btn primary">🚀 一键部署 Docker 版迅雷</button>
+      </div>
+      <div id="xdDeployStatus" class="dir-status" hidden></div>
+      <details class="hint">
+        <summary>📦 手动安装说明（不用一键部署时点开）</summary>
+        <div class="install-guide">
+          <p>用 Docker Compose 部署 <code>cnk3x/xunlei</code>（推荐 host 网络，
+            面板默认 <code>http://NAS-IP:2345</code>）：</p>
+          <pre>services:
+  xunlei:
+    container_name: xunlei
+    image: cnk3x/xunlei:latest
+    restart: unless-stopped
+    network_mode: host        # bridge 则加 ports: ["2345:2345"]
+    cap_add: [SYS_ADMIN]
+    environment:
+      - XL_UID=1000           # 改成你自己的 UID/GID（通常 1000）
+      - XL_GID=1000
+      - TZ=Asia/Shanghai
+    volumes:
+      - /vol1/1000/docker/xunlei/data:/xunlei/data      # 账号/配置，必须持久化
+      - /vol1/1000/downloads:/xunlei/downloads          # 下载目录，按需改</pre>
+          <p>要点：首次打开面板要登录迅雷账号并填内测邀请码「迅雷牛通」；
+            上方「保存目录」照抄面板里显示的路径（如 <code>/downloads</code>），留空用引擎默认目录；
+            数据目录 <code>/xunlei/data</code> 必须持久化，否则重装要重新登录。</p>
+        </div>
+      </details>
       <div class="form-grid">
         <label>引擎面板地址
           <input id="teUrl" type="text" placeholder="http://127.0.0.1:2345">

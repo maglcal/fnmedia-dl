@@ -19,7 +19,7 @@ if [ -n "${FNDL_REPO_DIR}" ] && [ -f "${UNIT_FILE}" ]; then
 fi
 
 [ -n "${FNDL_REPO_DIR}" ] || exit 0
-BACKUP_DIR="${TRIM_PKGVAR:-/tmp}/fnmedia-dl-upgrade-backup"
+BACKUP_DIR="${TRIM_TEMP_UPGRADE_FOLDER:-${TRIM_PKGVAR:-/tmp}}/fnmedia-dl-upgrade-backup"
 rm -rf "${BACKUP_DIR}"; mkdir -p "${BACKUP_DIR}"
 if [ -d "${FNDL_REPO_DIR}/state" ]; then
   tar --ignore-failed-read -czf "${BACKUP_DIR}/state.tar.gz" \

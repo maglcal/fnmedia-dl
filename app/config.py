@@ -98,8 +98,8 @@ def _paths_env_file() -> Path:
 
 
 def runtime_paths() -> dict:
-    """读取 FNDL_SHARES_DIR / FNDL_ACCESSIBLE_PATHS（文件 + 环境变量覆盖）。"""
-    out = {"FNDL_SHARES_DIR": "", "FNDL_ACCESSIBLE_PATHS": ""}
+    """读取 FNDL_SHARES_DIR / FNDL_DATA_DIR / FNDL_ACCESSIBLE_PATHS（文件 + 环境变量覆盖）。"""
+    out = {"FNDL_SHARES_DIR": "", "FNDL_DATA_DIR": "", "FNDL_ACCESSIBLE_PATHS": ""}
     pf = _paths_env_file()
     if pf.is_file():
         try:
@@ -118,6 +118,11 @@ def runtime_paths() -> dict:
 def share_dir() -> str:
     """应用共享目录（data-share 创建的默认下载目录，免授权）。"""
     return runtime_paths().get("FNDL_SHARES_DIR", "")
+
+
+def data_dir() -> str:
+    """应用数据共享目录（data-share 的 fnmedia-dl 根共享，持久化运行数据）。"""
+    return runtime_paths().get("FNDL_DATA_DIR", "")
 
 
 def accessible_paths() -> list[str]:

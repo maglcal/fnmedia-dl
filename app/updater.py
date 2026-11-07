@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import subprocess
 import tarfile
@@ -235,7 +236,17 @@ def _rebuild_deps() -> None:
 
 
 def _restart_service() -> bool:
-    """延迟 1 秒重启 systemd 服务（先让 HTTP 响应落地）；无 systemd 环境返回 False。"""
+    """延迟 1 秒重启服务（先让 HTTP 响应落地）。
+
+    服务以专用应用用户运行时无权 systemctl：systemd 托管环境
+    （INVOCATION_ID 存在）改为自终止，由单元 Restart=always 拉起新进程；
+    非托管环境退回 systemctl（root 手动部署场景）；都没有返回 False。"""
+    if os.environ.get("INVOCATION_ID"):
+        subprocess.Popen(
+            ["sh", "-c", f"sleep 1; kill -TERM {os.getpid()}"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     if not shutil.which("systemctl"):
         return False
     subprocess.Popen(

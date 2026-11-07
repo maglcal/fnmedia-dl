@@ -2,5 +2,7 @@
     "defaults":
     {
         "run-as": "root"
-    }
+    },
+    "username": "fnmedia-dl",
+    "groupname": "fnmedia-dl"
 }

@@ -320,5 +320,39 @@ class TestUIPaths(unittest.TestCase):
                 self.assertNotIn(pat, text, f"{name} 残留绝对路径: {pat}")
 
 
+class TestAdminGuard(unittest.TestCase):
+    """写操作鉴权：网关转发（X-Trim-* 头）时仅管理员可写；无头直连放行兼容。"""
+
+    def setUp(self):
+        self.client = TestClient(main.app)
+
+    def test_mutating_without_gateway_headers_allowed(self):
+        r = self.client.post("/api/parse", json={"text": ""})
+        self.assertNotEqual(r.status_code, 403)
+
+    def test_mutating_admin_allowed(self):
+        r = self.client.post("/api/parse", json={"text": ""},
+                             headers={"x-trim-userid": "1000",
+                                      "x-trim-isadmin": "true"})
+        self.assertNotEqual(r.status_code, 403)
+
+    def test_mutating_non_admin_rejected(self):
+        hdrs = {"x-trim-userid": "1001", "x-trim-isadmin": "false"}
+        cases = [
+            ("post", "/api/parse", {"json": {"text": ""}}),
+            ("put", "/api/config", {"json": {"config": {}}}),
+            ("delete", "/api/tasks/aria2/x", {}),
+        ]
+        for method, path, kw in cases:
+            r = getattr(self.client, method)(path, headers=hdrs, **kw)
+            self.assertEqual(r.status_code, 403, f"{method} {path}")
+            self.assertIn("管理员", r.json()["detail"])
+
+    def test_readonly_not_blocked(self):
+        r = self.client.get("/api/health",
+                            headers={"x-trim-isadmin": "false"})
+        self.assertEqual(r.status_code, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

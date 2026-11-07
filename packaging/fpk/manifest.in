@@ -10,4 +10,6 @@ os_min_version        = 1.2.0
 desktop_uidir         = ui
 desktop_applaunchname = fnmedia-dl.main
 checkport             = false
+ctl_stop              = true
+changelog             = v@VERSION@ 更新内容详见 https://github.com/maglcal/fnmedia-dl/releases
 micro_app             = true

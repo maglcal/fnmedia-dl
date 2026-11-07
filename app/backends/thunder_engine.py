@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""迅雷下载引擎通道（备选）：直连本地/局域网迅雷引擎 web 面板。
+"""迅雷下载引擎通道（备选）：直连本地/局域网「群晖套件系」迅雷引擎 web 面板。
+
+支持范围：cnk3x/xunlei 的 Docker 版、群晖迅雷套件等 webman 面板系引擎。
+应用中心官方原生迅雷（飞牛社区版）**不支持本地直连**（无此面板接口），
+请改用迅雷远程通道（原生迅雷会把 NAS 注册为迅雷账号的远程设备）。
 
 认证：GET 面板首页，正则提取 uiauth(value){return "..."} 作为 pan-auth JWT。
 请求前缀：/webman/3rdparty/pan-xunlei-com/index.cgi/drive/v1/...
@@ -16,6 +20,8 @@ from .drive_core import DriveCore, task_to_view
 
 UIAUTH_RE = re.compile(r'uiauth\(value\)\{\s*return\s*"([^"]+)"')
 PATH_PREFIX = "/webman/3rdparty/pan-xunlei-com/index.cgi"
+SCOPE_HINT = ("（本通道仅支持 Docker/群晖套件版迅雷面板；应用中心官方原生迅雷"
+              "「社区版」请改用迅雷远程通道）")
 
 
 class ThunderEngine(Backend):
@@ -41,12 +47,13 @@ class ThunderEngine(Backend):
             resp = self.client.get(self.base_url + PATH_PREFIX + "/",
                                    timeout=15)
         except httpx.HTTPError as exc:
-            raise BackendError(f"引擎面板连接失败：{exc}") from exc
+            raise BackendError(f"引擎面板连接失败：{exc}{SCOPE_HINT}") from exc
         if resp.status_code >= 400:
-            raise BackendError(f"引擎面板返回 HTTP {resp.status_code}")
+            raise BackendError(f"引擎面板返回 HTTP {resp.status_code}{SCOPE_HINT}")
         m = UIAUTH_RE.search(resp.text)
         if not m:
-            raise BackendError("引擎面板未返回 pan-auth（请确认面板地址与版本）")
+            raise BackendError(f"引擎面板未返回 pan-auth"
+                               f"（请确认面板地址与版本）{SCOPE_HINT}")
         self._token = m.group(1)
 
     def _space_of(self) -> str:

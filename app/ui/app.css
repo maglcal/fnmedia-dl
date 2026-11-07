@@ -122,6 +122,18 @@ main {
 }
 .card-head h2 { margin: 0; font-size: 16px; }
 .hint { color: var(--muted); font-size: 12.5px; margin: 2px 0; }
+details.hint summary { cursor: pointer; color: var(--warn); user-select: none; }
+.install-guide { margin-top: 8px; }
+.install-guide p { margin: 6px 0; line-height: 1.7; }
+.install-guide pre {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; overflow-x: auto; font-size: 12px; line-height: 1.6;
+  color: var(--text); white-space: pre;
+}
+.install-guide code {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 4px; font-size: 12px;
+}
 
 /* ---------------- 表单 ---------------- */
 textarea, input, select {

@@ -88,8 +88,60 @@ cd app && python serve.py --http 127.0.0.1:8787
    验证地址，浏览器完成验证后重试。`target` 留空时自动发现账号下第一台远程设备
    （需先在迅雷 App 中绑定远程下载设备）。
 2. **迅雷下载引擎**：填引擎 web 面板地址（如 `http://127.0.0.1:2345`，Docker/套件版
-   按实际端口）。注意此通道走套件端入口，任务数可能受每日配额限制。
+   按实际端口）。没装 Docker 版迅雷也不用愁——安装向导可选「帮我自动部署」，
+   或在管理页「迅雷下载引擎」卡片点「一键部署 Docker 版迅雷」，自动完成
+   拉镜像、起容器、配面板地址（详见下一节）。注意此通道走套件端入口，
+   任务数可能受每日配额限制。
+   **支持范围**：仅「群晖套件系」面板（cnk3x/xunlei 的 Docker 版、群晖迅雷套件等）。
+   **应用中心官方原生迅雷（"飞牛社区版"）不支持本地直连**——它没有这套面板接口；
+   如需配合官方原生迅雷，请用**迅雷远程通道**（原生迅雷会把 NAS 注册为你迅雷账号的
+   远程设备，远程通道可直接向它派发任务）。
 3. **aria2**：需 aria2 开启 RPC（`--enable-rpc --rpc-listen-port=6800`），有 RPC 密钥则一并填写。
+
+## 迅雷下载引擎（Docker 版）安装
+
+### 一键部署（推荐）
+
+不需要手动写 compose：安装向导选「没装，请帮我自动部署」，或在管理页
+「迅雷下载引擎」卡片点 **「🚀 一键部署 Docker 版迅雷」**。插件会自动
+检测 Docker → 拉取 `cnk3x/xunlei` 镜像 → 启动容器（数据持久化在应用共享
+目录 `fnmedia-dl/xunlei`，下载目录映射内置共享 `fnmedia-dl/downloads`）→
+配好面板地址。部署完成后打开面板 `http://NAS-IP:2345` 登录迅雷账号即可。
+
+前提：NAS 已安装并启用 Docker（应用中心 → Docker）。部署只管理插件自建的
+容器 `fnmedia-dl-xunlei`，不碰你自己已有的任何容器；重复点击幂等（已在跑
+就直接复用）。
+
+### 手动部署
+
+引擎直连通道配合 **cnk3x/xunlei Docker 版** 使用。host 网络最省心（UPnP 正常、
+下载速度更好），面板默认 `http://NAS-IP:2345`：
+
+```yaml
+services:
+  xunlei:
+    container_name: xunlei
+    image: cnk3x/xunlei:latest
+    restart: unless-stopped
+    network_mode: host        # bridge 则加 ports: ["2345:2345"] 并按需改外端口
+    cap_add: [SYS_ADMIN]
+    environment:
+      - XL_UID=1000           # 改成你自己的 UID/GID（通常 1000），避免下载文件属主是 root
+      - XL_GID=1000
+      - TZ=Asia/Shanghai
+    volumes:
+      - /vol1/1000/docker/xunlei/data:/xunlei/data        # 账号/配置，必须持久化
+      - /vol1/1000/downloads:/xunlei/downloads            # 下载目录，按需改
+```
+
+要点：
+
+- 首次打开面板要登录迅雷账号并填内测邀请码（`迅雷牛通`），跟应用中心旧版一致。
+- 面板里显示的下载路径是去掉 `/xunlei` 前缀的（如 `/downloads`）；本插件「保存目录」
+  照抄面板里显示的路径即可，留空则用引擎默认目录。
+- 有多个下载目录时用 `XL_DIR_DOWNLOAD`（冒号分隔，均以 `/xunlei` 开头）配合多条
+  volumes 映射。
+- 完整参数见 [cnk3x/xunlei](https://github.com/cnk3x/xunlei)。
 
 ## 迅雷接口说明（重要）
 

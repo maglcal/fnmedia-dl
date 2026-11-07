@@ -4,12 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+# 最小权限：长期服务进程以专用应用用户运行（生命周期脚本仍以 root 管理单元）。
+# 用户不存在时 install.sh 会自动回退去掉 User=/Group=（root 兜底，仅手动部署）。
+User=fnmedia-dl
+Group=fnmedia-dl
 WorkingDirectory=@ROOT@/app
 ExecStart=@ROOT@/.venv/bin/python serve.py
 KillMode=mixed
 TimeoutStopSec=25
-Restart=on-failure
+# Restart=always：在线更新完成后的“自终止重启”依赖此策略拉起新进程。
+Restart=always
 RestartSec=5
 UMask=0022
 Environment=PYTHONUNBUFFERED=1

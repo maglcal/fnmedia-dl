@@ -18,4 +18,12 @@ if [ "${agree_ok}" -ne 1 ]; then
 fi
 
 command -v python3 >/dev/null 2>&1 || fndl_fail "需要 python3"
+
+# —— Docker 版迅雷安装方式（向导单选，取值视为不可信输入需校验）——
+# deploy = 装完自动部署 cnk3x/xunlei；existing/skip = 不自动部署。
+xd_raw="$(printf '%s' "${wizard_xunlei_docker:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
+case "${xd_raw}" in
+  ""|deploy|existing|skip) ;;
+  *) fndl_fail "「Docker 版迅雷」选项取值无效，请返回上一步重新选择。" ;;
+esac
 exit 0

@@ -352,6 +352,7 @@ async function loadConfig() {
   }
   loadFs();
   loadTcReview();
+  loadXdStatus();
 }
 
 /* 目录与授权：共享目录、已授权目录、目录检测 */
@@ -486,6 +487,95 @@ $("#tcLoginBtn").addEventListener("click", async () => {
   } finally {
     $("#tcLoginBtn").disabled = false;
     loadTcReview();
+  }
+});
+
+/* ---------------- Docker 版迅雷一键部署（cnk3x/xunlei） ----------------
+   安装向导选「帮我自动部署」或这里点按钮：自动拉镜像、起容器、配面板地址。
+   部署由独立后台进程执行（服务重启不影响），这里只做状态轮询与结果回填。 */
+const XDP = { timer: null };
+
+function xdRender(s) {
+  const box = $("#xdDeployStatus");
+  const btn = $("#btnDeployXd");
+  const d = (s && s.deploy) || {};
+  const active = !!s && (s.running || (!d.done && d.stage !== "idle" && d.stage !== "error"));
+  box.hidden = false;
+  btn.disabled = active;
+  if (active) {
+    box.className = "dir-status";
+    box.textContent = `部署中：${d.detail || d.stage || "…"}（${d.percent || 0}%）`;
+  } else if (d.stage === "error") {
+    box.className = "dir-status bad";
+    box.textContent = "✗ " + (d.detail || "部署失败") + "，可点上方按钮重试";
+  } else if (s && s.container === "running") {
+    box.className = "dir-status ok";
+    box.textContent = "✓ Docker 版迅雷容器运行中，点「测试连接」确认连通后即可使用";
+  } else if (d.done) {
+    box.className = "dir-status ok";
+    box.textContent = "✓ " + (d.detail || "已部署");
+  } else if (s && !s.docker) {
+    box.className = "dir-status bad";
+    box.textContent = "未检测到 Docker：请先到 应用中心 → Docker 安装并启动，再点「一键部署」";
+  } else {
+    box.className = "dir-status";
+    box.textContent = "还没部署 Docker 版迅雷：点上方按钮自动安装配置（需 NAS 已装 Docker）";
+  }
+  return active;
+}
+
+async function loadXdStatus() {
+  try {
+    xdRender(await API.get("/api/xunlei_docker/status"));
+  } catch (e) {
+    const box = $("#xdDeployStatus");
+    box.hidden = false;
+    box.className = "dir-status bad";
+    box.textContent = "部署状态获取失败：" + e.message;
+  }
+}
+
+function xdStartPoll() {
+  if (XDP.timer) return;
+  XDP.timer = setInterval(async () => {
+    let s = null;
+    try {
+      s = await API.get("/api/xunlei_docker/status");
+    } catch {
+      return;   // 服务暂不可达，等下一轮
+    }
+    const active = xdRender(s);
+    if (active) return;
+    clearInterval(XDP.timer);
+    XDP.timer = null;
+    const d = s.deploy || {};
+    if (d.done && d.stage !== "error") {
+      // 成功后自动回填面板地址并保存，用户零操作
+      if (!$("#teUrl").value.trim()) $("#teUrl").value = s.panel_url;
+      try { await saveConfig(); } catch { /* 保存失败不影响部署结果展示 */ }
+      toast("✓ Docker 版迅雷已就绪，打开面板登录迅雷账号即可使用");
+      loadChips();
+    }
+  }, 2500);
+}
+
+$("#btnDeployXd").addEventListener("click", async () => {
+  if (!confirm("将自动拉取 cnk3x/xunlei 镜像并启动容器" +
+    "（数据持久化到应用共享目录），继续？\n需要 NAS 已安装并启用 Docker（应用中心 → Docker）。")) return;
+  const btn = $("#btnDeployXd");
+  const box = $("#xdDeployStatus");
+  btn.disabled = true;
+  box.hidden = false;
+  box.className = "dir-status";
+  box.textContent = "部署中：准备…";
+  try {
+    const r = await API.send("/api/xunlei_docker/deploy", "POST", {});
+    toast(r.detail || "已开始部署…");
+    xdStartPoll();
+  } catch (e) {
+    box.className = "dir-status bad";
+    box.textContent = "✗ " + e.message;
+    btn.disabled = false;
   }
 });
 

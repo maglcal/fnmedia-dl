@@ -22,4 +22,16 @@ fi
 bash deploy/install.sh >> "${FNDL_LOG}" 2>&1 || { tail -n 8 "${FNDL_LOG}" >&2 || true; fndl_fail "服务启动失败，详见 ${FNDL_LOG}"; }
 # 同步共享目录/授权目录清单给应用（默认下载目录等）
 fndl_sync_paths
+# —— Docker 版迅雷自动部署（向导选了「帮我自动部署」才触发）——
+# 后台独立进程执行：镜像拉取可能要几分钟，不能卡住安装流程；
+# 进度/结果见管理页「迅雷下载引擎」卡片（state/xunlei-deploy.json）。
+xd_pick="$(printf '%s' "${wizard_xunlei_docker:-}" | tr -d '[]"[:space:]' | tr 'A-Z' 'a-z')"
+if [ "${xd_pick}" = "deploy" ]; then
+  if [ -n "${FNDL_REPO_DIR}" ] && [ -x "${FNDL_REPO_DIR}/.venv/bin/python" ]; then
+    ( cd "${FNDL_REPO_DIR}" && nohup ./.venv/bin/python app/xunlei_docker.py run >> "${FNDL_LOG}" 2>&1 & )
+    echo "[fnmedia-dl] 已在后台自动部署 Docker 版迅雷（cnk3x/xunlei），进度见管理页「迅雷下载引擎」卡片" >> "${FNDL_LOG}"
+  else
+    echo "[fnmedia-dl] 未找到应用 Python 环境，跳过 Docker 版迅雷自动部署；可稍后在管理页「迅雷下载引擎」卡片点「一键部署」" >> "${FNDL_LOG}"
+  fi
+fi
 exit 0
