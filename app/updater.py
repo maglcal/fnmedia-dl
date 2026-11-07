@@ -5,8 +5,12 @@
   downloading → extracting → backing_up → replacing → [deps] → restarting → done
 任一步失败：整体回滚到备份，状态置 error 并说明原因。
 
+下载（多源回退）：下载候选按序「镜像源 → 官方源」，每个候选重试 2 次，
+校验大小/SHA256，不符或失败自动换下一个候选（download_verified）。
+
 安全边界：
-  - 只接受本仓库 GitHub Releases 下载地址（validate_asset_url）；
+  - 只接受官方 GitHub Releases 与「用户已配置镜像源」的 .fpk 地址
+    （validate_asset_url，镜像前缀由 main 依配置传入）；
   - 只替换白名单条目（app/deploy/packaging/wheelhouse/VERSION 等），
     state/（配置、凭据、任务记录）与 .venv/ 永不触碰；
   - 替换前整份备份到 <repo>/.update-backup/，失败即回滚；
@@ -14,6 +18,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import shutil
@@ -21,6 +26,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -82,10 +88,11 @@ def _read_version(root: Path | None = None) -> str:
         return "0.0.0"
 
 
-def validate_asset_url(url: str) -> bool:
-    """只放行本仓库 GitHub Releases 的 .fpk 资产下载地址。"""
+def validate_asset_url(url: str, extra_prefixes: list[str] | None = None) -> bool:
+    """只放行官方 GitHub Releases 与「已配置镜像源」的 .fpk 下载地址。"""
+    allowed = [DOWNLOAD_URL_PREFIX, *(extra_prefixes or [])]
     return (isinstance(url, str)
-            and url.startswith(DOWNLOAD_URL_PREFIX)
+            and any(url.startswith(p) for p in allowed if p)
             and url.endswith(".fpk")
             and ".." not in url)
 
@@ -210,6 +217,46 @@ def download_fpk(url: str, dest: Path,
     return dest.stat().st_size
 
 
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_verified(urls: list[str], dest: Path,
+                      sha256: str = "", expected_size: int = 0,
+                      client: httpx.Client | None = None) -> int:
+    """多候选下载并校验：逐候选「下载 → 校验大小/SHA256」，
+    每候选最多重试 2 次（递增退避），失败或校验不符自动换下一个候选。
+    全部失败抛 UpdateError（含逐候选原因汇总）。返回文件大小。"""
+    errors: list[str] = []
+    for idx, url in enumerate(urls, 1):
+        tag = f"候选{idx}"
+        for attempt in (1, 2):
+            try:
+                size = download_fpk(url, dest, client=client)
+                if expected_size and size != expected_size:
+                    raise UpdateError(
+                        f"大小不符（{size} ≠ {expected_size} 字节）")
+                if sha256:
+                    actual = _sha256_of(dest)
+                    if actual.lower() != sha256.lower():
+                        raise UpdateError("SHA256 校验不符")
+                _set("downloading", 80, "下载校验通过")
+                return size
+            except UpdateError as exc:
+                errors.append(f"{tag}第{attempt}次：{exc}")
+                if attempt == 1:
+                    time.sleep(1.5 * idx)   # 递增退避后重试同候选
+            except httpx.HTTPError as exc:
+                errors.append(f"{tag}第{attempt}次：网络错误 {exc}")
+                if attempt == 1:
+                    time.sleep(1.5 * idx)
+    raise UpdateError("所有下载候选均失败：" + "；".join(errors))
+
+
 # ------------------------------------------------------------ 依赖与重启
 
 def _requirements_changed(new_tree: Path) -> bool:
@@ -258,28 +305,38 @@ def _restart_service() -> bool:
 
 # ------------------------------------------------------------ 编排
 
-def start(url: str, version: str = "") -> dict:
-    """启动后台更新线程（单例）。返回当前进度快照。"""
+def start(url: str, version: str = "", *,
+          fallback_urls: list[str] | None = None,
+          sha256: str = "", expected_size: int = 0,
+          allowed_prefixes: list[str] | None = None) -> dict:
+    """启动后台更新线程（单例）。返回当前进度快照。
+
+    url 为主下载候选（镜像源优先），fallback_urls 为回退候选（官方源兜底），
+    两者按序组成下载候选列表；sha256/expected_size 为清单校验值（可空），
+    allowed_prefixes 为镜像源地址前缀（由 main 依配置传入）。"""
     global _thread
-    if not validate_asset_url(url):
-        raise UpdateError("仅支持本项目 GitHub Releases 的 .fpk 下载地址")
+    candidates = [url, *(fallback_urls or [])]
+    for u in candidates:
+        if not validate_asset_url(u, allowed_prefixes):
+            raise UpdateError("仅支持本项目官方 Releases 与已配置镜像源的 .fpk 地址")
     with _lock:
         if _thread is not None and _thread.is_alive():
             raise UpdateError("已有更新正在进行中")
         _state.update(stage="downloading", percent=0, detail="准备下载…",
                       error="", from_version=_read_version(),
                       to_version=(version or "").lstrip("vV"), done=False)
-    _thread = threading.Thread(target=_run, args=(url,), daemon=True)
+    _thread = threading.Thread(
+        target=_run, args=(candidates, sha256, expected_size), daemon=True)
     _thread.start()
     return progress()
 
 
-def _run(url: str) -> None:
+def _run(urls: list[str], sha256: str = "", expected_size: int = 0) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="fndl-update-"))
     fpk_path = workdir / "update.fpk"
     replaced = False
     try:
-        download_fpk(url, fpk_path)                              # 5..80%
+        download_verified(urls, fpk_path, sha256, expected_size)   # 5..80%
         _set("extracting", 82, "解包校验…")
         new_tree = extract_repo_tree(fpk_path, workdir)
         new_ver = _read_version(new_tree)

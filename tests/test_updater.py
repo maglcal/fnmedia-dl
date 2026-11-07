@@ -2,6 +2,7 @@
 """在线更新器测试（假 fpk + 临时目录，全程无网络）。"""
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
@@ -183,6 +184,114 @@ class TestValidateUrl(unittest.TestCase):
 
     def test_reject_empty(self):
         self.assertFalse(updater.validate_asset_url(""))
+
+    def test_mirror_prefix_allowed(self):
+        """已配置镜像源前缀放行（含跨源回退候选）。"""
+        self.assertTrue(updater.validate_asset_url(
+            "http://mirror.example.com/raw/fnmedia-dl/releases/"
+            "v0.1.24/fnmedia-dl-0.1.24.fpk",
+            ["http://mirror.example.com/raw/fnmedia-dl/"]))
+
+    def test_mirror_prefix_still_rejects_non_fpk_and_traversal(self):
+        p = ["http://mirror.example.com/raw/fnmedia-dl/"]
+        self.assertFalse(updater.validate_asset_url(
+            "http://mirror.example.com/raw/fnmedia-dl/x.exe", p))
+        self.assertFalse(updater.validate_asset_url(
+            "http://mirror.example.com/raw/fnmedia-dl/../evil.fpk", p))
+
+    def test_unlisted_mirror_rejected(self):
+        self.assertFalse(updater.validate_asset_url(
+            "http://other.example.com/raw/fnmedia-dl/x.fpk",
+            ["http://mirror.example.com/raw/fnmedia-dl/"]))
+
+
+class TestDownloadVerified(unittest.TestCase):
+    def setUp(self):
+        # 打桩下载与退避，专注候选切换/校验逻辑
+        self.calls: list[str] = []
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dest = Path(self._tmp.name) / "a.fpk"
+        self._orig_download = updater.download_fpk
+        self._orig_sleep = updater.time.sleep
+        updater.time.sleep = lambda s: None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        updater.download_fpk = self._orig_download
+        updater.time.sleep = self._orig_sleep
+        self._tmp.cleanup()
+
+    def _stub_download(self, impl):
+        def fake(url, dest, client=None):
+            self.calls.append(url)
+            return impl(url, dest)
+        updater.download_fpk = fake
+
+    def test_first_candidate_ok(self):
+        def impl(url, dest):
+            dest.write_bytes(b"hello")
+            return 5
+        self._stub_download(impl)
+        size = updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5)
+        self.assertEqual(size, 5)
+        self.assertEqual(self.calls, ["http://a/x.fpk"])
+
+    def test_fallback_on_download_error(self):
+        def impl(url, dest):
+            if "http://a/" in url:
+                raise updater.UpdateError("下载失败：HTTP 500")
+            dest.write_bytes(b"hello")
+            return 5
+        self._stub_download(impl)
+        updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+        self.assertIn("http://b/x.fpk", self.calls)
+
+    def test_sha256_mismatch_switches_candidate(self):
+        def impl(url, dest):
+            dest.write_bytes(b"hello" if "http://b/" in url else b"evil!")
+            return 5
+        self._stub_download(impl)
+        good = hashlib.sha256(b"hello").hexdigest()
+        size = updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, sha256=good)
+        self.assertEqual(size, 5)
+        self.assertIn("http://b/x.fpk", self.calls)
+
+    def test_size_mismatch_switches_candidate(self):
+        def impl(url, dest):
+            dest.write_bytes(b"hello" if "http://b/" in url else b"hi")
+            return 2 if "http://a/" in url else 5
+        self._stub_download(impl)
+        updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5)
+        self.assertIn("http://b/x.fpk", self.calls)
+
+    def test_all_fail_raises_with_summary(self):
+        def impl(url, dest):
+            raise updater.UpdateError("下载失败：HTTP 500")
+        self._stub_download(impl)
+        with self.assertRaises(updater.UpdateError) as cm:
+            updater.download_verified(
+                ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+        msg = str(cm.exception)
+        self.assertIn("所有下载候选均失败", msg)
+        self.assertIn("候选1", msg)
+        self.assertIn("候选2", msg)
+        # 每候选重试 2 次
+        self.assertEqual(len(self.calls), 4)
+
+    def test_network_error_also_retries_and_falls_back(self):
+        def impl(url, dest):
+            if "http://a/" in url:
+                raise updater.httpx.ConnectError("boom")
+            dest.write_bytes(b"ok!")
+            return 3
+        self._stub_download(impl)
+        updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+        self.assertIn("http://b/x.fpk", self.calls)
 
 
 class TestProgressState(unittest.TestCase):

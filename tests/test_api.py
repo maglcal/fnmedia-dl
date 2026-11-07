@@ -59,10 +59,15 @@ class TestAPI(unittest.TestCase):
         self.assertIn("done", body)
 
     def test_update_download_rejects_bad_url(self):
-        r = self.client.post("/api/update/download",
-                             json={"url": "https://evil.example.com/x.fpk"})
+        from unittest import mock
+        empty = {"ok": True, "current": "0.1.0", "latest": "0.1.0",
+                 "has_update": False, "url": "", "notes": "", "source": "",
+                 "assets": [], "fetched_at": 0}
+        with mock.patch.object(main.updatesrc, "check", return_value=empty):
+            r = self.client.post("/api/update/download",
+                                 json={"url": "https://evil.example.com/x.fpk"})
         self.assertEqual(r.status_code, 400)
-        self.assertIn("GitHub", r.json()["detail"])
+        self.assertIn("官方 Releases", r.json()["detail"])
 
     def test_ui_assets_no_cache(self):
         """UI 页面/脚本禁协商缓存：在线更新后 iframe 不吃旧页。"""
@@ -75,42 +80,37 @@ class TestAPI(unittest.TestCase):
         self.assertNotEqual(r.headers.get("cache-control"), "no-cache")
 
     def test_update_check(self):
+        """API 透传多源检查结果（多源逻辑见 test_updatesrc.py）。"""
         from unittest import mock
         payload = {
-            "tag_name": "v9.9.9",
-            "html_url": "https://github.com/maglcal/fnmedia-dl/releases/tag/v9.9.9",
-            "body": "更新说明",
+            "ok": True, "current": "0.1.0", "latest": "9.9.9",
+            "has_update": True,
+            "url": "https://github.com/maglcal/fnmedia-dl/releases/tag/v9.9.9",
+            "notes": "更新说明", "source": "repobox",
             "assets": [{"name": "fnmedia-dl-9.9.9.fpk",
-                        "browser_download_url": "https://x/a.fpk", "size": 12}],
+                        "url": "http://mirror.example.com/raw/fnmedia-dl/x.fpk",
+                        "fallback_urls": ["https://github.com/maglcal/fnmedia-dl/"
+                                          "releases/download/v9.9.9/fnmedia-dl-9.9.9.fpk"],
+                        "sha256": "ab", "size": 12}],
+            "fetched_at": 0,
         }
-
-        class _Resp:
-            status_code = 200
-
-            @staticmethod
-            def json():
-                return payload
-
-        with mock.patch.object(main.httpx, "get", return_value=_Resp()):
+        with mock.patch.object(main.updatesrc, "check", return_value=payload):
             r = self.client.get("/api/update/check")
         self.assertEqual(r.status_code, 200)
         d = r.json()
         self.assertEqual(d["latest"], "9.9.9")
         self.assertTrue(d["has_update"])
         self.assertEqual(d["assets"][0]["name"], "fnmedia-dl-9.9.9.fpk")
+        self.assertEqual(d["assets"][0]["fallback_urls"],
+                         payload["assets"][0]["fallback_urls"])
 
-        # 404（仓库尚无 release）→ 明确文案而不是报错
-        class _Resp404:
-            status_code = 404
-
-            @staticmethod
-            def json():
-                return {}
-
-        with mock.patch.object(main.httpx, "get", return_value=_Resp404()):
+        # 全部更新源不可用 → 502 明确文案
+        from updatesrc import SourceError
+        with mock.patch.object(main.updatesrc, "check",
+                               side_effect=SourceError("全部更新源不可用")):
             r2 = self.client.get("/api/update/check")
-        self.assertEqual(r2.status_code, 200)
-        self.assertFalse(r2.json()["has_update"])
+        self.assertEqual(r2.status_code, 502)
+        self.assertIn("更新源", r2.json()["detail"])
 
     def test_parse(self):
         r = self.client.post("/api/parse", json={

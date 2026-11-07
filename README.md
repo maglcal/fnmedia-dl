@@ -79,6 +79,67 @@ cd app && python serve.py --http 127.0.0.1:8787
 # 打开 http://127.0.0.1:8787
 ```
 
+## 更新源配置（国内镜像加速）
+
+GitHub Releases 在国内访问慢/超时，插件支持**多更新源**：默认优先走自建
+RepoBox 镜像（国内直链），失败自动回退 GitHub 官方源。未配置镜像时行为与
+旧版完全一致（仅官方源）。
+
+### 切换 / 配置更新源
+
+在 `state/config.json` 的 `update.sources` 数组里配置，**按数组顺序依次尝试**，
+第一个可用的源为准：
+
+```json
+"update": {
+  "sources": [
+    {"name": "repobox", "type": "repobox",
+     "base_url": "https://repo.example.com",
+     "repo": "fnmedia-dl", "token": "rbx_xxx"},
+    {"name": "github", "type": "github", "repo": "maglcal/fnmedia-dl"}
+  ],
+  "timeout": 15,
+  "retries": 2
+}
+```
+
+- `type=repobox`：自建 RepoBox 镜像。`base_url` 留空自动跳过（即只用官方源）；
+  `token` 用于读清单（raw 直链公开可读时可留空）。
+- `type=github`：GitHub 官方 Releases 兜底。
+- 想只用官方源：把 repobox 条目的 `base_url` 置空，或直接删掉该条目。
+- 想把镜像换成别的地址：改 `base_url` 即可（需按 `latest.json` 清单协议提供）。
+- `timeout`（单请求超时秒）/`retries`（单源请求重试次数）按需调整。
+
+### 回退与重试策略
+
+- **检查更新**：逐源按序尝试，每源内部重试 `retries` 次（间隔递增）；单源失败
+  自动换下一个源，全部失败才报错（错误里含逐源原因）。
+- **下载安装包**：下载候选按「镜像源 → 官方源」排序，每个候选重试 2 次
+  （间隔递增）；候选内失败或**大小/SHA256 校验不符**自动换下一个候选，
+  全部失败才报错（含逐候选原因）。
+- **安装失败**：替换前整份备份到 `repo/.update-backup/`，任一步失败自动回滚
+  到更新前版本，不会把系统留在半更新状态。
+
+### 镜像自动同步（GitHub → RepoBox）
+
+仓库自带 `.github/workflows/mirror-repobox.yml`：release 发布时立即同步，
+每 6 小时兜底校验（幂等，已同步自动跳过），也可手动触发。配置 3 个
+Repository Secrets 即可启用：
+
+| Secret | 说明 |
+|---|---|
+| `REPOBOX_URL` | RepoBox 站点地址（如 `https://repo.example.com`） |
+| `REPOBOX_TOKEN` | API 令牌 `rbx_xxx`（RepoBox 网页「令牌」页创建） |
+| `REPOBOX_REPO` | 镜像仓库名（可省，默认 `fnmedia-dl`，不存在自动创建） |
+
+同步内容：发行资产（`.fpk`/`.sha256`）按 `releases/{tag}/` 布局上传（逐文件
+回读校验），并生成 `latest.json` 清单（version/tag/资产大小/SHA256），供插件
+多源检查消费。手动同步：
+
+```bash
+REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag vX.Y.Z] [--force]
+```
+
 ## 通道配置
 
 管理页「通道设置」里配置，要点：
