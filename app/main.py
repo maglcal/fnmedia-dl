@@ -21,7 +21,8 @@
   POST /api/parse            批量链接解析
   POST /api/tasks            批量派发下载
   GET  /api/tasks            统一任务列表
-  POST /api/tasks/{backend}/{id}/pause|resume
+  POST /api/history/check    下载历史查重（是否下载过某链接）
+  POST /api/tasks/{backend}/{id}/pause|resume|retry
   DELETE /api/tasks/{backend}/{id}
 """
 from __future__ import annotations
@@ -330,6 +331,23 @@ def list_tasks():
     return {"tasks": tasks, "backend_errors": errors}
 
 
+class HistoryCheckReq(BaseModel):
+    links: list[str] = []
+    text: str = ""
+
+
+@app.post("/api/history/check")
+def history_check(req: HistoryCheckReq):
+    """下载历史查重：查询链接是否派发过（magnet 按信息哈希归一）。"""
+    mgr = _manager()
+    urls = [u.strip() for u in req.links if u.strip()]
+    if req.text.strip():
+        urls.extend(li.url for li in linksmod.parse_text(req.text) if li.url)
+    if not urls:
+        raise HTTPException(400, "没有可查询的链接")
+    return {"results": [mgr.history_check(u) for u in urls]}
+
+
 @app.post("/api/tasks/{backend}/{task_id}/pause")
 def pause_task(backend: str, task_id: str):
     return _control("pause", backend, task_id)
@@ -338,6 +356,18 @@ def pause_task(backend: str, task_id: str):
 @app.post("/api/tasks/{backend}/{task_id}/resume")
 def resume_task(backend: str, task_id: str):
     return _control("resume", backend, task_id)
+
+
+@app.post("/api/tasks/{backend}/{task_id}/retry")
+def retry_task(backend: str, task_id: str):
+    """失败/已清理任务重试：删旧任务后按原始链接原通道重新派发。"""
+    mgr = _manager()
+    try:
+        res = mgr.retry(backend, task_id)
+    except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误
+        raise HTTPException(502, str(exc))
+    return {"ok": True, "backend": res.get("backend"),
+            "id": res.get("id"), "label": res.get("label")}
 
 
 @app.delete("/api/tasks/{backend}/{task_id}")

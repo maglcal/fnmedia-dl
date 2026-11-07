@@ -157,6 +157,46 @@ class TestAPI(unittest.TestCase):
         r = self.client.post("/api/tasks/nope/x/pause")
         self.assertEqual(r.status_code, 502)
 
+    # ------------------------------------------------ 重试/历史查重
+
+    def test_retry_task(self):
+        good = FakeBackend("aria2", "aria2")
+        self._patch_backends({"aria2": good})
+        downloader.DownloadManager({})._record(
+            "aria2", "old-1", "https://x/a.iso", "a.iso", "/dl")
+        r = self.client.post("/api/tasks/aria2/old-1/retry")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["id"], "aria2-task-1")
+        self.assertEqual(good.deleted, ["old-1"])     # 旧任务已删
+        self.assertEqual(len(good.added), 1)          # 原链接重新派发
+
+    def test_retry_missing_url_502(self):
+        good = FakeBackend("aria2", "aria2")
+        self._patch_backends({"aria2": good})
+        r = self.client.post("/api/tasks/aria2/nope/retry")
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("原始链接", r.json()["detail"])
+
+    def test_history_check(self):
+        downloader.DownloadManager({})._record(
+            "aria2", "g1", "magnet:?xt=urn:btih:" + "a" * 40, "demo", "/dl")
+        # 同信息哈希（大小写不同）命中
+        r = self.client.post("/api/history/check", json={
+            "links": ["magnet:?xt=urn:btih:" + "A" * 40]})
+        self.assertEqual(r.status_code, 200)
+        res = r.json()["results"][0]
+        self.assertTrue(res["downloaded"])
+        self.assertEqual(res["matches"][0]["name"], "demo")
+        # 未下载过
+        r2 = self.client.post("/api/history/check", json={
+            "links": ["magnet:?xt=urn:btih:" + "b" * 40]})
+        self.assertFalse(r2.json()["results"][0]["downloaded"])
+        # 空请求
+        r3 = self.client.post("/api/history/check", json={"links": []})
+        self.assertEqual(r3.status_code, 400)
+
     def test_config_roundtrip(self):
         r = self.client.put("/api/config", json={"config": {
             "default_dir": "/data/dl",

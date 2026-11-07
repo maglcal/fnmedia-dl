@@ -159,6 +159,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 /* ---------------- 按钮 ---------------- */
 .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 .row-inline { display: flex; align-items: center; gap: 12px; }
+.row-inline .grow { flex: 1; min-width: 0; }
 
 .btn {
   padding: 9px 18px; border-radius: var(--radius-sm);
@@ -233,6 +234,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 .link-reason { width: 100%; color: var(--muted); font-size: 12px; padding-left: 2px; }
 .result-ok   { color: var(--ok); font-size: 12.5px; font-weight: 500; }
 .result-fail { color: var(--err); font-size: 12.5px; font-weight: 500; }
+.result-warn { color: var(--warn); font-size: 12.5px; font-weight: 500; }
 
 /* ---------------- 任务表格 ---------------- */
 .table-wrap { overflow-x: auto; }
@@ -337,6 +339,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 }
 .dir-status.ok  { color: var(--ok);  background: var(--ok-bg); }
 .dir-status.bad { color: var(--err); background: var(--err-bg); }
+.dir-status.warn { color: var(--warn); background: var(--warn-bg); }
 .card-status {
   font-size: 12.5px; border-radius: var(--radius-sm);
   padding: 10px 14px; margin: 12px 0 0; line-height: 1.8;

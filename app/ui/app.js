@@ -161,6 +161,9 @@ function renderDispatch(results) {
       ${r.ok
         ? `<span class="result-ok">✓ 已提交 · ${esc(r.label || r.backend)} · 任务 ${esc((r.id || "").slice(0, 12))}</span>`
         : `<span class="result-fail">✗ ${esc(r.error)}</span>`}
+      ${r.duplicate
+        ? `<span class="result-warn">⚠ 之前下载过：${esc(r.duplicate.name || r.duplicate.url || "")}</span>`
+        : ""}
     `;
     ul.appendChild(el);
   }
@@ -197,7 +200,9 @@ function renderTasks(tasks, backendErrors) {
   body.innerHTML = "";
   for (const t of tasks) {
     const tr = document.createElement("tr");
-    const canControl = !["gone", "removed", "completed"].includes(t.state);
+    // 失败/已清理：重试+删除（没有暂停语义）；其余活动任务：暂停/继续+删除
+    const dead = ["error", "gone"].includes(t.state);
+    const canControl = !["gone", "removed", "completed", "error"].includes(t.state);
     tr.innerHTML = `
       <td>
         <div class="task-name">${esc(t.name)}</div>
@@ -212,6 +217,9 @@ function renderTasks(tasks, backendErrors) {
       </td>
       <td>${fmtSpeed(t.speed)}</td>
       <td>
+        ${dead ? `
+          <button class="btn" data-act="retry"
+                  data-backend="${esc(t.backend)}" data-id="${esc(t.id)}">重试</button>` : ""}
         ${canControl ? `
           <button class="btn" data-act="${t.state === "paused" ? "resume" : "pause"}"
                   data-backend="${esc(t.backend)}" data-id="${esc(t.id)}">
@@ -224,6 +232,8 @@ function renderTasks(tasks, backendErrors) {
     body.appendChild(tr);
   }
 
+  const ACT_TEXT = { delete: "已删除", pause: "已暂停", resume: "已继续",
+                     retry: "已按原链接重新派发" };
   body.querySelectorAll("button[data-act]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const { act, backend, id } = btn.dataset;
@@ -231,7 +241,7 @@ function renderTasks(tasks, backendErrors) {
         const url = `/api/tasks/${encodeURIComponent(backend)}/${encodeURIComponent(id)}` +
                     (act === "delete" ? "" : `/${act}`);
         await API.send(url, act === "delete" ? "DELETE" : "POST");
-        toast(act === "delete" ? "已删除" : act === "pause" ? "已暂停" : "已继续");
+        toast(ACT_TEXT[act] || "已完成");
         loadTasks();
       } catch (e) {
         toast("操作失败：" + e.message);
@@ -241,6 +251,39 @@ function renderTasks(tasks, backendErrors) {
 }
 
 $("#btnRefresh").addEventListener("click", loadTasks);
+
+/* ---------------- 下载历史查重 ---------------- */
+async function checkHistory() {
+  const url = $("#historyInput").value.trim();
+  if (!url) return toast("请先粘贴要查询的链接");
+  const box = $("#historyResult");
+  box.hidden = false;
+  box.className = "dir-status";
+  box.textContent = "查询中…";
+  try {
+    const r = await API.send("/api/history/check", "POST", { links: [url] });
+    const res = (r.results || [])[0] || {};
+    if (res.downloaded) {
+      box.classList.add("warn");
+      const m = res.matches[0] || {};
+      const when = m.created_at
+        ? new Date(m.created_at * 1000).toLocaleString() : "时间未知";
+      box.textContent = `⚠ 该链接下载过 ${res.count} 次（最近：${m.name || ""}` +
+        ` · ${m.dir || "默认目录"} · ${when}），注意避免重复下载`;
+    } else {
+      box.classList.add("ok");
+      box.textContent = "✓ 未找到下载记录，可以派发";
+    }
+  } catch (e) {
+    box.classList.add("bad");
+    box.textContent = "查询失败：" + e.message;
+  }
+}
+
+$("#btnHistory").addEventListener("click", checkHistory);
+$("#historyInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") checkHistory();
+});
 
 function scheduleAutoRefresh() {
   clearInterval(taskTimer);

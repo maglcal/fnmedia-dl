@@ -100,6 +100,12 @@
           <button id="btnRefresh" class="btn ghost">刷新</button>
         </div>
       </div>
+      <div class="row-inline dir-tools">
+        <input id="historyInput" class="grow" type="text" spellcheck="false"
+               placeholder="粘贴链接查是否下载过（磁力按信息哈希归一，避免重复下载）…">
+        <button id="btnHistory" class="btn ghost">查重</button>
+      </div>
+      <div id="historyResult" class="dir-status" hidden></div>
       <div id="taskError" class="error" hidden></div>
       <div class="table-wrap">
         <table class="task-table">

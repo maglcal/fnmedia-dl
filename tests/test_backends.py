@@ -137,13 +137,64 @@ class TestDriveCore(unittest.TestCase):
             return httpx.Response(200, json={})
         core = self._mk(handler)
         core.set_phase("sp", "user#download-url", "t9", "pause")
-        method, url, content = calls[0]
-        self.assertEqual(method, "PATCH")
-        body = json.loads(content)
+        patch = next(c for c in calls if c[0] == "PATCH")
+        body = json.loads(patch[2])
         self.assertEqual(json.loads(body["set_params"]["spec"]), {"phase": "pause"})
+        # 查不到任务时回退调用方给的 space/type
+        self.assertEqual(body["space"], "sp")
+        self.assertEqual(body["type"], "user#download-url")
         core.delete_task("sp", "t9")
-        self.assertEqual(calls[1][0], "DELETE")
-        self.assertIn("task_ids=t9", calls[1][1])
+        self.assertTrue(any(c[0] == "DELETE" and "task_ids=t9" in c[1]
+                            for c in calls))
+
+    def test_set_phase_uses_real_task_type_space(self):
+        """任务操作回归（2026-11-05 用户实测暂停无效）：
+        PATCH 前先查任务真实 space/type——硬编码值与任务不符时
+        引擎静默忽略，UI 状态不翻转。"""
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            if request.method == "GET" and request.url.path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [{
+                    "id": "t9", "type": "user#download",
+                    "space": "real-space", "phase": "PHASE_TYPE_RUNNING"}]})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        core.set_phase("sp", "user#download-url", "t9", "pause")
+        patch = next(c for c in calls if c.method == "PATCH")
+        body = json.loads(patch.content)
+        self.assertEqual(body["space"], "real-space")     # 任务真实 space
+        self.assertEqual(body["type"], "user#download")   # 任务真实 type
+        self.assertEqual(body["id"], "t9")
+
+    def test_request_detects_error_payload(self):
+        """HTTP 200 + 错误体必须报错：只看状态码会把暂停/删除的失败当成功。"""
+        def handler(request):
+            return httpx.Response(200, json={"error_code": 16,
+                                             "errorDesc": "任务不存在"})
+        core = self._mk(handler)
+        with self.assertRaises(BackendError) as cm:
+            core.delete_task("sp", "t9")
+        self.assertIn("任务不存在", str(cm.exception))
+
+    def test_request_success_payload_passes(self):
+        def handler(request):
+            return httpx.Response(200, json={"error": "success",
+                                             "error_code": 0})
+        core = self._mk(handler)
+        core.delete_task("sp", "t9")     # 不抛即通过
+
+    def test_task_to_view_unknown_phase_fallback(self):
+        """未知 phase 拼写按关键词兜底（防暂停后状态不翻转、按钮卡住）。"""
+        t = dict(DRIVE_TASKS[0], phase="PHASE_TYPE_STOPPED")
+        self.assertEqual(task_to_view("x", t).state, "paused")
+        t["phase"] = "PAUSED"
+        self.assertEqual(task_to_view("x", t).state, "paused")
+        t["phase"] = "PHASE_TYPE_FAIL"
+        self.assertEqual(task_to_view("x", t).state, "error")
+        t["phase"] = ""
+        self.assertEqual(task_to_view("x", t).state, "waiting")
 
     def test_task_to_view(self):
         v = task_to_view("aria2-like", DRIVE_TASKS[0])

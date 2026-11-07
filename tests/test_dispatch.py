@@ -149,5 +149,93 @@ class TestUnifiedTasks(DispatchTestBase):
         self.assertEqual(mgr.records, [])
 
 
+class TestRetry(DispatchTestBase):
+    def test_retry_redispatches_same_channel(self):
+        """重试 = 删旧任务 + 原通道按原链接/目录重新派发（删除重建语义）。"""
+        good = FakeBackend("aria2", "aria2")
+        mgr = self.manager({"aria2": good})
+        mgr._record("aria2", "old-1", "https://x/a.iso", "a.iso", "/dl")
+        res = mgr.retry("aria2", "old-1")
+        self.assertTrue(res["ok"])
+        self.assertEqual(good.deleted, ["old-1"])          # 旧任务已删
+        self.assertEqual(len(good.added), 1)               # 已重新派发
+        self.assertEqual(good.added[0][0], "https://x/a.iso")
+        self.assertEqual(good.added[0][2], "/dl")          # 沿用原目录
+        # 旧记录换成新任务记录
+        self.assertEqual([r["id"] for r in mgr.records], [res["id"]])
+        self.assertEqual(mgr.records[0]["url"], "https://x/a.iso")
+
+    def test_retry_uses_live_task_url_without_record(self):
+        """无本地记录（别处创建的任务）：从引擎实时任务里取原始链接重试。"""
+        live = [TaskView(backend="aria2", id="g5", name="b.iso",
+                         state="error", url="https://x/b.iso")]
+        good = FakeBackend("aria2", "aria2", tasks=live)
+        mgr = self.manager({"aria2": good})
+        res = mgr.retry("aria2", "g5")
+        self.assertTrue(res["ok"])
+        self.assertEqual(good.added[0][0], "https://x/b.iso")
+
+    def test_retry_delete_failure_does_not_block(self):
+        """旧任务已不在引擎（删除报错）时重试仍要走通。"""
+        good = FakeBackend("aria2", "aria2")
+        good.delete = lambda tid: (_ for _ in ()).throw(BackendError("gone"))
+        mgr = self.manager({"aria2": good})
+        mgr._record("aria2", "old-1", "https://x/a.iso", "a.iso", "")
+        res = mgr.retry("aria2", "old-1")
+        self.assertTrue(res["ok"])
+
+    def test_retry_without_url_fails(self):
+        good = FakeBackend("aria2", "aria2")
+        mgr = self.manager({"aria2": good})
+        with self.assertRaises(BackendError):
+            mgr.retry("aria2", "missing")
+        self.assertEqual(good.added, [])
+
+    def test_retry_unknown_backend(self):
+        mgr = self.manager({})
+        with self.assertRaises(BackendError):
+            mgr.retry("nope", "x")
+
+
+class TestHistoryCheck(DispatchTestBase):
+    def test_magnet_same_infohash_matches_across_trackers(self):
+        """磁力查重按信息哈希归一：不同 tracker/dn 的同资源命中同一条。"""
+        good = FakeBackend("aria2", "aria2")
+        mgr = self.manager({"aria2": good})
+        h = "a" * 40
+        mgr.dispatch(f"magnet:?xt=urn:btih:{h}&dn=x&tr=http://t1/ann")
+        res = mgr.history_check(f"magnet:?xt=urn:btih:{h.upper()}&dn=y&tr=http://t2/ann")
+        self.assertTrue(res["downloaded"])
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["matches"][0]["backend"], "aria2")
+
+    def test_base32_and_hex_same_resource(self):
+        import base64
+        good = FakeBackend("aria2", "aria2")
+        mgr = self.manager({"aria2": good})
+        hexhash = "a" * 40
+        b32 = base64.b32encode(bytes.fromhex(hexhash)).decode()
+        mgr.dispatch(f"magnet:?xt=urn:btih:{hexhash}")
+        self.assertTrue(mgr.history_check(f"magnet:?xt=urn:btih:{b32}")["downloaded"])
+
+    def test_different_resource_no_match(self):
+        good = FakeBackend("aria2", "aria2")
+        mgr = self.manager({"aria2": good})
+        mgr.dispatch("magnet:?xt=urn:btih:" + "a" * 40)
+        res = mgr.history_check("magnet:?xt=urn:btih:" + "b" * 40)
+        self.assertFalse(res["downloaded"])
+        self.assertEqual(res["matches"], [])
+
+    def test_dispatch_result_carries_duplicate(self):
+        """重复派发同一链接：结果带 duplicate 提示（避免重复下载）。"""
+        good = FakeBackend("aria2", "aria2")
+        mgr = self.manager({"aria2": good})
+        first = mgr.dispatch("https://x/a.iso")
+        self.assertNotIn("duplicate", first)          # 首次派发无历史
+        second = mgr.dispatch("https://x/a.iso")
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["duplicate"]["id"], first["id"])
+
+
 if __name__ == "__main__":
     unittest.main()

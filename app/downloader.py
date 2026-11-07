@@ -19,6 +19,7 @@ from backends import Backend, BackendError, build_backends
 from backends.base import TaskView
 from config import STATE_DIR
 import config as cfgmod
+import links as linksmod
 
 RECORDS_PATH = STATE_DIR / "tasks.json"
 
@@ -64,6 +65,7 @@ class DownloadManager:
         self.records.append({
             "backend": backend, "id": task_id, "url": url,
             "name": name, "dir": directory, "created_at": int(time.time()),
+            "identity": linksmod.identity(url),
         })
         self._save_records()
 
@@ -83,6 +85,8 @@ class DownloadManager:
         order = self._order(backend, pool)
         if not order:
             return {"ok": False, "url": url, "error": "没有可用的下载通道"}
+        # 派发前的下载历史（不含本次新建记录）：命中时结果带重复提示
+        prior = self.history_check(url)
 
         errors: list[str] = []
         for name_key in order:
@@ -94,8 +98,11 @@ class DownloadManager:
                     continue
                 task_id = impl.add(url, name=name or None, directory=directory)
                 self._record(name_key, task_id, url, name, directory or "")
-                return {"ok": True, "url": url, "backend": name_key,
-                        "id": task_id, "label": impl.label}
+                result = {"ok": True, "url": url, "backend": name_key,
+                          "id": task_id, "label": impl.label}
+                if prior["downloaded"]:
+                    result["duplicate"] = prior["matches"][0]
+                return result
             except BackendError as exc:
                 errors.append(f"{impl.label}: {exc}")
                 if backend != "auto":
@@ -173,3 +180,72 @@ class DownloadManager:
             self._save_records()
         else:
             raise BackendError(f"未知操作：{action}")
+
+    # ------------------------------------------------------------ 重试
+
+    def retry(self, backend: str, task_id: str) -> dict:
+        """失败/已清理任务重试：取回原始链接后删旧任务、原通道重新派发。
+
+        迅雷 drive/v1 没有原生重试接口（接口本身只支持暂停/恢复/删除），
+        aria2 失败任务同样只能移除重建——统一「删除重建」语义，
+        新任务 id 与原任务不同。"""
+        pool = self.backends()
+        impl = pool.get(backend)
+        if not impl:
+            raise BackendError(f"未知通道：{backend}")
+        rec = next((r for r in reversed(self.records)
+                    if r.get("backend") == backend
+                    and r.get("id") == task_id), None)
+        url = (rec or {}).get("url", "")
+        directory = (rec or {}).get("dir", "")
+        if not url:
+            # 无本地记录（别处创建的任务）：从引擎实时任务里取原始链接
+            try:
+                for tv in impl.list_tasks():
+                    if tv.id == task_id and tv.url:
+                        url = tv.url
+                        break
+            except BackendError:
+                pass
+        if not url:
+            raise BackendError("找不到该任务的原始链接，无法重试（请复制链接重新派发）")
+        # 删旧任务与旧记录（任务可能已不在引擎，删除失败不阻断重试）
+        try:
+            impl.delete(task_id)
+        except BackendError:
+            pass
+        self.records = [r for r in self.records
+                        if not (r.get("backend") == backend
+                                and r.get("id") == task_id)]
+        self._save_records()
+        info = linksmod.parse_line(url)
+        res = self.dispatch(
+            info, backend=backend,
+            directory=directory or self.cfg.get("default_dir") or None)
+        if not res.get("ok"):
+            raise BackendError(res.get("error") or "重试派发失败")
+        return res
+
+    # ------------------------------------------------------------ 历史查重
+
+    def history_check(self, url: str) -> dict:
+        """下载历史查重：同一资源是否派发过。
+
+        链接身份按 links.identity 归一——magnet 按信息哈希匹配，
+        不同 tracker / dn 的同一资源命中同一条记录。"""
+        ident = linksmod.identity(url)
+        matches: list[dict] = []
+        for r in reversed(self.records):          # 新 → 旧
+            r_ident = r.get("identity") or linksmod.identity(r.get("url", ""))
+            if ident and r_ident == ident:
+                matches.append({
+                    "backend": r.get("backend", ""),
+                    "id": r.get("id", ""),
+                    "name": r.get("name") or r.get("url", "")[:80],
+                    "dir": r.get("dir", ""),
+                    "url": r.get("url", ""),
+                    "created_at": r.get("created_at"),
+                })
+        return {"url": url, "identity": ident,
+                "downloaded": bool(matches), "count": len(matches),
+                "matches": matches}

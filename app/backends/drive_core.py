@@ -33,6 +33,43 @@ PHASE_STATE = {
 }
 
 
+def _phase_state(phase: str) -> str:
+    """phase → 统一状态。精确表优先，未知值按关键词兜底
+    （引擎各版本可能给 PAUSED/STOP 的变体拼写，兜底防止
+    暂停后状态不翻转、按钮卡在「暂停」）。"""
+    p = (phase or "").strip().upper()
+    if p in PHASE_STATE:
+        return PHASE_STATE[p]
+    if "PAUSE" in p or "STOP" in p:
+        return "paused"
+    if "ERROR" in p or "FAIL" in p:
+        return "error"
+    if "COMPLETE" in p or "DONE" in p:
+        return "completed"
+    if "PEND" in p or "WAIT" in p or "QUEUE" in p:
+        return "waiting"
+    return "running" if p else "waiting"
+
+
+def _err_payload(data: dict) -> str:
+    """drive/v1 错误体检测：迅雷接口常见 HTTP 200 + 错误体，
+    只看状态码会把失败当成功（暂停/删除静默失效的原因之一）。
+    与 thunder_cloud._is_error 同语义；返回错误文案，无错返回空串。"""
+    if not isinstance(data, dict):
+        return ""
+    if (data.get("error") or "").strip() == "success":
+        return ""
+    try:
+        code = int(data.get("error_code") or data.get("errorCode") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    detail = (data.get("errorDesc") or data.get("error_description")
+              or data.get("error") or "").strip()
+    if code or detail:
+        return f"{detail or '未知错误'}（error_code={code}）"
+    return ""
+
+
 def scalar_int(v, default: int = 0) -> int:
     if v is None:
         return default
@@ -71,9 +108,14 @@ class DriveCore:
         if resp.status_code >= 400:
             raise BackendError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError as exc:
             raise BackendError(f"响应不是 JSON：{resp.text[:120]}") from exc
+        # 迅雷接口常见 HTTP 200 + 错误体：不检测会把暂停/删除的失败当成功
+        err = _err_payload(data) if isinstance(data, dict) else ""
+        if err:
+            raise BackendError(f"{method} {path} 失败：{err}")
+        return data
 
     # ------------------------------------------------------------ 设备
 
@@ -159,11 +201,52 @@ class DriveCore:
 
     # ------------------------------------------------------------ 操作
 
+    def find_task(self, task_id: str, space: str = "") -> dict | None:
+        """按 id 查任务（含暂停/失败态），返回任务对象（带真实 space/type）。
+
+        PATCH 前先查任务取 task.Space / task.Type 发请求——硬编码 type/space 与任务不符时
+        引擎会静默忽略（暂停卡住不翻转的原因）。先查给定 space，
+        找不到再逐个查设备空间。"""
+        filters = json.dumps({
+            "type": {"in": "user#download,user#download-url"},
+            "phase": {"in": ALL_PHASES},
+        })
+        spaces: list[str] = []
+        if space:
+            spaces.append(space)
+        try:
+            for t in self.device_targets():
+                if t["target"] not in spaces:
+                    spaces.append(t["target"])
+        except BackendError:
+            pass                      # 设备发现失败不阻断主 space 的查找
+        for sp in spaces:
+            page_token = ""
+            for _ in range(20):
+                params: dict = {"space": sp, "filters": filters}
+                if page_token:
+                    params["page_token"] = page_token
+                data = self._request("GET", "/tasks", params=params)
+                for t in data.get("tasks", []):
+                    if str(t.get("id", "")) == str(task_id):
+                        if not t.get("space"):
+                            t["space"] = sp
+                        return t
+                page_token = ((data.get("next_page_token")
+                               or data.get("nextPageToken") or "").strip())
+                if not page_token:
+                    break
+        return None
+
     def set_phase(self, space: str, task_type: str, task_id: str, phase: str) -> None:
-        """phase: "pause" | "running"。"""
+        """phase: "pause" | "running"。
+
+        先查任务真实 space/type 再 PATCH；
+        查不到（引擎已清理等）时回退调用方给的值。"""
+        task = self.find_task(task_id, space) or {}
         body = {
-            "space": space,
-            "type": task_type,
+            "space": task.get("space") or space,
+            "type": task.get("type") or task_type,
             "id": task_id,
             "set_params": {"spec": json.dumps({"phase": phase})},
         }
@@ -178,7 +261,7 @@ def task_to_view(backend: str, t: dict):
     """drive/v1 任务对象 → 统一任务视图。"""
     from .base import TaskView
     phase = t.get("phase") or ""
-    state = PHASE_STATE.get(phase, "running" if phase else "waiting")
+    state = _phase_state(phase)
     size = scalar_int(t.get("file_size"), 0) or None
     done = scalar_int(t.get("status_size"), 0)
     progress = t.get("progress")

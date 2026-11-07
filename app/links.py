@@ -224,6 +224,33 @@ def magnet_from_infohash(infohash: str, dn: str = "", trackers: list[str] | None
     return "&".join(parts)
 
 
+# ---------------------------------------------------------------- 身份标识
+
+def identity(url: str) -> str:
+    """链接身份标识，用于下载历史查重。
+
+    - magnet → btih:<infohash>（base32 归一为 hex；不同 tracker/dn 的同资源命中同一条）
+    - ed2k   → ed2k:<hash>
+    - 其他   → url:<小写完整链接>（thunder 解码后按内层链接归一）
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    info = parse_line(raw)
+    meta = info.meta or {}
+    if meta.get("infohash"):
+        digest = str(meta["infohash"]).lower()
+        if meta.get("infohash_algo") == "base32":
+            try:
+                digest = base64.b32decode(digest.upper()).hex()
+            except ValueError:  # binascii.Error 是 ValueError 子类
+                pass
+        return "btih:" + digest
+    if meta.get("hash"):
+        return "ed2k:" + str(meta["hash"]).lower()
+    return "url:" + (info.url or raw).lower()
+
+
 # ---------------------------------------------------------------- 入口
 
 def parse_line(line: str) -> LinkInfo:
