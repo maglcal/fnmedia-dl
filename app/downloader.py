@@ -5,6 +5,10 @@
   1) 指定通道：仅用该通道；失败即报错（用户显式选择不静默换通道）；
   2) auto：按降级链逐个尝试，通道不可用/创建失败自动落到下一个，
      全部失败才报错。ed2k 等不支持的链接直接拒绝派发。
+
+配额感知（迅雷引擎非会员每日任务创建次数有限，撞限返回 HTTP 402）：
+  - 撞满后当天 auto 派发跳过引擎（quota.py 记录，跨天自动恢复）；
+  - 重试撞配额自动换 auto 降级链重派（迅雷远程通道不占引擎配额）。
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ from backends.base import TaskView
 from config import STATE_DIR
 import config as cfgmod
 import links as linksmod
+import quota as quotamod
 
 RECORDS_PATH = STATE_DIR / "tasks.json"
 
@@ -32,6 +37,8 @@ class DownloadManager:
         self.client = client or httpx.Client(trust_env=False)
         self._lock = threading.Lock()
         self.records: list[dict] = self._load_records()
+        # 引擎每日配额跟踪（路径跟 RECORDS_PATH 同目录，测试可整体换目录）
+        self.quota = quotamod.QuotaTracker(STATE_DIR / "quota.json")
 
     # ------------------------------------------------------------ 通道
 
@@ -91,12 +98,20 @@ class DownloadManager:
         errors: list[str] = []
         for name_key in order:
             impl = pool[name_key]
+            # 今日引擎配额已满：auto 派发直接跳过（别再撞 402 报错）；
+            # 用户显式指定引擎通道时仍尝试（尊重显式选择）。
+            if (name_key == "thunder_engine" and backend == "auto"
+                    and self.quota.engine_blocked()):
+                errors.append(f"{impl.label}: 今日任务创建次数已满，已跳过（明日自动恢复）")
+                continue
             try:
                 st = impl.status()
                 if not st.get("reachable"):
                     errors.append(f"{impl.label}: {st.get('detail') or '不可用'}")
                     continue
                 task_id = impl.add(url, name=name or None, directory=directory)
+                if name_key == "thunder_engine":
+                    self.quota.note_engine_create()
                 self._record(name_key, task_id, url, name, directory or "")
                 result = {"ok": True, "url": url, "backend": name_key,
                           "id": task_id, "label": impl.label}
@@ -104,6 +119,8 @@ class DownloadManager:
                     result["duplicate"] = prior["matches"][0]
                 return result
             except BackendError as exc:
+                if name_key == "thunder_engine" and quotamod.is_quota_error(str(exc)):
+                    self.quota.note_engine_quota_hit()
                 errors.append(f"{impl.label}: {exc}")
                 if backend != "auto":
                     break
@@ -188,7 +205,11 @@ class DownloadManager:
 
         迅雷 drive/v1 没有原生重试接口（接口本身只支持暂停/恢复/删除），
         aria2 失败任务同样只能移除重建——统一「删除重建」语义，
-        新任务 id 与原任务不同。"""
+        新任务 id 与原任务不同。
+
+        配额换通道：原通道撞每日配额（HTTP 402）时自动改用 auto 降级链
+        重派（迅雷远程/aria2 不占引擎配额），结果带 switched/message 标注，
+        避免「重试 = 原通道再撞一次配额」死循环。"""
         pool = self.backends()
         impl = pool.get(backend)
         if not impl:
@@ -219,12 +240,22 @@ class DownloadManager:
                                 and r.get("id") == task_id)]
         self._save_records()
         info = linksmod.parse_line(url)
-        res = self.dispatch(
-            info, backend=backend,
-            directory=directory or self.cfg.get("default_dir") or None)
-        if not res.get("ok"):
-            raise BackendError(res.get("error") or "重试派发失败")
-        return res
+        directory = directory or self.cfg.get("default_dir") or None
+        res = self.dispatch(info, backend=backend, directory=directory)
+        if res.get("ok"):
+            return res
+        err = res.get("error") or "重试派发失败"
+        if backend != "auto" and quotamod.is_quota_error(err):
+            # 原通道今日配额已满：换 auto 降级链重派（引擎撞满会被跳过）
+            res2 = self.dispatch(info, backend="auto", directory=directory)
+            if res2.get("ok"):
+                res2["switched"] = True
+                res2["message"] = (f"原通道今日配额已满，已换 "
+                                   f"{res2.get('label')} 通道重新派发")
+                return res2
+            raise BackendError(f"原通道配额已满；换通道重试也失败："
+                               f"{res2.get('error')}")
+        raise BackendError(err)
 
     # ------------------------------------------------------------ 历史查重
 
