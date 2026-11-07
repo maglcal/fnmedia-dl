@@ -231,6 +231,89 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
         self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
 
+    # ---- 解析失败回退直传（0.1.27 用户实测回归：0.1.26 对无权限/根外目录硬报错，
+    #      老版本把目录原样交给引擎一直能直接下载到设置目录） ----
+
+    def test_create_task_fallback_when_folder_setup_denied(self):
+        """建目录被拒（引擎账号对该目录无读写权）→ 回退直传目录原样。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if path.endswith("/files") and request.method == "POST":
+                return httpx.Response(200, json={"error_code": 403,
+                                                 "error": "permission denied"})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-1"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="电影/2025")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_path"], "电影/2025")
+
+    def test_create_task_fallback_when_dir_outside_root(self):
+        """根外绝对目录不再报错：直传给引擎（0.1.26 前的老行为）。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-2"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="/vol1/media/剧集")
+        self.assertEqual(tid, "t-2")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_path"],
+                         "/vol1/media/剧集")
+
+    def test_create_task_fallback_when_root_unresolvable(self):
+        """目录表为空时：有设置目录 → 直传老形状（id 空 + 原样路径）。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": []})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-3"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="/vol1/media")
+        self.assertEqual(tid, "t-3")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/vol1/media")
+
+    def test_create_task_empty_dir_needs_resolvable_root(self):
+        """无设置目录且下载根解析失败 → 显式报错
+        （回退两字段全空 = 任务永远排队中，静默建出来比报错更糟）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": []})
+            return httpx.Response(200, json={"task": {"id": "t-4"}})
+        core = self._mk(handler)
+        with self.assertRaises(BackendError):
+            core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                             "sp")
+
     def test_set_phase_and_delete(self):
         calls = []
 

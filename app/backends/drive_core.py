@@ -295,12 +295,24 @@ class DriveCore:
                     *, directory: str = "", parent_folder_id: str = "",
                     parent_folder_path: str = "") -> str:
         """创建任务。parent_folder_id 为空时按 directory 解析真实下载目录——
-        这是任务真正开始下载的必要字段（缺省任务永远停在排队中）。"""
+        这是任务真正开始下载的必要字段（缺省任务永远停在排队中）。
+
+        目录解析只是增强，失败不挡道（0.1.27 用户实测回归）：解析/建目录失败
+        （目录在识别出的下载根之外、引擎账号对该目录无读写权等）时回退
+        0.1.26 之前的直传行为——把设置的目录原样交给引擎落盘，老版本一直
+        可以这样直接下载到设置目录。仅当未设置目录且下载根解析失败时才报错
+        （两字段全空的任务会永远停在排队中，静默建出来比报错更糟）。"""
         if parent_folder_id:
             pfid = parent_folder_id
             pfpath = parent_folder_path or directory or ""
         else:
-            pfid, pfpath = self.resolve_dest_folder(space, directory)
+            dest = (directory or "").strip()
+            try:
+                pfid, pfpath = self.resolve_dest_folder(space, dest)
+            except BackendError:
+                if not dest:
+                    raise
+                pfid, pfpath = "", directory
         name = resource.name or url[:80]
         body = {
             "type": "user#download-url",
