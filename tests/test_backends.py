@@ -1237,5 +1237,245 @@ class TestReviewSms(unittest.TestCase):
         self.assertEqual(conf["review_cookies"], {})
 
 
+class TestCloudDeviceApi(unittest.TestCase):
+    """云端设备专属 API（0.1.30）：api-pan 的 /drive/v1/files 只服务云盘空间，远程设备（user#runner 空间）的目录表/建目录/设备配置必须走 INNER_API 发现的设备专属域名。"""
+
+    def _tc(self, handler):
+        conf = {"login_name": "u", "password": "p", "device_id": "c" * 32,
+                "access_token": "at-1", "target": "remote-1"}
+        return ThunderCloud(_client(handler), conf)
+
+    def test_relay_full_shape_and_no_apipan(self):
+        """目录表走设备 API 完整形状：plugin 凭据、
+        device_space=、filters 三条件、with=…HistoryDownloadPath、with_audit、
+        order=TYPE_DESC 全齐，且绝不打 api-pan /files。"""
+        seen, unexpected = {}, []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                seen["inner"] = dict(request.url.params)
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p1/"
+                            "?plugin_app_id=pid-1&plugin_app_token=ptok-1"})
+            if host == "relay.example" and path.endswith("/drive/v1/files") \
+                    and request.method == "GET":
+                seen["files_path"] = path
+                seen["files"] = dict(request.url.params)
+                seen["with_multi"] = request.url.params.get_list("with")
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/"}}]})
+            unexpected.append(f"{request.method} {host}{path}")
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        files = tc.core._folders("remote-1", "")
+        self.assertEqual([f["id"] for f in files], ["d1"])
+        self.assertEqual(unexpected, [])        # 未打 api-pan /files
+        self.assertEqual(seen["inner"], {"space": "remote-1"})
+        self.assertEqual(seen["files_path"], "/p1/drive/v1/files")
+        p = seen["files"]
+        self.assertEqual(p["space"], "remote-1")
+        self.assertEqual(p["device_space"], "")
+        self.assertEqual(p["parent_id"], "")
+        self.assertEqual(p["plugin_app_id"], "pid-1")
+        self.assertEqual(p["plugin_app_token"], "ptok-1")
+        self.assertEqual(p["with_audit"], "true")
+        self.assertEqual(p["order"], "TYPE_DESC")
+        self.assertEqual(p["page_token"], "")
+        self.assertEqual(seen["with_multi"],
+                         ["withCategoryDiskMountPath",
+                          "withCategoryHistoryDownloadPath"])
+        self.assertEqual(json.loads(p["filters"]), {
+            "trashed": {"eq": False},
+            "phase": {"eq": "PHASE_TYPE_COMPLETE"},
+            "kind": {"eq": "drive#folder"}})
+
+    def test_relay_links_variant_cached_and_slash_norm(self):
+        """INNER_API 的 links[].url 变体可解析；link 无尾斜杠时 base 自动补
+        （SDK ApiDomain+路径 是字符串拼接）；发现结果按 space 缓存。"""
+        calls, paths = [], []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                calls.append(1)
+                return httpx.Response(200, json={"links": [{
+                    "url": "https://relay.example/p2"
+                           "?plugin_app_id=pid-2&plugin_app_token=ptok-2"}]})
+            if host == "relay.example":
+                paths.append(path)
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        tc.core._folders("remote-1", "")
+        tc.core._folders("remote-1", "x")
+        self.assertEqual(len(calls), 1)          # 发现缓存：只查一次 INNER_API
+        self.assertEqual(paths, ["/p2/drive/v1/files"] * 2)
+
+    def test_relay_failure_refreshes_discovery(self):
+        """设备 API 首轮全挂 → 强制重发现重试一轮（凭据过期自愈），仍失败才回退。"""
+        state = {"inner": 0, "files": 0}
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                state["inner"] += 1
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                state["files"] += 1
+                if state["files"] <= 2:          # 第一轮两个形状都 502
+                    return httpx.Response(502, text="bad gateway")
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        files = tc.core._folders("remote-1", "")
+        self.assertEqual([f["id"] for f in files], ["d1"])
+        self.assertEqual(state["inner"], 2)      # 第二轮重新发现
+        self.assertEqual(state["files"], 3)      # 2 失败形状 + 1 重试成功
+
+    def test_inner_api_fails_falls_back_apipan(self):
+        """INNER_API 不可达/无 link → 回退 api-pan 形状阶梯（兼容未来变化）。"""
+        seen = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={})      # 无 link
+            if host == "api-pan.xunlei.com" and path.endswith("/drive/v1/files") \
+                    and request.method == "GET":
+                seen.append(dict(request.url.params))
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        files = tc.core._folders("remote-1", "")
+        self.assertEqual([f["id"] for f in files], ["d1"])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["space"], "remote-1")
+
+    def test_relay_and_apipan_all_fail_aggregate_error(self):
+        """两路全挂 → 聚合错误：设备API 发现错误 + api-pan 各形状错误都保留。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError) as ctx:
+            tc.core._folders("remote-1", "")
+        msg = str(ctx.exception)
+        self.assertIn("设备API发现", msg)
+        self.assertIn("api-pan", msg)
+        self.assertIn("502", msg)
+        for label in ("标准形状", "极简形状", "扩展形状", "空间形状"):
+            self.assertIn(label, msg)
+
+    def test_resolve_end_to_end_via_relay_walk_and_create(self):
+        """端到端：relay device/config 提示 + 目录表逐段解析 + 缺级 relay 自动
+        建目录（带 plugin 凭据），全程不打 api-pan 目录接口。"""
+        made, config_hits, unexpected = [], [], []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=pid&plugin_app_token=ptok"})
+            if host == "relay.example" and path.endswith("/device/config"):
+                config_hits.append(host)
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if host == "relay.example" and path.endswith("/drive/v1/files") \
+                    and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "dir-1", "name": "downloads", "kind": "drive#folder",
+                         "params": {"RealPath": "/downloads/"}}]})
+                return httpx.Response(200, json={"files": [
+                    {"id": "sub-1", "name": "电影", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/电影/"}}]})
+            if host == "relay.example" and path.endswith("/drive/v1/files") \
+                    and request.method == "POST":
+                made.append({"body": json.loads(request.content),
+                             "params": dict(request.url.params)})
+                return httpx.Response(200, json={"file": {"id": "made-1"}})
+            unexpected.append(f"{request.method} {host}{path}")
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        self.assertEqual(tc.core.resolve_dest_folder("remote-1", "电影/2025"),
+                         ("made-1", "/downloads/电影/2025/"))
+        self.assertEqual(config_hits, ["relay.example"])   # 提示走设备 API
+        self.assertEqual(unexpected, [])
+        self.assertEqual(len(made), 1)
+        self.assertEqual(made[0]["body"], {
+            "parent_id": "sub-1", "name": "2025",
+            "space": "remote-1", "kind": "drive#folder"})
+        self.assertEqual(made[0]["params"]["plugin_app_id"], "pid")
+        self.assertEqual(made[0]["params"]["plugin_app_token"], "ptok")
+
+    def test_make_folder_falls_back_apipan_when_relay_post_fails(self):
+        """relay 建目录失败 → 回退 api-pan 建目录（既有行为保留）。"""
+        seen = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                return httpx.Response(200, json={"error_code": 403,
+                                                 "error": "denied"})
+            if host == "api-pan.xunlei.com" and request.method == "POST":
+                seen.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "ap-1"}})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        self.assertEqual(tc.core._make_folder("remote-1", "p1", "电影"),
+                         {"id": "ap-1", "name": "电影", "params": {"RealPath": ""}})
+        self.assertEqual(seen, [{"parent_id": "p1", "name": "电影",
+                                 "space": "remote-1", "kind": "drive#folder"}])
+
+    def test_create_task_still_posts_apipan_after_relay_resolve(self):
+        """回归：目录解析走设备 API，但建任务仍 POST api-pan /drive/v1/task，parent_folder_id 来自 relay 解析结果。"""
+        captured = {}
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if host == "api-pan.xunlei.com" and path.endswith("/drive/v1/task") \
+                    and request.method == "POST":
+                captured["host"], captured["path"] = host, path
+                captured.update(json.loads(request.content))
+                return httpx.Response(200, json={"task": {"id": "cloud-9"}})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        tid = tc.core.create_task("https://x/a",
+                                  ParsedResource(name="a", size=1), "remote-1")
+        self.assertEqual(tid, "cloud-9")
+        self.assertEqual(captured["host"], "api-pan.xunlei.com")
+        self.assertEqual(captured["path"], "/drive/v1/task")
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@
   换令牌   POST https://xluser-ssl.xunlei.com/v1/auth/signin/token
   刷令牌   POST https://xluser-ssl.xunlei.com/v1/auth/token
   业务 API https://api-pan.xunlei.com/drive/v1/*（与本地引擎同构）
+  设备专属 API GET /drive/v1/apps/INNER_API?space=<target> 发现中继域名，远程设备的目录表/建目录/设备配置走该域名（云端目录接口只服务云盘空间，设备空间走设备专属接口）
 签名：captcha_sign/devicesign 按约定的摘要算法计算。
 凭据仅保存在本机 state/config.json，不上传任何服务器。
 """
@@ -21,12 +22,12 @@ import os
 import re
 import time
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
 from .base import Backend, BackendError, ParsedResource, TaskView
-from .drive_core import DriveCore, task_to_view
+from .drive_core import DriveCore, _dbg, task_to_view
 
 XLUSER_BASE = "https://xluser-ssl.xunlei.com"
 XLUSER_API = XLUSER_BASE + "/v1"
@@ -139,11 +140,18 @@ def captcha_sign(device_id: str) -> tuple[str, str]:
 
 
 class _CloudDrive(DriveCore):
-    """带错误码检测与令牌/人机令牌自动续期的 drive/v1 客户端。"""
+    """带错误码检测与令牌/人机令牌自动续期的 drive/v1 客户端。
+
+    远程设备的目录表/建目录走设备专属 API。"""
+
+    # 设备专属 API 发现缓存 TTL（
+    # 取 300s 减少发现请求；失效时自动重发现，见 _folders 的 refresh 轮）
+    _RELAY_TTL = 300
 
     def __init__(self, client: httpx.Client, backend: "ThunderCloud"):
         super().__init__(client, DRIVE_API, backend._auth_headers)
         self.backend = backend
+        self._device_apis: dict[str, dict] = {}
 
     def _request(self, method, path, *, params=None, json_body=None,
                  timeout=30):
@@ -189,8 +197,149 @@ class _CloudDrive(DriveCore):
             raise BackendError(_err_text("迅雷接口错误", data))
         raise BackendError("迅雷接口错误：重试后仍失败")
 
+    # ------------------------------------------------ 设备专属 API（0.1.30）
+
+    def _relay_api(self, space: str, refresh: bool = False) -> dict:
+        """发现远程设备的专属 API 网关。
+
+        链路：
+          GET https://api-pan.xunlei.com/drive/v1/apps/INNER_API?space=<target>
+          （仅 Bearer 认证）→ {"link": "<url>", "links": [{"url": "<url>"}]}
+          url 形如 https://<relay-host>/<path>/?plugin_app_id=X&plugin_app_token=Y
+        ApiDomain = 去掉 query、保留路径、补尾斜杠，
+        后续请求 <ApiDomain>drive/v1/files?...&plugin_app_id=X&plugin_app_token=Y。"""
+        now = time.time()
+        ent = self._device_apis.get(space)
+        if ent and not refresh and now - ent.get("at", 0) < self._RELAY_TTL:
+            return ent
+        data = self._request("GET", DRIVE_API + "/apps/INNER_API",
+                             params={"space": space}, timeout=15)
+        url = (data.get("link") or "").strip()
+        if not url:
+            for it in (data.get("links") or []):
+                if isinstance(it, dict) and (it.get("url") or "").strip():
+                    url = it["url"].strip()
+                    break
+        if not url:
+            raise BackendError(
+                "设备专属 API 发现失败：INNER_API 响应缺少 link/links[].url")
+        parts = urlsplit(url)
+        base = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        if not base.endswith("/"):
+            base += "/"        # ApiDomain+相对路径 是字符串拼接，必须带尾斜杠
+        q = parse_qs(parts.query)
+        ent = {"base": base,
+               "plugin_app_id": (q.get("plugin_app_id") or [""])[0],
+               "plugin_app_token": (q.get("plugin_app_token") or [""])[0],
+               "at": now}
+        self._device_apis[space] = ent
+        _dbg(f"设备API发现: space={space[:12]} relay={parts.netloc}{parts.path} "
+             f"plugin凭据={'有' if ent['plugin_app_token'] else '无'}")
+        return ent
+
+    def _relay_params(self, api: dict, space: str) -> dict:
+        """设备 API 请求公共参数：space= 设备空间、
+        device_space= 空、plugin_app_id/plugin_app_token 发现凭据。"""
+        p = {"device_space": "", "space": space}
+        if api.get("plugin_app_id"):
+            p["plugin_app_id"] = api["plugin_app_id"]
+        if api.get("plugin_app_token"):
+            p["plugin_app_token"] = api["plugin_app_token"]
+        return p
+
+    def _relay_folder_shapes(self, api: dict, space: str,
+                             parent_id: str) -> list[tuple[str, dict]]:
+        """设备 API 目录表参数形状：
+        filters 三条件（trashed/phase/kind）、with_audit=true、order=TYPE_DESC、
+        page_token= 空、with=withCategoryDiskMountPath&withCategoryHistoryDownloadPath
+        （注意是 HistoryDownloadPath，扩展引擎形状的 withCategoryDownloadPath
+        不适用于设备 API）。第二形状 kind-only 兜底防扩展参数被严格校验。"""
+        filters_full = json.dumps({
+            "trashed": {"eq": False},
+            "phase": {"eq": "PHASE_TYPE_COMPLETE"},
+            "kind": {"eq": "drive#folder"}}, separators=(",", ":"))
+        filters_kind = json.dumps({"kind": {"eq": "drive#folder"}},
+                                  separators=(",", ":"))
+        base = self._relay_params(api, space)
+        full = dict(base, parent_id=parent_id or "", limit="200",
+                    with_audit="true", filters=filters_full, page_token="",
+                    order="TYPE_DESC",
+                    **{"with": ["withCategoryDiskMountPath",
+                                "withCategoryHistoryDownloadPath"]})
+        kind_only = dict(base, parent_id=parent_id or "", limit="200",
+                         filters=filters_kind)
+        return [("设备API完整形状", full), ("设备API极简形状", kind_only)]
+
+    def _folders(self, space: str, parent_id: str = "") -> list[dict]:
+        """目录表走设备专属 API（0.1.30 修复）；失败时回退基类阶梯
+        （api-pan 标准/极简形状，兼容万一 api-pan 开放设备空间的未来变化）。
+        两路全挂才抛聚合错误（设备API 与 api-pan 每一步的错误都保留）。"""
+        tries: list[str] = []
+        for refresh in (False, True):     # 第二轮强制重发现（凭据过期自愈）
+            try:
+                api = self._relay_api(space, refresh=refresh)
+            except BackendError as exc:
+                tries.append(f"设备API发现：{str(exc)[:100]}")
+                break
+            saw_ok = False
+            for label, params in self._relay_folder_shapes(api, space, parent_id):
+                try:
+                    data = self._request("GET", api["base"] + "drive/v1/files",
+                                         params=params, timeout=15)
+                except BackendError as exc:
+                    tries.append(f"{label}：{str(exc)[:100]}")
+                    continue
+                saw_ok = True
+                files = [f for f in (data.get("files") or [])
+                         if isinstance(f, dict)
+                         and f.get("kind") in (None, "", "drive#folder")]
+                if files:
+                    return files
+                tries.append(f"{label}：空表")
+            if saw_ok:                    # 设备 API 可达但目录为空：如实返回
+                return []
+        _dbg(f"设备API目录表未果回退api-pan: {space[:12]} {str(tries)[:80]}")
+        try:
+            return super()._folders(space, parent_id)
+        except BackendError as exc:
+            raise BackendError(
+                "云端目录表查询失败（设备API 与 api-pan 均失败）："
+                + "；".join(tries + [str(exc)[:400]])) from exc
+
+    def _make_folder(self, space: str, parent_id: str, name: str) -> dict:
+        """建子目录走设备专属 API（带 plugin 凭据），
+        失败回退基类（api-pan）。"""
+        try:
+            api = self._relay_api(space)
+            data = self._request("POST", api["base"] + "drive/v1/files",
+                                 params=self._relay_params(api, space),
+                                 json_body={"parent_id": parent_id, "name": name,
+                                            "space": space, "kind": "drive#folder"},
+                                 timeout=15)
+            fid = (data.get("file") or {}).get("id") or ""
+        except BackendError:
+            fid = ""
+        if not fid:
+            return super()._make_folder(space, parent_id, name)
+        return {"id": fid, "name": name, "params": {"RealPath": ""}}
+
+    def _device_config(self, space: str = "") -> dict:
+        """设备配置（download_paths 下载根提示）优先走设备专属 API
+        （<ApiDomain>device/config，与 device/info/watch 同级），
+        失败回退基类（api-pan /device/config 通常不可达 → {} 静默）。"""
+        if space:
+            try:
+                api = self._relay_api(space)
+                return self._request("GET", api["base"] + "device/config",
+                                     params=self._relay_params(api, space),
+                                     timeout=15)
+            except BackendError:
+                pass
+        return super()._device_config(space)
+
     def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
-        """云端 api-pan 网关只认标准/极简形状——扩展（with）/空间（device_space）引擎形状会被网关直接 502（0.1.28 网关差异），云端优先标准形状。"""
+        """api-pan 回退阶梯的形状顺序（0.1.30 起仅作设备 API 不可达时的回退）：
+        标准/极简优先——api-pan 对引擎形状（with/device_space）直接 502。"""
         shapes = dict(super()._folder_shapes(space, parent_id))
         order = ["标准形状", "极简形状", "扩展形状", "空间形状"]
         return [(k, shapes[k]) for k in order if k in shapes]

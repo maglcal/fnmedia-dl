@@ -201,9 +201,10 @@ class DriveCore:
 
     # ------------------------------------------------------------ 目录解析
 
-    def _device_config(self) -> dict:
+    def _device_config(self, space: str = "") -> dict:
         """GET /device/config（drive/v1 的同级接口，用于获取
-        download_paths）。云端网关不一定代理此接口——失败静默返回 {}，
+        download_paths）。space 仅设备专属 API 覆盖版（_CloudDrive）使用，
+        基类本地引擎不需要。云端网关不一定代理此接口——失败静默返回 {}，
         由 resolve_dest_folder 的兜底链继续。"""
         root = self.base_url[:-len("/drive/v1")] if self.base_url.endswith("/drive/v1") else self.base_url
         try:
@@ -213,10 +214,11 @@ class DriveCore:
 
     def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
         """目录表查询参数形状阶梯（0.1.29）：不同网关对参数容忍度不同——
-        本地引擎认 扩展（with）/空间（device_space）形状，云端 api-pan
-        网关对这两种引擎形状直接 502（0.1.28 网关差异），
-        只认不带扩展参数的标准/极简形状。基类=本地引擎：带 with 的扩展形状优先（目录项带 params.RealPath，下载根匹配最准）；
-        _CloudDrive 覆盖为云端优先。"""
+        本地引擎认扩展（with）/空间（device_space）形状优先（目录项带
+        params.RealPath，下载根匹配最准），标准/极简形状兜底。
+
+        0.1.30：远程设备（user#runner 空间）的目录表须走设备专属 API。
+        _CloudDrive 覆盖 _folders 走设备专属 API，本阶梯降级为回退路径。"""
         filters = json.dumps({"kind": {"eq": "drive#folder"}},
                              separators=(",", ":"))
         standard = {"space": space, "limit": "200",
@@ -281,7 +283,7 @@ class DriveCore:
                 "引擎目录表为空，无法解析下载根目录"
                 "（parent_folder_id 缺失时任务不会开始下载）")
         hint = ""
-        for p in (self._device_config().get("download_paths") or []):
+        for p in (self._device_config(space).get("download_paths") or []):
             if str(p).strip():
                 hint = _norm_dir(str(p))
                 break
