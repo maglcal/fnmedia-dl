@@ -107,10 +107,14 @@ class DownloadManager:
                 errors.append(f"{impl.label}: 今日任务创建次数已满，已跳过（明日自动恢复）")
                 continue
             try:
-                st = impl.status()
-                if not st.get("reachable"):
-                    errors.append(f"{impl.label}: {st.get('detail') or '不可用'}")
-                    continue
+                # 显式指定通道时跳过 status 预检直达 add（0.1.29）：预检要多打
+                # 2~3 个接口，上游卡顿时白白吃掉网关响应预算（用户实测派发
+                # 提示 502 的帮凶）；auto 降级链仍预检——那是通道探活的依据。
+                if backend == "auto":
+                    st = impl.status()
+                    if not st.get("reachable"):
+                        errors.append(f"{impl.label}: {st.get('detail') or '不可用'}")
+                        continue
                 task_id = impl.add(url, name=name or None, directory=directory)
                 if name_key == "thunder_engine":
                     self.quota.note_engine_create()

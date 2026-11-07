@@ -146,13 +146,13 @@ class DriveCore:
         return h
 
     def _request(self, method: str, path: str, *, params: dict | None = None,
-                 json_body: dict | None = None) -> dict:
+                 json_body: dict | None = None, timeout: float = 30) -> dict:
         # path 以 http 开头时视为完整 URL（如 drive/v1 的同级接口 /device/config）
         url = path if path.startswith("http") else self.base_url + path
         try:
             resp = self.client.request(method, url, params=params,
                                        json=json_body, headers=self._headers(),
-                                       timeout=30)
+                                       timeout=timeout)
         except httpx.HTTPError as exc:
             raise BackendError(f"连接失败：{exc}") from exc
         if resp.status_code >= 400:
@@ -211,35 +211,47 @@ class DriveCore:
         except BackendError:
             return {}
 
-    def _folders(self, space: str, parent_id: str = "") -> list[dict]:
-        """目录表：两种参数形状依次尝试（0.1.28 用户实测 扩展形状在其环境失败）。
-
-        A) 扩展形状：带 with=withCategoryDiskMountPath/
-           withCategoryDownloadPath，目录项带 params.RealPath 可精确匹配下载根。
-        B) 空间形状：无 with、多带 device_space= 空参数（同生态实测可用）；
-           目录项无 RealPath 时按名称/parent_id 兜底匹配。"""
+    def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
+        """目录表查询参数形状阶梯（0.1.29）：不同网关对参数容忍度不同——
+        本地引擎认 扩展（with）/空间（device_space）形状，云端 api-pan
+        网关对这两种引擎形状直接 502（0.1.28 网关差异），
+        只认不带扩展参数的标准/极简形状。基类=本地引擎：带 with 的扩展形状优先（目录项带 params.RealPath，下载根匹配最准）；
+        _CloudDrive 覆盖为云端优先。"""
         filters = json.dumps({"kind": {"eq": "drive#folder"}},
                              separators=(",", ":"))
-        common = {"space": space, "limit": "200", "parent_id": parent_id or "",
-                  "filters": filters, "page_token": ""}
-        saw_ok, last_err = False, ""
-        for extra in (
-                {"with": ["withCategoryDiskMountPath", "withCategoryDownloadPath"]},
-                {"device_space": ""}):
+        standard = {"space": space, "limit": "200",
+                    "parent_id": parent_id or "", "filters": filters}
+        minimal = {"space": space, "limit": "200", "parent_id": parent_id or ""}
+        shape_ext = dict(standard, page_token="",
+                     **{"with": ["withCategoryDiskMountPath",
+                                 "withCategoryDownloadPath"]})
+        shape_space = dict(standard, page_token="", device_space="")
+        return [("扩展形状", shape_ext), ("空间形状", shape_space),
+                ("标准形状", standard), ("极简形状", minimal)]
+
+    def _folders(self, space: str, parent_id: str = "") -> list[dict]:
+        """目录表：按 _folder_shapes 阶梯逐形状重试，取第一个非空结果；
+        只要有任一形状成功（哪怕空表）就不升级报错，全军覆没才抛聚合错误
+        （每形状的错误都保留，502/超时这类网关差异一眼可辨）。
+        kind 客户端兜底过滤：极简形状无服务端过滤时只信 drive#folder。"""
+        saw_ok, tries = False, []
+        for label, params in self._folder_shapes(space, parent_id):
             try:
-                data = self._request("GET", "/files",
-                                     params=dict(common, **extra))
+                data = self._request("GET", "/files", params=params, timeout=15)
             except BackendError as exc:
-                last_err = str(exc)[:120]
+                tries.append(f"{label}：{str(exc)[:100]}")
                 continue
             saw_ok = True
-            files = [f for f in (data.get("files") or []) if isinstance(f, dict)]
+            files = [f for f in (data.get("files") or [])
+                     if isinstance(f, dict)
+                     and f.get("kind") in (None, "", "drive#folder")]
             if files:
                 return files
-        if not saw_ok:
-            raise BackendError(
-                f"引擎目录表查询失败（扩展/空间两种参数形状均报错）：{last_err}")
-        return []
+            tries.append(f"{label}：空表")
+        if saw_ok:
+            return []
+        raise BackendError(
+            "引擎目录表查询失败（各形状均报错）：" + "；".join(tries))
 
     def _make_folder(self, space: str, parent_id: str, name: str) -> dict:
         """建子目录：POST /drive/v1/files kind=drive#folder。"""
@@ -337,13 +349,18 @@ class DriveCore:
 
     def create_task(self, url: str, resource: ParsedResource, space: str,
                     *, directory: str = "", parent_folder_id: str = "",
-                    parent_folder_path: str = "") -> str:
+                    parent_folder_path: str = "",
+                    on_unresolvable: str = "raise") -> str:
         """创建任务。parent_folder_id 为空时按 directory 解析真实下载目录——
         这是任务真正开始下载的必要字段（缺省任务永远停在排队中）。
 
         解析是阶梯式尽力而为（0.1.28）：完整解析 → 子目录失败降级用根 id +
-        目标路径 → 根外绝对路径保留根 id + 原样路径。只有完全拿不到目录 id
-        （目录表查询全挂）才报错——绝不静默建「排队中」死任务。"""
+        目标路径 → 根外绝对路径保留根 id + 原样路径。
+
+        on_unresolvable（0.1.29）：目录解析彻底失败（目录表查询全挂/空表）时——
+        "raise"（默认，云端）：显式报错，云端 id 空的任务永不启动，静默建
+        死任务比报错糟；"direct"（本地引擎）：回退 0.1.22 直传形状（id 空 +
+        路径原样），引擎按路径自行落盘（用户环境实测可用），仅作最后兜底。"""
         if parent_folder_id:
             pfid = parent_folder_id
             pfpath = parent_folder_path or directory or ""
@@ -353,7 +370,10 @@ class DriveCore:
                     space, (directory or "").strip())
             except BackendError as exc:
                 _dbg(f"目录解析失败: dir={directory[:40]!r} → {str(exc)[:120]}")
-                raise
+                if on_unresolvable != "direct":
+                    raise
+                pfid, pfpath = "", (directory or "").strip()
+                _dbg(f"引擎直传兜底: id=空 path={pfpath[:40]}")
             _dbg(f"目录解析: dir={directory[:40]!r} → id={pfid[:16]} "
                  f"path={pfpath[:40]}")
         name = resource.name or url[:80]

@@ -145,7 +145,8 @@ class _CloudDrive(DriveCore):
         super().__init__(client, DRIVE_API, backend._auth_headers)
         self.backend = backend
 
-    def _request(self, method, path, *, params=None, json_body=None):
+    def _request(self, method, path, *, params=None, json_body=None,
+                 timeout=30):
         # 自行发请求（不走 DriveCore._request）：迅雷错误多以 200/4xx + error_code
         # 返回，必须先按错误码分流（令牌续期），不能只看 HTTP 状态码。
         # path 以 http 开头时视为完整 URL（如 /device/config 同级接口）。
@@ -156,7 +157,8 @@ class _CloudDrive(DriveCore):
             try:
                 resp = self.client.request(method, url, params=params,
                                            json=json_body,
-                                           headers=self._headers(), timeout=30)
+                                           headers=self._headers(),
+                                           timeout=timeout)
             except httpx.HTTPError as exc:
                 raise BackendError(f"网络错误（请检查 NAS 出网/DNS/代理设置）：{exc}") from exc
             try:
@@ -186,6 +188,12 @@ class _CloudDrive(DriveCore):
                     f"（v{_pkg_version()}，user_id={'已取到' if uid else '空'}）")
             raise BackendError(_err_text("迅雷接口错误", data))
         raise BackendError("迅雷接口错误：重试后仍失败")
+
+    def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
+        """云端 api-pan 网关只认标准/极简形状——扩展（with）/空间（device_space）引擎形状会被网关直接 502（0.1.28 网关差异），云端优先标准形状。"""
+        shapes = dict(super()._folder_shapes(space, parent_id))
+        order = ["标准形状", "极简形状", "扩展形状", "空间形状"]
+        return [(k, shapes[k]) for k in order if k in shapes]
 
 
 class ThunderCloud(Backend):

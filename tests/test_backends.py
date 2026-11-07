@@ -197,6 +197,58 @@ class TestDriveCore(unittest.TestCase):
         self.assertNotIn("with", seen[1])
         self.assertIn("device_space", seen[1])
 
+    def test_folders_shape_ladder_to_minimal(self):
+        """引擎形状（扩展/空间）全挂时还有标准/极简形状兜底——
+        0.1.29：云端 api-pan 网关 502 引擎形状，极简形状（无 filters/
+        page_token/with/device_space）是兼容面最大的一种。"""
+        seen = []
+
+        def handler(request):
+            if request.url.path.endswith("/files") and request.method == "GET":
+                p = dict(request.url.params)
+                seen.append(p)
+                if "with" in p or "device_space" in p or "filters" in p:
+                    return httpx.Response(502, text="bad gateway")
+                return httpx.Response(200, json={"files": [
+                    {"id": "a", "name": "电影", "parent_id": "root-9"},
+                    {"id": "b", "name": "动漫", "parent_id": "root-9"}]})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
+        self.assertEqual(len(seen), 4)          # 扩展 → 空间 → 标准 → 极简
+        self.assertNotIn("filters", seen[3])
+        self.assertNotIn("page_token", seen[3])
+        self.assertNotIn("with", seen[3])
+        self.assertNotIn("device_space", seen[3])
+
+    def test_folders_all_shapes_fail_aggregate_error(self):
+        """全形状报错 → 聚合错误（每形状错误都保留，502/超时一眼可辨）。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+        core = self._mk(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("sp", "")
+        msg = str(ctx.exception)
+        for label in ("扩展形状", "空间形状", "标准形状", "极简形状"):
+            self.assertIn(label, msg)
+        self.assertIn("502", msg)
+
+    def test_cloud_folder_shapes_standard_first(self):
+        """云端通道（_CloudDrive）形状顺序：标准/极简优先——引擎形状会被
+        api-pan 网关 502（0.1.28 网关差异）。"""
+        from backends.thunder_cloud import ThunderCloud
+        tc = ThunderCloud(httpx.Client(), {}, None)
+        labels = [label for label, _ in tc.core._folder_shapes("sp", "")]
+        self.assertEqual(labels, ["标准形状", "极简形状", "扩展形状", "空间形状"])
+
+    def test_folders_kind_filter_client_side(self):
+        """极简形状无服务端过滤：kind 非 drive#folder 的条目客户端兜底剔除。"""
+        core = self._mk(self._folder_handler(files=[
+            {"id": "f1", "name": "file.bin", "kind": "drive#file"},
+            {"id": "d1", "name": "电影", "kind": "drive#folder"},
+            {"id": "d2", "name": "剧集"}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("d1", ""))
+
     def test_resolve_subdir_walk_and_create(self):
         """子目录逐段解析，缺级自动建。"""
         made = []
@@ -333,6 +385,26 @@ class TestDriveCore(unittest.TestCase):
         with self.assertRaises(BackendError):
             core.create_task("https://x/a", ParsedResource(name="a", size=1),
                              "sp")
+
+    def test_create_task_engine_direct_fallback_when_unresolvable(self):
+        """本地引擎最后兜底（on_unresolvable="direct"）：目录表查询全挂时
+        回退 0.1.22 直传形状（id 空 + 路径原样）——引擎按路径自行落盘
+        （用户环境实测可用）；默认（云端）仍报错不建死任务。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(502, text="bad gateway")
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-5"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="/vol1/media",
+                               on_unresolvable="direct")
+        self.assertEqual(tid, "t-5")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/vol1/media")
 
     def test_set_phase_and_delete(self):
         calls = []
