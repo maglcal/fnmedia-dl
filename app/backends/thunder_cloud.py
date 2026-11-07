@@ -148,7 +148,8 @@ class _CloudDrive(DriveCore):
     def _request(self, method, path, *, params=None, json_body=None):
         # 自行发请求（不走 DriveCore._request）：迅雷错误多以 200/4xx + error_code
         # 返回，必须先按错误码分流（令牌续期），不能只看 HTTP 状态码。
-        url = self.base_url + path
+        # path 以 http 开头时视为完整 URL（如 /device/config 同级接口）。
+        url = path if path.startswith("http") else self.base_url + path
         # 人机令牌刷新的 action 是完整 URL 路径（含 /drive/v1 前缀）
         action = method + ":" + urlsplit(url).path
         for attempt in range(3):
@@ -694,15 +695,28 @@ class ThunderCloud(Backend):
     # ------------------------------------------------------------ 目标设备
 
     def _target_of(self) -> str:
-        if (self.conf.get("target") or "").strip():
-            return self.conf["target"].strip()
-        if self._target:
+        """目标设备必须仍在在线设备（user#runner）列表里才使用——
+        设备重建/换绑后旧 target 会把任务建进无人执行的「幽灵空间」：
+        任务永远排队中、迅雷面板看不到（0.1.18 暂停静默失效同类坑）。
+        设备发现失败时不阻断（回退配置值，可用性优先）。"""
+        conf_t = (self.conf.get("target") or "").strip()
+        try:
+            online = [t["target"] for t in self.core.device_targets()]
+        except BackendError:
+            online = None                      # 发现失败 ≠ 没有设备
+        if conf_t and (online is None or conf_t in online):
+            return conf_t
+        if self._target and (online is None or self._target in online):
             return self._target
-        targets = self.core.device_targets()
-        if not targets:
-            raise BackendError("当前迅雷账号下未发现远程下载设备（请先在迅雷 App 中绑定远程设备）")
-        self._target = targets[0]["target"]
-        return self._target
+        if online:
+            self._target = online[0]
+            return self._target
+        if conf_t:
+            return conf_t                      # 发现失败但有配置值：尽力而为
+        if online is None:
+            raise BackendError("远程设备发现失败，且未配置目标设备"
+                               "（请在设置里填写「目标设备」或稍后重试）")
+        raise BackendError("当前迅雷账号下未发现远程下载设备（请先在迅雷 App 中绑定远程设备）")
 
     # ------------------------------------------------------------ 接口
 
@@ -729,6 +743,11 @@ class ThunderCloud(Backend):
                         "detail": _err_text("登录态校验失败", data)}
             targets = self.core.device_targets()
             detail = f"已登录，远程设备 {len(targets)} 台"
+            conf_t = (self.conf.get("target") or "").strip()
+            online = [t["target"] for t in targets]
+            if conf_t and online and conf_t not in online:
+                detail += (f"；⚠ 配置的目标设备 {conf_t[:12]}… 已不在线，"
+                           f"任务将改发到 {online[0][:12]}…（可在设置里更新目标设备）")
             return {"configured": True, "reachable": bool(targets), "detail": detail}
         except BackendError as exc:
             return {"configured": True, "reachable": False, "detail": str(exc)}

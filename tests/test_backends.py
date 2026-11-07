@@ -14,7 +14,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 from backends.aria2 import Aria2                      # noqa: E402
-from backends.base import BackendError                 # noqa: E402
+from backends.base import BackendError, ParsedResource    # noqa: E402
 from backends.drive_core import DriveCore, task_to_view  # noqa: E402
 from backends.thunder_cloud import (                   # noqa: E402
     ALGORITHMS, CLIENT_ID, CLIENT_VERSION, PACKAGE_NAME, REVIEW_UA,
@@ -129,6 +129,108 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(captured["params"]["sub_file_index"], "--1,")
         self.assertEqual(captured["file_size"], "10")
 
+    # ---- parent_folder_id 解析（2026-11-08 用户实测任务永远排队中 0.0% 的原因：
+    #      缺省 parent_folder_id 的任务不会开始下载，已验证） ----
+
+    def _folder_handler(self, *, config=None, files=None, made=None, post_seen=None):
+        """目录解析链 mock：/device/config + GET/POST /drive/v1/files。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json=config or {})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": files or []})
+            if path.endswith("/files") and request.method == "POST":
+                if post_seen is not None:
+                    post_seen.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": made or "made-1"}})
+            return httpx.Response(200, json={"task": {"id": "t-x"}})
+        return handler
+
+    def test_resolve_root_by_config_hint(self):
+        """下载根 = /device/config download_paths 与目录表 realPath 匹配。"""
+        core = self._mk(self._folder_handler(
+            config={"download_paths": ["/downloads"]},
+            files=[{"id": "dir-1", "name": "downloads", "params": {"RealPath": "/downloads/"}},
+                   {"id": "dir-2", "name": "other", "params": {"RealPath": "/other/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""),
+                         ("dir-1", "/downloads/"))
+
+    def test_resolve_root_single_folder_and_name(self):
+        """无 /device/config：唯一顶层目录 / 常见下载根名兜底。"""
+        core = self._mk(self._folder_handler(
+            files=[{"id": "only", "name": "x", "params": {"RealPath": "/x/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""),
+                         ("only", "/x/"))
+        core = self._mk(self._folder_handler(
+            files=[{"id": "a", "name": "aaa", "params": {"RealPath": "/aaa/"}},
+                   {"id": "b", "name": "downloads", "params": {"RealPath": "/data/downloads/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""),
+                         ("b", "/data/downloads/"))
+
+    def test_resolve_root_heuristic_fallback(self):
+        """最后兜底：首个顶层目录的 parent_id 或 id。"""
+        core = self._mk(self._folder_handler(
+            files=[{"id": "a", "name": "aaa", "parent_id": "root-9"},
+                   {"id": "b", "name": "bbb", "parent_id": "root-9"}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
+
+    def test_resolve_subdir_walk_and_create(self):
+        """子目录逐段解析，缺级自动建。"""
+        made = []
+        subs = [{"id": "sub-1", "name": "电影", "params": {"RealPath": "/downloads/电影/"}}]
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "dir-1", "name": "downloads",
+                         "params": {"RealPath": "/downloads/"}}]})
+                return httpx.Response(200, json={"files": subs})
+            if path.endswith("/files") and request.method == "POST":
+                made.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "made-%d" % len(made)}})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "电影/2025"),
+                         ("made-1", "/downloads/电影/2025/"))
+        self.assertEqual(made, [{"parent_id": "sub-1", "name": "2025",
+                                 "space": "sp", "kind": "drive#folder"}])
+
+    def test_resolve_rejects_dir_outside_root(self):
+        """根外绝对目录显式报错（静默建进错误目录 = 假成功）。"""
+        core = self._mk(self._folder_handler(
+            config={"download_paths": ["/downloads"]},
+            files=[{"id": "dir-1", "name": "downloads", "params": {"RealPath": "/downloads/"}}]))
+        with self.assertRaises(BackendError) as cm:
+            core.resolve_dest_folder("sp", "/vol1/other")
+        self.assertIn("/downloads/", str(cm.exception))
+
+    def test_create_task_resolves_parent_folder(self):
+        """未显式给 parent_folder_id 时自动解析——这是任务开始下载的必要字段。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": 4242}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "space-1")
+        self.assertEqual(tid, "4242")            # 引擎整型 id 归一字符串
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
+
     def test_set_phase_and_delete(self):
         calls = []
 
@@ -219,6 +321,12 @@ class TestThunderEngine(unittest.TestCase):
             if path.endswith("/drive/v1/tasks"):
                 return httpx.Response(200, json={"tasks": [{
                     "params": {"target": "dev-space"}}]})
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/drive/v1/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads", "parent_id": "root-1",
+                     "params": {"RealPath": "/downloads/"}}]})
             if path.endswith("/drive/v1/resource/list"):
                 return httpx.Response(200, json={
                     "list": {"resources": [{"name": "f", "file_size": 1}]}})
@@ -234,6 +342,10 @@ class TestThunderEngine(unittest.TestCase):
         # pan-auth 头应携带从面板提取的 JWT
         task_req = seen["/webman/3rdparty/pan-xunlei-com/index.cgi/drive/v1/task"][0]
         self.assertEqual(task_req.headers.get("pan-auth"), "JWT-TOKEN-123")
+        # parent_folder_id/path 必须是解析出的真实下载目录（缺失任务不会开始下载）
+        body = json.loads(task_req.content)
+        self.assertEqual(body["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(body["params"]["parent_folder_path"], "/downloads/")
 
     def test_bad_panel(self):
         def handler(request):
@@ -281,6 +393,12 @@ class TestThunderCloudFlow(unittest.TestCase):
                     "refresh_token": "rt-1", "user_id": "u1"})
             if path.endswith("/user/me"):
                 return httpx.Response(200, json={"user_id": "u1"})
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/drive/v1/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "cdir-1", "name": "downloads", "parent_id": "root-1",
+                     "params": {"RealPath": "/downloads/"}}]})
             if path.endswith("/drive/v1/tasks"):
                 return httpx.Response(200, json={"tasks": [{
                     "params": {"target": "remote-1"}, "name": "runner"}]})
@@ -309,6 +427,10 @@ class TestThunderCloudFlow(unittest.TestCase):
         task_req = seen["https://api-pan.xunlei.com/drive/v1/task"][0]
         self.assertEqual(task_req.headers["authorization"], "Bearer at-1")
         self.assertEqual(task_req.headers["x-captcha-token"], "ct-1")
+        # parent_folder_id/path 必须是解析出的真实下载目录（缺失任务不会开始下载）
+        body = json.loads(task_req.content)
+        self.assertEqual(body["params"]["parent_folder_id"], "cdir-1")
+        self.assertEqual(body["params"]["parent_folder_path"], "/downloads/")
         # 令牌已持久化
         self.assertTrue(saved)
         self.assertEqual(saved[-1]["access_token"], "at-1")
@@ -533,6 +655,11 @@ class TestThunderCloudFixes(unittest.TestCase):
 
         def handler(request):
             if request.url.path.endswith("/tasks"):
+                if request.url.params.get("type") == "user#runner":
+                    # 设备发现（_target_of 在线校验）——不计入翻页序列
+                    return httpx.Response(200, json={"tasks": [
+                        {"id": "r1", "name": "dev",
+                         "params": {"target": "remote-1"}}]})
                 seen.append(str(request.url))
                 if not request.url.params.get("page_token", ""):
                     return httpx.Response(200, json={

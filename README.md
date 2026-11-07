@@ -225,14 +225,21 @@ services:
 隔离：任一迅雷通道失效时自动降级到 aria2，不影响基本可用性。ed2k 协议需要
 amule 等重型组件，暂不支持派发。
 
+**保存目录解析**：迅雷引擎建任务时必须给出下载根目录对应的
+`parent_folder_id`（缺省任务只会停在「排队中」不会开始下载）。插件会按
+`/device/config` 的下载路径 → 目录表 realPath 匹配 → 顶层唯一目录 → 首个
+顶层目录的顺序自动识别下载根；「保存目录」填根下的相对路径（如
+`movies/2025`）即可，缺级目录会自动创建。请勿填下载根之外的绝对路径。
+
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v    # 112 个用例，全程无网络
+python -m unittest discover -s tests -v    # 234 个用例，全程无网络
 ```
 
 覆盖：链接解析（magnet/thunder/ed2k/种子）、drive/v1 请求形状、云端登录链与
-签名链、令牌自动续期、aria2 JSON-RPC、派发降级、统一任务视图、API 层。
+签名链、令牌自动续期、下载目录/parent_folder 解析、aria2 JSON-RPC、派发降级、
+统一任务视图、API 层。
 
 ## License
 

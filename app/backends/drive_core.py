@@ -5,10 +5,17 @@
 同一套 drive/v1 请求体，仅 base URL 与认证头不同：
   设备发现 GET  /drive/v1/tasks?type=user#runner        → tasks[].params.target
   链接解析 POST /drive/v1/resource/list  {"page_size":2000,"urls":url}
+  目录表   GET  /drive/v1/files?space=&filters={"kind":{"eq":"drive#folder"}}
+  建目录   POST /drive/v1/files          kind=drive#folder
   创建任务 POST /drive/v1/task           type=user#download-url
-  任务列表 GET  /drive/v1/tasks?space=&filters={"phase":{"in":"..."}}
+  任务列表 GET  /drive/v1/tasks?space=&filters={"type":{"in":"..."}}
   暂停恢复 PATCH /drive/v1/task          set_params.spec={"phase":"pause"|"running"}
   删除任务 DELETE /drive/v1/tasks?space=&task_ids=
+
+任务参数铁律（2026-11-08）：
+  params.parent_folder_id/path 是任务真正开始下载的必要字段——
+  缺省（空）时引擎会把任务建出来但永远停在 PHASE_TYPE_PENDING
+  （插件显示「排队中 0.0%」、迅雷面板没有任何下载数据）。
 """
 from __future__ import annotations
 
@@ -20,8 +27,9 @@ import httpx
 from .base import BackendError, ParsedResource
 
 ACTIVE_PHASES = "PHASE_TYPE_PENDING,PHASE_TYPE_RUNNING"
-ALL_PHASES = ("PHASE_TYPE_PENDING,PHASE_TYPE_RUNNING,PHASE_TYPE_COMPLETE,"
-              "PHASE_TYPE_ERROR,PHASE_TYPE_STOP,PHASE_TYPE_PAUSED")
+TASK_TYPES = "user#download,user#download-url"
+# 下载根目录常见名（无 /device/config 提示时的兜底匹配）
+DOWNLOAD_ROOT_NAMES = {"download", "downloads", "下载", "下载目录"}
 
 PHASE_STATE = {
     "PHASE_TYPE_PENDING": "waiting",
@@ -79,6 +87,29 @@ def scalar_int(v, default: int = 0) -> int:
         return default
 
 
+def _norm_dir(path: str) -> str:
+    """目录路径归一：clean + 尾斜杠。"""
+    p = (path or "").replace("\\", "/").strip()
+    if not p:
+        return ""
+    segs = [s for s in p.split("/") if s]
+    if not segs:
+        return "/"
+    return "/" + "/".join(segs) + "/"
+
+
+def _folder_path(folder: dict) -> str:
+    """drive/v1/files 目录项的真实路径：
+    params.RealPath 优先，AliasPath 兜底；键名大小写防御。"""
+    params = folder.get("params") or {}
+    for key in ("RealPath", "realPath", "real_path",
+                "AliasPath", "aliasPath", "alias_path"):
+        v = _norm_dir(str(params.get(key) or ""))
+        if v:
+            return v
+    return ""
+
+
 class DriveCore:
     """参数化的 drive/v1 客户端。base_url 以 /drive/v1 结尾；
     headers_provider() 每次请求取最新认证头。"""
@@ -98,7 +129,8 @@ class DriveCore:
 
     def _request(self, method: str, path: str, *, params: dict | None = None,
                  json_body: dict | None = None) -> dict:
-        url = self.base_url + path
+        # path 以 http 开头时视为完整 URL（如 drive/v1 的同级接口 /device/config）
+        url = path if path.startswith("http") else self.base_url + path
         try:
             resp = self.client.request(method, url, params=params,
                                        json=json_body, headers=self._headers(),
@@ -149,10 +181,126 @@ class DriveCore:
             raw=r,
         )
 
+    # ------------------------------------------------------------ 目录解析
+
+    def _device_config(self) -> dict:
+        """GET /device/config（drive/v1 的同级接口，用于获取
+        download_paths）。云端网关不一定代理此接口——失败静默返回 {}，
+        由 resolve_dest_folder 的兜底链继续。"""
+        root = self.base_url[:-len("/drive/v1")] if self.base_url.endswith("/drive/v1") else self.base_url
+        try:
+            return self._request("GET", root + "/device/config")
+        except BackendError:
+            return {}
+
+    def _folders(self, space: str, parent_id: str = "") -> list[dict]:
+        """目录表（标准接口同参）：with 两个 category 选项
+        让目录项带 params.RealPath/AliasPath 供根目录匹配。"""
+        data = self._request("GET", "/files", params={
+            "space": space, "limit": "200", "parent_id": parent_id or "",
+            "filters": json.dumps({"kind": {"eq": "drive#folder"}}),
+            "page_token": "",
+            "with": ["withCategoryDiskMountPath", "withCategoryDownloadPath"],
+        })
+        return [f for f in (data.get("files") or []) if isinstance(f, dict)]
+
+    def _make_folder(self, space: str, parent_id: str, name: str) -> dict:
+        """建子目录：POST /drive/v1/files kind=drive#folder。"""
+        data = self._request("POST", "/files", json_body={
+            "parent_id": parent_id, "name": name,
+            "space": space, "kind": "drive#folder"})
+        fid = (data.get("file") or {}).get("id") or ""
+        if not fid:
+            raise BackendError(f"创建下载子目录 {name} 失败：响应缺少 file.id")
+        return {"id": fid, "name": name,
+                "params": {"RealPath": ""}}
+
+    def resolve_dest_folder(self, space: str, directory: str = "") -> tuple[str, str]:
+        """解析下载目标文件夹 → (parent_folder_id, parent_folder_path)。
+
+        建任务必须带真实 parent_folder_id/path，否则任务永远不开始下载
+        （缺省任务不会开始下载）。下载根目录识别按序：
+          1. /device/config download_paths[0] 与目录表 realPath/aliasPath 匹配
+          2. 顶层只有一个目录 → 即根
+          3. 名称/路径命中下载根常见名（downloads/下载/…）
+          4. 启发式兜底：首个顶层目录的 parent_id 或 id
+        directory 为根下子目录（相对路径，或根目录下的绝对路径），
+        中间层级缺失时自动创建（多级逐段建）。"""
+        folders = self._folders(space, "")
+        if not folders:
+            raise BackendError(
+                "引擎目录表为空，无法解析下载根目录"
+                "（parent_folder_id 缺失时任务不会开始下载）")
+        hint = ""
+        for p in (self._device_config().get("download_paths") or []):
+            if str(p).strip():
+                hint = _norm_dir(str(p))
+                break
+
+        root_id, root_path = "", ""
+        if hint:                                  # 1) 配置提示精确匹配
+            for f in folders:
+                if _folder_path(f) == hint:
+                    root_id, root_path = str(f.get("id")), hint
+                    break
+        if not root_id and len(folders) == 1:     # 2) 唯一顶层目录
+            root_id = str(folders[0].get("id"))
+            root_path = _folder_path(folders[0]) or hint
+        if not root_id:                           # 3) 常见下载根名
+            for f in folders:
+                name = (f.get("name") or "").strip().lower()
+                if _folder_path(f) in ("/downloads/", "/") or name in DOWNLOAD_ROOT_NAMES:
+                    root_id = str(f.get("id"))
+                    root_path = _folder_path(f) or hint
+                    break
+        if not root_id:                           # 4) 启发式兜底
+            pid = str(folders[0].get("parent_id") or "").strip()
+            root_id = pid or str(folders[0].get("id"))
+            root_path = hint
+        if not root_id:
+            raise BackendError("无法识别引擎下载根目录（parent_folder_id 解析失败）")
+
+        dest = (directory or "").strip()
+        if not dest:
+            return root_id, root_path
+        nd = _norm_dir(dest)
+        if root_path and nd == root_path:
+            return root_id, root_path
+        if root_path and nd.startswith(root_path):
+            rel = nd[len(root_path):]             # 根下绝对路径 → 相对段
+        elif dest.startswith("/") and root_path:
+            raise BackendError(
+                f"下载目录 {dest} 不在引擎下载根目录 {root_path} 之下——"
+                f"请改成根下相对路径（如 电影/2025），或留空用下载根目录")
+        else:
+            rel = nd.lstrip("/")                  # 相对路径（根路径未知时绝对路径也按名走）
+
+        pid, ppath = root_id, root_path
+        for seg in [s for s in rel.split("/") if s]:
+            child = None
+            for f in self._folders(space, pid):
+                if ((f.get("name") or "").strip() == seg
+                        or _folder_path(f) == ppath + seg + "/"):
+                    child = f
+                    break
+            if child is None:
+                child = self._make_folder(space, pid, seg)
+            pid = str(child.get("id"))
+            ppath = ppath + seg + "/"
+        return pid, ppath
+
     # ------------------------------------------------------------ 建任务
 
     def create_task(self, url: str, resource: ParsedResource, space: str,
-                    *, directory: str = "", parent_folder_id: str = "") -> str:
+                    *, directory: str = "", parent_folder_id: str = "",
+                    parent_folder_path: str = "") -> str:
+        """创建任务。parent_folder_id 为空时按 directory 解析真实下载目录——
+        这是任务真正开始下载的必要字段（缺省任务永远停在排队中）。"""
+        if parent_folder_id:
+            pfid = parent_folder_id
+            pfpath = parent_folder_path or directory or ""
+        else:
+            pfid, pfpath = self.resolve_dest_folder(space, directory)
         name = resource.name or url[:80]
         body = {
             "type": "user#download-url",
@@ -164,8 +312,8 @@ class DriveCore:
                 "target": space,
                 "url": url,
                 "total_file_count": str(resource.file_count or "1"),
-                "parent_folder_path": directory or "",
-                "parent_folder_id": parent_folder_id or "",
+                "parent_folder_path": pfpath,
+                "parent_folder_id": pfid,
                 "sub_file_index": "--1,",
                 "mime_type": resource.mime_type,
                 "file_id": resource.file_id,
@@ -176,19 +324,26 @@ class DriveCore:
         tid = task.get("id") or ""
         if not tid:
             raise BackendError(f"创建任务失败：{json.dumps(data, ensure_ascii=False)[:200]}")
-        return tid
+        return str(tid)   # 引擎 id 可能是整型，统一字符串防 unified_tasks 匹配失败
 
     # ------------------------------------------------------------ 列表
 
     def list_tasks(self, space: str, *, active_only: bool = False) -> list[dict]:
         """任务列表（自动翻页）：drive/v1 /tasks 按 page_token 分页，
-        只拉首页会漏任务。"""
-        phases = ACTIVE_PHASES if active_only else ALL_PHASES
-        filters = json.dumps({"phase": {"in": phases}})
+        只拉首页会漏任务。
+
+        filters 实现：type 过滤只看
+        下载任务（防 user#runner 设备行混进任务列表）；全量查询不枚举 phase
+        （引擎各版本 phase 拼写有变体，枚举会漏掉 PHASE_TYPE_STOPPED 等任务）。"""
+        filters: dict = {"type": {"in": TASK_TYPES}}
+        if active_only:
+            filters["phase"] = {"in": ACTIVE_PHASES}
+        filters_s = json.dumps(filters)
         out: list[dict] = []
         page_token = ""
         for _ in range(20):        # 安全上限，防异常响应导致死循环
-            params: dict = {"space": space, "filters": filters}
+            params: dict = {"space": space, "filters": filters_s,
+                            "limit": "200"}
             if page_token:
                 params["page_token"] = page_token
             data = self._request("GET", "/tasks", params=params)
@@ -206,11 +361,9 @@ class DriveCore:
 
         PATCH 前先查任务取 task.Space / task.Type 发请求——硬编码 type/space 与任务不符时
         引擎会静默忽略（暂停卡住不翻转的原因）。先查给定 space，
-        找不到再逐个查设备空间。"""
-        filters = json.dumps({
-            "type": {"in": "user#download,user#download-url"},
-            "phase": {"in": ALL_PHASES},
-        })
+        找不到再逐个查设备空间。只按 type 过滤（不枚举 phase，
+        防 phase 拼写变体漏掉任务）。"""
+        filters = json.dumps({"type": {"in": TASK_TYPES}})
         spaces: list[str] = []
         if space:
             spaces.append(space)

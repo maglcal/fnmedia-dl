@@ -70,7 +70,9 @@ class DownloadManager:
     def _record(self, backend: str, task_id: str, url: str, name: str,
                 directory: str) -> None:
         self.records.append({
-            "backend": backend, "id": task_id, "url": url,
+            # id 统一字符串化：引擎可能返回整型 id，与 live 视图（str）不一致
+            # 会导致 unified_tasks 匹配失败（同任务出「已清理」+重复行）。
+            "backend": backend, "id": str(task_id), "url": url,
             "name": name, "dir": directory, "created_at": int(time.time()),
             "identity": linksmod.identity(url),
         })
@@ -158,14 +160,14 @@ class DownloadManager:
         seen: set[tuple[str, str]] = set()
         out: list[dict] = []
         for rec in reversed(self.records):
-            k = (rec.get("backend"), rec.get("id"))
+            k = (rec.get("backend"), str(rec.get("id")))
             if k in live:
                 item = dict(live[k])
                 item["url"] = item.get("url") or rec.get("url", "")
                 item["created_at"] = rec.get("created_at")
                 seen.add(k)
             else:
-                item = {"backend": rec.get("backend"), "id": rec.get("id"),
+                item = {"backend": rec.get("backend"), "id": str(rec.get("id")),
                         "name": rec.get("name") or rec.get("url", "")[:80],
                         "state": "gone", "progress": 0, "speed": None,
                         "size": None, "url": rec.get("url", ""),
@@ -193,7 +195,8 @@ class DownloadManager:
         elif action == "delete":
             impl.delete(task_id)
             self.records = [r for r in self.records
-                            if not (r.get("backend") == backend and r.get("id") == task_id)]
+                            if not (r.get("backend") == backend
+                                    and str(r.get("id")) == str(task_id))]
             self._save_records()
         else:
             raise BackendError(f"未知操作：{action}")
@@ -216,7 +219,7 @@ class DownloadManager:
             raise BackendError(f"未知通道：{backend}")
         rec = next((r for r in reversed(self.records)
                     if r.get("backend") == backend
-                    and r.get("id") == task_id), None)
+                    and str(r.get("id")) == str(task_id)), None)
         url = (rec or {}).get("url", "")
         directory = (rec or {}).get("dir", "")
         if not url:
@@ -237,7 +240,7 @@ class DownloadManager:
             pass
         self.records = [r for r in self.records
                         if not (r.get("backend") == backend
-                                and r.get("id") == task_id)]
+                                and str(r.get("id")) == str(task_id))]
         self._save_records()
         info = linksmod.parse_line(url)
         directory = directory or self.cfg.get("default_dir") or None
