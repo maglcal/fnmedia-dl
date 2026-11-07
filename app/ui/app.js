@@ -921,18 +921,37 @@ function renderQueue(s) {
   }
 }
 
+async function enqueue(text, directory) {
+  return API.send("/api/queue", "POST", { text, directory });
+}
+
 on("#btnEnqueue", "click", async () => {
   const text = $("#linkInput").value.trim();
   if (!text) return toast("请先在上方粘贴链接");
   try {
-    const r = await API.send("/api/queue", "POST", {
-      text,
-      directory: $("#dirInput").value.trim() || null,
-    });
-    toast(`✓ 已加入队列 ${(r.added || []).length} 条`);
+    const r = await enqueue(text, $("#dirInput").value.trim() || null);
+    toast(`✓ 已加入队列 ${(r.added || []).length} 条（尚未派发）——点「加入队列并立即派发」或「立即派发待发项」放行`);
     renderQueue(r);
   } catch (e) {
     toast("入队失败：" + e.message);
+  }
+});
+
+on("#btnEnqueueRun", "click", async () => {
+  const text = $("#linkInput").value.trim();
+  if (!text) return toast("请先在上方粘贴链接");
+  const btn = $("#btnEnqueueRun");
+  if (btn) btn.disabled = true;
+  try {
+    await enqueue(text, $("#dirInput").value.trim() || null);
+    const r = await API.send("/api/queue/run", "POST", {});
+    const results = r.results || [];
+    toast(`派发完成：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
+    renderQueue(r);
+  } catch (e) {
+    toast("派发失败：" + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 });
 
