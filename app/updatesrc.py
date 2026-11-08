@@ -57,6 +57,15 @@ def allowed_prefixes(cfg: dict) -> list[str]:
     return out
 
 
+def strip_ver(s: str) -> str:
+    """发布标识 → 纯版本号：剥 main-v / v 前缀（新格式 main-vX.Y.Z 与
+    旧格式 vX.Y.Z 兼容），供版本比较与 UI 显示统一用 X.Y.Z。"""
+    s = (s or "").strip()
+    if s.lower().startswith("main-v"):
+        return s[6:].strip()
+    return s.lstrip("vV").strip()
+
+
 def _ver_tuple(v: str) -> tuple[int, int, int]:
     import re
     nums: list[int] = []
@@ -117,7 +126,7 @@ def _fetch_repobox(src: dict, client: httpx.Client, *,
             "size": int(a.get("size") or 0),
             "sha256": str(a.get("sha256") or "").lower(),
         })
-    return {"version": str(data.get("version")).lstrip("vV"),
+    return {"version": strip_ver(str(data.get("version") or "")),
             "tag": data.get("tag") or "",
             "notes": data.get("notes") or "",
             "html_url": data.get("html_url") or "",
@@ -162,7 +171,7 @@ def _fetch_github(src: dict, client: httpx.Client, *,
                 except SourceError:
                     pass
     tag = str(data.get("tag_name") or "").strip()
-    return {"version": tag.lstrip("vV"), "tag": tag,
+    return {"version": strip_ver(tag), "tag": tag,
             "notes": data.get("body") or "",
             "html_url": data.get("html_url")
             or f"https://github.com/{repo}/releases",
@@ -190,16 +199,25 @@ def _syntactic_url(src: dict, tag: str, name: str) -> str:
 
 
 def _normalize(current: str, src: dict, info: dict, cfg: dict) -> dict:
-    tag = info.get("tag") or f"v{info.get('version') or ''}"
+    ver = info.get("version") or ""
+    tag = info.get("tag") or f"main-v{ver}"
+    # 跨源回退候选按新旧两种 tag 命名各合成一份（main-vX.Y.Z / 旧 vX.Y.Z），
+    # 某源目录布局与 tag 命名对不上时另一条仍可命中
+    tags = [tag]
+    if ver:
+        for t in (f"main-v{ver}", f"v{ver}"):
+            if t not in tags:
+                tags.append(t)
     assets = []
     for a in info.get("assets") or []:
         if not a.get("url"):
             continue
         fallbacks: list[str] = []
         for other in resolve_sources(cfg):
-            u = _syntactic_url(other, tag, a["name"])
-            if u and u != a["url"] and u not in fallbacks:
-                fallbacks.append(u)
+            for t in tags:
+                u = _syntactic_url(other, t, a["name"])
+                if u and u != a["url"] and u not in fallbacks:
+                    fallbacks.append(u)
         assets.append({**a, "fallback_urls": fallbacks})
     latest = info.get("version") or ""
     return {"ok": True, "current": current, "latest": latest or current,

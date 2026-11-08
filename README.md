@@ -57,7 +57,7 @@ fnmedia-dl/
 
 ```bash
 # 在 Linux（fnOS 或构建机）上打包
-bash packaging/fpk/build.sh          # 产出 dist/fnmedia-dl-<版本>.fpk
+bash packaging/fpk/build.sh          # 产出 dist/fnmedia-dl-main-v<版本>.fpk
 ```
 
 把 `.fpk` 上传到 fnOS 应用中心安装；安装向导需勾选同意免责声明。
@@ -137,8 +137,26 @@ Repository Secrets 即可启用：
 多源检查消费。手动同步：
 
 ```bash
-REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag vX.Y.Z] [--force]
+REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag main-vX.Y.Z] [--force]
 ```
+
+### 发布命名规则（main-vX.Y.Z）
+
+从 `main-v0.1.35` 起，发布标识统一 **`main-vX.Y.Z`**（`main` 之后跟版本号，
+如 `main-v0.1.35`）：
+
+- **git tag / GitHub Release 标签**：`main-vX.Y.Z`；
+- **fpk 资产文件名**：`fnmedia-dl-main-vX.Y.Z.fpk`（配套 `.fpk.sha256`）；
+- **版本号本体**（VERSION 文件、manifest version 字段、更新比较）：`vX.Y.Z` /
+  纯 `X.Y.Z`，**不带 `main-` 前缀**——fnOS 升级比较与插件内版本比较只认数字三段。
+
+解析端（`app/updatesrc.py` 的 `strip_ver`，updater/同步脚本共用同一规则）剥
+`main-v`/`v` 前缀取纯版本，旧格式 `v0.1.x` tag 兼容可解析；历史 tag 为旧命名，
+不再新增。
+
+版本号**延续主线往后递增**（不独立编号、不重置、不跳号）：小修小补递增第三位
+（版本号 `v0.1.35` → `v0.1.36` → ……，发布标识对应 `main-v0.1.36`），
+大内容更新才升第二位（`v0.2.0`），首个正式大版 `v1.0.0`。
 
 ## 通道配置
 

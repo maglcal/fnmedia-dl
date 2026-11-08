@@ -73,6 +73,14 @@ def _quote_path(path: str) -> str:
 
 # ------------------------------------------------------------ GitHub 侧
 
+def _strip_ver(s: str) -> str:
+    """发布标识 → 纯版本号：剥 main-v / v 前缀（与 app/updatesrc.py 同规则）。"""
+    s = (s or "").strip()
+    if s.lower().startswith("main-v"):
+        return s[6:].strip()
+    return s.lstrip("vV").strip()
+
+
 def fetch_release(gh_repo: str, tag: str, gh_token: str) -> dict:
     """取 GitHub release（tag 空 = latest）。返回规范化信息。"""
     gh_api = os.environ.get("GH_API", "").strip() or "https://api.github.com"
@@ -94,7 +102,7 @@ def fetch_release(gh_repo: str, tag: str, gh_token: str) -> dict:
         if name and dl:
             assets.append({"name": name, "url": dl, "size": int(a.get("size") or 0)})
     return {"tag": rel.get("tag_name") or tag,
-            "version": (rel.get("tag_name") or "").lstrip("vV"),
+            "version": _strip_ver(rel.get("tag_name") or ""),
             "notes": rel.get("body") or "",
             "published_at": rel.get("published_at") or "",
             "html_url": rel.get("html_url") or "",

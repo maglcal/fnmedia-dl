@@ -31,6 +31,8 @@ from pathlib import Path
 
 import httpx
 
+from updatesrc import strip_ver
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GITHUB_REPO = "maglcal/fnmedia-dl"
 DOWNLOAD_URL_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
@@ -324,7 +326,7 @@ def start(url: str, version: str = "", *,
             raise UpdateError("已有更新正在进行中")
         _state.update(stage="downloading", percent=0, detail="准备下载…",
                       error="", from_version=_read_version(),
-                      to_version=(version or "").lstrip("vV"), done=False)
+                      to_version=strip_ver(version or ""), done=False)
     _thread = threading.Thread(
         target=_run, args=(candidates, sha256, expected_size), daemon=True)
     _thread.start()

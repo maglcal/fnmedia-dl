@@ -849,13 +849,13 @@ on("#updateRunBtn", "click", async () => {
       stageEl.textContent = "服务重启中，等待新版本生效…";
       bar.style.width = "100%";
       pctEl.textContent = "100%";
-      const oldVer = (p.from_version || "").replace(/^v/, "");
-      const newVer = (p.to_version || UPD.target || "").replace(/^v/, "");
+      const oldVer = (p.from_version || "").replace(/^(main-)?v/i, "");
+      const newVer = (p.to_version || UPD.target || "").replace(/^(main-)?v/i, "");
       const deadline = Date.now() + 90000;
       const healthTimer = setInterval(async () => {
         try {
           const h = await API.get("/api/health");
-          const v = (h.version || "").replace(/^v/, "");
+          const v = (h.version || "").replace(/^(main-)?v/i, "");
           if (v && v !== oldVer) {
             clearInterval(healthTimer);
             st.className = "dir-status ok";

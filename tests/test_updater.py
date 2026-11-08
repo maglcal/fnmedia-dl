@@ -310,6 +310,33 @@ class TestProgressState(unittest.TestCase):
         self.assertEqual(updater.progress()["stage"], "downloading")
 
 
+class TestStartVersionStrip(unittest.TestCase):
+    """start() 的 to_version 归一：新格式 main-vX.Y.Z 与旧 vX.Y.Z 均剥成纯 X.Y.Z。"""
+
+    URL = ("https://github.com/maglcal/fnmedia-dl/releases/download/"
+           "main-v0.2.0/fnmedia-dl-main-v0.2.0.fpk")
+
+    def tearDown(self):
+        with updater._lock:
+            updater._state.update(stage="idle", percent=0, detail="", error="",
+                                 from_version="", to_version="", done=False)
+
+    def _start(self, version: str) -> dict:
+        from unittest import mock
+        with mock.patch.object(updater, "_run"):   # 不真下载
+            updater.start(self.URL, version=version)
+            return updater.progress()
+
+    def test_main_v_prefix_stripped(self):
+        self.assertEqual(self._start("main-v0.2.0")["to_version"], "0.2.0")
+
+    def test_legacy_v_prefix_stripped(self):
+        self.assertEqual(self._start("v0.2.0")["to_version"], "0.2.0")
+
+    def test_plain_version_kept(self):
+        self.assertEqual(self._start("0.2.0")["to_version"], "0.2.0")
+
+
 class TestRequirementsChanged(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()

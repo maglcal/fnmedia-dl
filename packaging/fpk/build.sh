@@ -90,7 +90,9 @@ WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT
 BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev/null || true)"
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
 mkdir -p "${OUT_DIR}"
-FINAL="${OUT_DIR}/fnmedia-dl-${VERSION}.fpk"
+# 发布标识统一 main-vX.Y.Z（tag / Release / fpk 文件名），VERSION 文件保持纯 X.Y.Z
+RELEASE_TAG="main-v${VERSION}"
+FINAL="${OUT_DIR}/fnmedia-dl-${RELEASE_TAG}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )
 echo "[fpk] 打包完成: ${FINAL}"

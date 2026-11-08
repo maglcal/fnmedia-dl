@@ -93,6 +93,82 @@ class TestVerTuple(unittest.TestCase):
         self.assertEqual(updatesrc._ver_tuple(""), (0, 0, 0))
 
 
+class TestStripVer(unittest.TestCase):
+    """发布标识 → 纯版本号：新格式 main-vX.Y.Z 与旧格式 vX.Y.Z 兼容。"""
+
+    def test_main_v_prefix(self):
+        self.assertEqual(updatesrc.strip_ver("main-v0.2.0"), "0.2.0")
+        self.assertEqual(updatesrc.strip_ver("main-V1.2.3"), "1.2.3")
+
+    def test_legacy_v_prefix(self):
+        self.assertEqual(updatesrc.strip_ver("v0.1.22"), "0.1.22")
+        self.assertEqual(updatesrc.strip_ver("V0.1.34"), "0.1.34")
+
+    def test_plain_and_edge(self):
+        self.assertEqual(updatesrc.strip_ver("0.2.0"), "0.2.0")
+        self.assertEqual(updatesrc.strip_ver(""), "")
+        self.assertEqual(updatesrc.strip_ver(None), "")
+        self.assertEqual(updatesrc.strip_ver("  main-v0.2.0  "), "0.2.0")
+
+
+class TestMainVTagFormat(unittest.TestCase):
+    """新命名 main-vX.Y.Z 的解析：version 字段剥前缀、tag 原样保留。"""
+
+    def test_github_main_v_tag(self):
+        # 真实新格式 release：tag_name 与资产下载 URL 都是 main-vX.Y.Z 路径
+        rel = dict(GH_RELEASE, tag_name="main-v0.2.0",
+                   html_url="https://github.com/maglcal/fnmedia-dl/"
+                            "releases/tag/main-v0.2.0",
+                   assets=[{**a,
+                            "browser_download_url":
+                                a["browser_download_url"].replace(
+                                    "/download/v0.2.0/",
+                                    "/download/main-v0.2.0/")}
+                           for a in GH_RELEASE["assets"]])
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/releases/latest"):
+                return httpx.Response(200, json=rel)
+            return httpx.Response(200, text="ab" * 32 + "  x.fpk\n")
+
+        d = updatesrc.check(CFG, "0.1.34", client=_client(handler))
+        self.assertEqual(d["source"], "github")
+        self.assertEqual(d["latest"], "0.2.0")           # 已剥 main-v 前缀
+        self.assertTrue(d["has_update"])
+        # 回退候选含另一命名（旧 vX.Y.Z）与镜像两种布局的合成地址
+        fpk = next(a for a in d["assets"] if a["name"].endswith(".fpk"))
+        self.assertIn("https://github.com/maglcal/fnmedia-dl/releases/"
+                      "download/v0.2.0/fnmedia-dl-0.2.0.fpk",
+                      fpk["fallback_urls"])
+        self.assertIn("http://mirror.example.com/raw/fnmedia-dl/"
+                      "releases/main-v0.2.0/fnmedia-dl-0.2.0.fpk",
+                      fpk["fallback_urls"])
+
+    def test_repobox_main_v_version_field(self):
+        # 真实新格式清单：sync 脚本按 tag 原文存 releases/main-vX.Y.Z/ 布局
+        man = dict(MANIFEST, version="main-v0.2.0", tag="main-v0.2.0",
+                   assets=[dict(MANIFEST["assets"][0],
+                                path="releases/main-v0.2.0/fnmedia-dl-main-v0.2.0.fpk",
+                                name="fnmedia-dl-main-v0.2.0.fpk")])
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=man)
+
+        d = updatesrc.check(CFG, "0.1.34", client=_client(handler))
+        self.assertEqual(d["latest"], "0.2.0")
+        self.assertTrue(d["has_update"])
+        self.assertEqual(d["assets"][0]["url"],
+                         "http://mirror.example.com/raw/fnmedia-dl/"
+                         "releases/main-v0.2.0/fnmedia-dl-main-v0.2.0.fpk")
+
+    def test_no_update_when_current_is_newer(self):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=GH_RELEASE)   # tag v0.2.0
+
+        d = updatesrc.check(CFG, "0.3.0", client=_client(handler))
+        self.assertFalse(d["has_update"])
+
+
 class TestCheck(unittest.TestCase):
     def test_repobox_success(self):
         def handler(req: httpx.Request) -> httpx.Response:
@@ -110,10 +186,14 @@ class TestCheck(unittest.TestCase):
                          "http://mirror.example.com/raw/fnmedia-dl/"
                          "releases/v0.2.0/fnmedia-dl-0.2.0.fpk")
         self.assertEqual(a["sha256"], "ab" * 32)          # 归一小写
-        # 跨源回退候选（github 按约定拼接，不含自身）
+        # 跨源回退候选（新旧 tag 命名各合成一份；自身主 url 去重不重复）
         self.assertEqual(a["fallback_urls"], [
+            "http://mirror.example.com/raw/fnmedia-dl/"
+            "releases/main-v0.2.0/fnmedia-dl-0.2.0.fpk",
             "https://github.com/maglcal/fnmedia-dl/releases/"
-            "download/v0.2.0/fnmedia-dl-0.2.0.fpk"])
+            "download/v0.2.0/fnmedia-dl-0.2.0.fpk",
+            "https://github.com/maglcal/fnmedia-dl/releases/"
+            "download/main-v0.2.0/fnmedia-dl-0.2.0.fpk"])
 
     def test_repobox_no_update_when_same_version(self):
         def handler(req: httpx.Request) -> httpx.Response:
@@ -138,10 +218,14 @@ class TestCheck(unittest.TestCase):
         self.assertEqual(d["latest"], "0.2.0")
         fpk = next(a for a in d["assets"] if a["name"].endswith(".fpk"))
         self.assertEqual(fpk["sha256"], "cd" * 32)         # 从 .sha256 资产取哈希
-        # 回退候选包含镜像拼接地址（同步脚本布局 releases/{tag}/{name}）
+        # 回退候选含镜像拼接地址（同步脚本布局 releases/{tag}/{name}）与另一命名
         self.assertEqual(fpk["fallback_urls"], [
             "http://mirror.example.com/raw/fnmedia-dl/"
-            "releases/v0.2.0/fnmedia-dl-0.2.0.fpk"])
+            "releases/v0.2.0/fnmedia-dl-0.2.0.fpk",
+            "http://mirror.example.com/raw/fnmedia-dl/"
+            "releases/main-v0.2.0/fnmedia-dl-0.2.0.fpk",
+            "https://github.com/maglcal/fnmedia-dl/releases/"
+            "download/main-v0.2.0/fnmedia-dl-0.2.0.fpk"])
 
     def test_github_404_empty_manifest(self):
         cfg = {"update": {"sources": [
