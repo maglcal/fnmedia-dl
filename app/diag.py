@@ -88,7 +88,7 @@ def _probe_one_plugin(core, target: str) -> tuple[bool, str]:
     try:
         api = core._relay_api(target)
     except Exception as exc:                      # noqa: BLE001 诊断面全捕获
-        return False, f"设备API发现失败：{str(exc)[:60]}"
+        return False, f"设备API发现失败：{str(exc)[:36]}"
     try:
         core._request("GET", api["base"] + "device/config",
                       params=core._relay_params(api, target), timeout=5)
@@ -98,8 +98,8 @@ def _probe_one_plugin(core, target: str) -> tuple[bool, str]:
         if any(k in msg for k in _PLUGIN_DOWN_KEYS):
             return False, "插件无响应（设备端超时）"
         if any(k in msg.lower() for k in _NET_DOWN_KEYS):
-            return False, f"不可达（{msg[:60]}）"
-        return True, f"通道有响应（{msg[:60]}）"
+            return False, f"不可达（{msg[:36]}）"
+        return True, f"通道有响应（{msg[:36]}）"
 
 
 def probe_devices_plugin(core, targets: list[dict],
@@ -130,7 +130,7 @@ def probe_devices_plugin(core, targets: list[dict],
         th.join(6.0)
 
     up: list[str] = []
-    down: list[str] = []
+    down: list[tuple[str, str]] = []              # (显示名, 原因)
     for t in tgs:
         tg = str(t.get("target") or "")
         name = str(t.get("name") or "?")[:14]
@@ -138,10 +138,20 @@ def probe_devices_plugin(core, targets: list[dict],
         if ok:
             up.append(f"{name}✓")
         else:
-            down.append(f"{name}✗（{why}）")
+            down.append((f"{name}✗", why))
     parts = [f"可达 {len(up)}/{len(tgs)}：" + ("、".join(up) or "无")]
     if down:
-        parts.append("不可达：" + "、".join(down))
+        # 同因合并（0.1.36）：多台相同原因合并展示，防长错误刷屏
+        groups: dict[str, list[str]] = {}
+        for mark_name, why in down:
+            groups.setdefault(why, []).append(mark_name)
+        segs = []
+        for why, names in groups.items():
+            if len(names) > 1:
+                segs.append(f"{'、'.join(names)}（{len(names)} 台同因：{why}）")
+            else:
+                segs.append(f"{names[0]}（{why}）")
+        parts.append("不可达：" + "；".join(segs))
     if active_target:
         r = results.get(active_target)
         mark = "✓ 插件可达" if r and r[0] else (f"✗ {r[1]}" if r
@@ -165,13 +175,39 @@ def probe_devices_plugin(core, targets: list[dict],
                          f"链路不通，非单台问题；可达的仅 {ups}，建议换其中"
                          f"一台为派发目标，或到目标设备上启动/更新迅雷远程插件")
     else:
-        parts.append("结论：设备插件通道整体可用")
+        extra = ""
+        if down:
+            extra = (f"——派发目标插件可达即主链路可用，其余 {len(down)} 台"
+                     f"不可达（多为电脑端未运行迅雷远程插件）不影响本插件派发")
+        parts.append("结论：设备插件通道整体可用" + extra)
     return "；".join(parts)
+
+
+def _reconcile_transient(steps: list[dict]) -> list[dict]:
+    """瞬态综合判定（0.1.36）：「设备 API 发现」单独失败、但后续走同一条
+    设备 API 链路的步骤（中继目录表/下载根解析）成功时，判为偶发瞬态超时
+    而非持续故障——0.1.35 NAS 实测首步 3s 超时被诊断模式（关重试）放大成
+    唯一 ✗，后续同链路调用全部成功，链路实际可用。改写该步为 ok=True
+    并加 transient 标记，避免误报异常。"""
+    by_name = {s["step"]: s for s in steps}
+    disc = by_name.get("设备 API 发现")
+    if not disc or disc.get("ok") or disc.get("transient"):
+        return steps
+    witnesses = [n for n in ("中继目录表", "下载根解析")
+                 if by_name.get(n, {}).get("ok")]
+    if witnesses:
+        disc["ok"] = True
+        disc["transient"] = True
+        disc["detail"] += (f"（⚠ 瞬态——后续「{'、'.join(witnesses)}」走"
+                           f"同一条设备 API 链路均成功，链路可用；首次调用"
+                           f"偶发超时，重试通常恢复）")
+    return steps
 
 
 def run(version: str = "") -> dict:
     """执行全链路自诊断 → {"ok", "version", "steps": [...]}。
-    ok = 关键步骤全绿（api-pan 对照是信息性步骤，不计入 ok）。"""
+    ok = 关键步骤全绿（api-pan 对照是信息性步骤，不计入 ok；
+    「设备 API 发现」单独失败但同链路后续步骤成功时按瞬态处理，不计异常）。"""
     cfg = cfgmod.load()
     steps: list[dict] = []
 
@@ -341,6 +377,8 @@ def run(version: str = "") -> dict:
 
     steps.append(_probe("api-pan 对照", probe_apipan, timeout=8.0))
 
+    # 0.1.36 瞬态综合判定：首步失败但同链路后续成功 → 标瞬态不计异常
+    _reconcile_transient(steps)
     # ok 只看关键步骤（设备插件探活/历史任务反查/api-pan 对照是信息性步骤）
     info_steps = {"设备插件探活", "历史任务反查", "api-pan 对照"}
     ok = all(s["ok"] for s in steps if s["step"] not in info_steps)

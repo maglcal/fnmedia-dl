@@ -139,5 +139,102 @@ class TestPluginProbe(unittest.TestCase):
             diag.probe_devices_plugin(_FakeCore({}), [], "")
 
 
+class TestTransientReconcile(unittest.TestCase):
+    """0.1.36 瞬态综合判定：「设备 API 发现」单独失败但同链路后续步骤
+    成功 → 标瞬态不计异常（0.1.35 NAS 实测首步 3s 超时被放大成唯一 ✗）。"""
+
+    @staticmethod
+    def _steps(disc_ok, folders_ok, root_ok, disc_detail="设备端响应超时"):
+        return [
+            {"step": "设备 API 发现", "ok": disc_ok, "ms": 3047,
+             "detail": disc_detail},
+            {"step": "中继目录表", "ok": folders_ok, "ms": 999,
+             "detail": "顶层目录 3 个"},
+            {"step": "下载根解析", "ok": root_ok, "ms": 9353,
+             "detail": "下载根 id=x"},
+        ]
+
+    def test_transient_marked_when_same_chain_recovered(self):
+        steps = self._steps(False, True, True)
+        diag._reconcile_transient(steps)
+        disc = steps[0]
+        self.assertTrue(disc["ok"])
+        self.assertTrue(disc["transient"])
+        self.assertIn("⚠ 瞬态", disc["detail"])
+        self.assertIn("中继目录表", disc["detail"])
+        self.assertIn("下载根解析", disc["detail"])
+
+    def test_transient_marked_with_single_witness(self):
+        steps = self._steps(False, True, False)
+        diag._reconcile_transient(steps)
+        self.assertTrue(steps[0]["ok"])
+        self.assertTrue(steps[0]["transient"])
+        self.assertIn("中继目录表", steps[0]["detail"])
+        self.assertNotIn("下载根解析", steps[0]["detail"])
+
+    def test_not_reconciled_when_chain_also_down(self):
+        steps = self._steps(False, False, False)
+        diag._reconcile_transient(steps)
+        self.assertFalse(steps[0]["ok"])
+        self.assertNotIn("transient", steps[0])
+
+    def test_ok_step_untouched(self):
+        steps = self._steps(True, True, True)
+        diag._reconcile_transient(steps)
+        self.assertNotIn("transient", steps[0])
+        self.assertNotIn("瞬态", steps[0]["detail"])
+
+    def test_idempotent(self):
+        steps = self._steps(False, True, True)
+        diag._reconcile_transient(steps)
+        detail = steps[0]["detail"]
+        diag._reconcile_transient(steps)          # 二次调用不得重复追加
+        self.assertEqual(steps[0]["detail"], detail)
+
+
+class TestPluginProbeOutput(unittest.TestCase):
+    """0.1.36 探活输出：错误截短 + 同因合并 + 派发目标可达结论。"""
+
+    def test_probe_one_plugin_error_truncated(self):
+        core = _FakeCore({
+            "t-disc": ("discover", "x" * 200),
+            "t-net": ("request", "网络错误（请检查 NAS 出网/DNS/代理设置）"
+                                "：" + "y" * 200),
+        })
+        ok, why = diag._probe_one_plugin(core, "t-disc")
+        self.assertFalse(ok)
+        self.assertLessEqual(len(why), 50)        # 前缀 + 截短到 36
+        ok, why = diag._probe_one_plugin(core, "t-net")
+        self.assertFalse(ok)
+        self.assertLessEqual(len(why), 50)
+
+    def test_probe_devices_plugin_same_cause_merged(self):
+        cause = ("request", "迅雷接口错误：设备端响应超时（error_code=2）"
+                            "：" + "z" * 120)
+        core = _FakeCore({"t-a": "ok", "t-b": cause, "t-c": cause})
+        targets = [{"target": "t-a", "name": "设备A"},
+                   {"target": "t-b", "name": "电脑-许诺"},
+                   {"target": "t-c", "name": "电脑-贰玖图文"}]
+        out = diag.probe_devices_plugin(core, targets, "t-a")
+        self.assertIn("2 台同因", out)            # 合并为一段
+        self.assertIn("电脑-许诺✗、电脑-贰玖图文✗", out)
+        self.assertLessEqual(len(out), 220)       # 不再刷屏
+
+    def test_probe_devices_plugin_target_up_others_down(self):
+        """派发目标可达 + 其余不可达 → 结论点明主链路可用不影响派发。"""
+        core = _FakeCore({
+            "t-a": "ok",
+            "t-b": ("request", "设备端响应超时（error_code=2）"),
+            "t-c": ("request", "设备端响应超时（error_code=2）"),
+        })
+        targets = [{"target": "t-a", "name": "群晖-xunlei"},
+                   {"target": "t-b", "name": "电脑-许诺"},
+                   {"target": "t-c", "name": "电脑-贰玖图文"}]
+        out = diag.probe_devices_plugin(core, targets, "t-a")
+        self.assertIn("结论：设备插件通道整体可用", out)
+        self.assertIn("主链路可用", out)
+        self.assertIn("不影响本插件派发", out)
+
+
 if __name__ == "__main__":
     unittest.main()

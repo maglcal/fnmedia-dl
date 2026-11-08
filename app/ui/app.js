@@ -775,14 +775,19 @@ on("#diagBtn", "click", async () => {
   try {
     const r = await API.get("/api/diagnose");
     const rows = (r.steps || []).map((s) => {
-      const mark = s.ok ? "✓" : "✗";
+      // 0.1.36 三态：瞬态步骤（首步超时但同链路后续已恢复）标 ⚠ 不标 ✗
+      const mark = s.transient ? "⚠" : (s.ok ? "✓" : "✗");
       // 0.1.34：detail 含上游错误原文（可能带 <…> 形态），必须转义——
       // 否则被当 HTML 标签吞掉（0.1.33 实测 <hash>/<id> 占位符显示为空）
       return `<div>${mark} ${esc(s.step)}（${s.ms}ms）：${esc(s.detail || "")}</div>`;
     });
+    const hasT = (r.steps || []).some((s) => s.transient);
     box.className = "dir-status" + (r.ok ? "" : " bad");
     box.innerHTML =
-      (r.ok ? "✓ 关键链路全部正常" : "✗ 存在异常步骤，请看下方定位") +
+      (r.ok
+        ? "✓ 关键链路全部正常" +
+          (hasT ? "（⚠ 含瞬态步骤：偶发超时已自愈，不影响使用）" : "")
+        : "✗ 存在异常步骤，请看下方定位") +
       `<br>${rows.join("")}` +
       (r.ok ? "" : "<br>第一个 ✗ 步骤即故障层；仍无法解决请带此结果反馈。");
   } catch (e) {
