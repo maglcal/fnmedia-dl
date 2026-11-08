@@ -198,7 +198,8 @@ def _syntactic_url(src: dict, tag: str, name: str) -> str:
     return ""
 
 
-def _normalize(current: str, src: dict, info: dict, cfg: dict) -> dict:
+def _normalize(current: str, src: dict, info: dict, cfg: dict,
+               notice: str = "") -> dict:
     ver = info.get("version") or ""
     tag = info.get("tag") or f"main-v{ver}"
     # 跨源回退候选按新旧两种 tag 命名各合成一份（main-vX.Y.Z / 旧 vX.Y.Z），
@@ -225,6 +226,7 @@ def _normalize(current: str, src: dict, info: dict, cfg: dict) -> dict:
             "url": info.get("html_url") or "",
             "notes": (info.get("notes") or "")[:2000],
             "source": src.get("name") or src.get("type") or "",
+            "notice": notice,
             "assets": assets,
             "fetched_at": int(time.time())}
 
@@ -252,9 +254,15 @@ def check(cfg: dict, current: str,
             try:
                 info = fetch(src, client, timeout=timeout, retries=retries,
                              current=current)
-                return _normalize(current, src, info, cfg)
+                # 回退透明提示：前面的源失败才走到这里 → 告知已切换备用源及原因
+                notice = ""
+                if errors:
+                    used = src.get("name") or src.get("type") or ""
+                    notice = (f"{'；'.join(errors)}——已自动切换到备用源"
+                              f"「{used}」完成检查，更新流程不受影响")
+                return _normalize(current, src, info, cfg, notice=notice)
             except SourceError as exc:
-                errors.append(f"{src.get('name') or src.get('type')}：{exc}")
+                errors.append(f"源「{src.get('name') or src.get('type')}」不可用（{exc}）")
         raise SourceError("全部更新源不可用：" + "；".join(errors))
     finally:
         if own:

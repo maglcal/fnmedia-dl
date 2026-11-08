@@ -745,13 +745,17 @@ on("#updateCheckBtn", "click", async () => {
         UPD.target = r.latest;
         $("#updateRunBtn").hidden = false;
       }
-      st.innerHTML =
+      const notice = r.notice
+        ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "";
+      st.innerHTML = notice +
         `发现新版本 <b>v${r.latest}</b>（当前 v${r.current}）` +
         (fpk ? "，可点「一键更新」在线升级" :
           (r.url ? ` —— <a href="${r.url}" target="_blank" rel="noreferrer">前往下载</a>` : ""));
     } else {
       $("#updateRunBtn").hidden = true;
-      st.textContent = `✓ 已是最新版本（v${r.current}）`;
+      st.innerHTML = (r.notice
+        ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "") +
+        `✓ 已是最新版本（v${r.current}）`;
     }
   } catch (e) {
     st.textContent = "✗ 检查更新失败：" + e.message;

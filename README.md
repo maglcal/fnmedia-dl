@@ -82,8 +82,9 @@ cd app && python serve.py --http 127.0.0.1:8787
 ## 更新源配置（国内镜像加速）
 
 GitHub Releases 在国内访问慢/超时，插件支持**多更新源**：默认优先走自建
-RepoBox 镜像（国内直链），失败自动回退 GitHub 官方源。未配置镜像时行为与
-旧版完全一致（仅官方源）。
+仓库（`your-repo.example.com`，国内直链），失败自动回退 GitHub 官方源并**明确提示**
+（检查与下载均在进度/状态区显示「已切换备用源」及原因，更新流程自动继续，
+对用户透明）。
 
 ### 切换 / 配置更新源
 
@@ -94,8 +95,8 @@ RepoBox 镜像（国内直链），失败自动回退 GitHub 官方源。未配�
 "update": {
   "sources": [
     {"name": "repobox", "type": "repobox",
-     "base_url": "https://repo.example.com",
-     "repo": "fnmedia-dl", "token": "rbx_xxx"},
+     "base_url": "https://your-repo.example.com",
+     "repo": "fnmedia-dl", "token": ""},
     {"name": "github", "type": "github", "repo": "maglcal/fnmedia-dl"}
   ],
   "timeout": 15,
@@ -103,10 +104,11 @@ RepoBox 镜像（国内直链），失败自动回退 GitHub 官方源。未配�
 }
 ```
 
-- `type=repobox`：自建 RepoBox 镜像。`base_url` 留空自动跳过（即只用官方源）；
-  `token` 用于读清单（raw 直链公开可读时可留空）。
-- `type=github`：GitHub 官方 Releases 兜底。
-- 想只用官方源：把 repobox 条目的 `base_url` 置空，或直接删掉该条目。
+- `type=repobox`：自建仓库（your-repo.example.com）。raw 清单/资产**公开可读，无需
+  token**（`token` 仅同步写入时需要，见下「凭据安全」）；`base_url` 留空自动
+  跳过（即只用官方源）。
+- `type=github`：GitHub 官方 Releases 备用（自建源不可用时自动切换）。
+- 想只用自建源：删掉 github 条目即可。
 - 想把镜像换成别的地址：改 `base_url` 即可（需按 `latest.json` 清单协议提供）。
 - `timeout`（单请求超时秒）/`retries`（单源请求重试次数）按需调整。
 
@@ -119,6 +121,25 @@ RepoBox 镜像（国内直链），失败自动回退 GitHub 官方源。未配�
   全部失败才报错（含逐候选原因）。
 - **安装失败**：替换前整份备份到 `repo/.update-backup/`，任一步失败自动回滚
   到更新前版本，不会把系统留在半更新状态。
+- **切换透明提示**：检查时若首选源不可用而使用备用源，结果里带 `notice`
+  说明（哪路源、什么原因、已切换到哪），界面黄字展示；下载换候选时进度
+  区同样提示「自动切换备用源继续下载」。更新流程自动继续，无需人工干预。
+
+### 凭据安全（防泄露约定）
+
+- **令牌不进源码/安装包**：自建仓库 raw 公开可读，检查/下载无需 token；
+  同步写入用的 `rbx_` 令牌只放环境变量（本地手动同步）或 GitHub Secrets
+  （Actions 自动同步），**不写进 `config.py`/默认配置/公开 fpk**。
+- **运行时凭据**（迅雷登录 password/access_token/refresh_token、aria2 secret、
+  各源 token）只存 `state/config.json`（chmod 600，`.gitignore` 排除
+  `state/`，不入版本控制）；对外 API 经 `redacted()` 统一掩码为 `******`。
+- **日志/错误文案脱敏**：URL 中 `token/secret/key/password/auth` 参数值在
+  错误与进度文案中自动掩码；`state/dispatch.log` 诊断日志不落凭据。
+- **迅雷客户端协议常量**（CLIENT_ID/CLIENT_SECRET/APP_KEY）提取自官方客户端，
+  为公共应用参数（所有第三方实现共用，非用户私有凭据），支持
+  `XL_CLIENT_ID`/`XL_CLIENT_SECRET`/`XL_APP_KEY` 环境变量覆盖。
+- **历史泄露处置**：令牌一旦出现在聊天/日志等渠道，应立即在服务端**重置
+  令牌**（旧令牌即作废），不要依赖事后删除记录。
 
 ### 镜像自动同步（GitHub → RepoBox）
 

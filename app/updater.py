@@ -99,6 +99,14 @@ def validate_asset_url(url: str, extra_prefixes: list[str] | None = None) -> boo
             and ".." not in url)
 
 
+def _mask_secrets(text: str) -> str:
+    """错误/进度文案里的 URL 敏感 query 参数（token/secret/key/password/auth）
+    值掩码——httpx 异常会带完整 URL，防凭据经错误提示泄露。"""
+    import re
+    return re.sub(r"((?:token|secret|key|password|passwd|auth)=)[^&\s\"')]+",
+                  r"\1******", text, flags=re.IGNORECASE)
+
+
 # ------------------------------------------------------------ 解包
 
 def extract_repo_tree(fpk_path: Path, workdir: Path) -> Path:
@@ -234,6 +242,7 @@ def download_verified(urls: list[str], dest: Path,
     每候选最多重试 2 次（递增退避），失败或校验不符自动换下一个候选。
     全部失败抛 UpdateError（含逐候选原因汇总）。返回文件大小。"""
     errors: list[str] = []
+    switched = 0                      # 换源次数（成功后仍在进度里留痕，切换透明）
     for idx, url in enumerate(urls, 1):
         tag = f"候选{idx}"
         for attempt in (1, 2):
@@ -246,16 +255,29 @@ def download_verified(urls: list[str], dest: Path,
                     actual = _sha256_of(dest)
                     if actual.lower() != sha256.lower():
                         raise UpdateError("SHA256 校验不符")
-                _set("downloading", 80, "下载校验通过")
+                done_note = "下载校验通过"
+                if switched:
+                    done_note += f"（中途已自动切换备用源 {switched} 次）"
+                _set("downloading", 80, done_note)
                 return size
             except UpdateError as exc:
                 errors.append(f"{tag}第{attempt}次：{exc}")
                 if attempt == 1:
                     time.sleep(1.5 * idx)   # 递增退避后重试同候选
+                elif idx < len(urls):
+                    # 换源透明提示：告知用户正在切换备用源（更新自动继续）
+                    switched += 1
+                    _set(detail=f"{tag}失败（{_mask_secrets(str(exc))[:80]}），"
+                                f"自动切换备用源继续下载…")
             except httpx.HTTPError as exc:
-                errors.append(f"{tag}第{attempt}次：网络错误 {exc}")
+                errors.append(f"{tag}第{attempt}次：网络错误 "
+                              f"{_mask_secrets(str(exc))}")
                 if attempt == 1:
                     time.sleep(1.5 * idx)
+                elif idx < len(urls):
+                    switched += 1
+                    _set(detail=f"{tag}失败（网络错误），"
+                                f"自动切换备用源继续下载…")
     raise UpdateError("所有下载候选均失败：" + "；".join(errors))
 
 

@@ -337,6 +337,64 @@ class TestStartVersionStrip(unittest.TestCase):
         self.assertEqual(self._start("0.2.0")["to_version"], "0.2.0")
 
 
+class TestMaskSecrets(unittest.TestCase):
+    """错误/进度文案的 URL 敏感参数掩码（防凭据经提示泄露）。"""
+
+    def test_masks_sensitive_query_params(self):
+        s = updater._mask_secrets(
+            "https://x/y?token=abc123&repo=fnmedia-dl&secret=zz99&key=k1")
+        self.assertNotIn("abc123", s)
+        self.assertNotIn("zz99", s)
+        self.assertIn("token=******", s)
+        self.assertIn("secret=******", s)
+        self.assertIn("key=******", s)
+        self.assertIn("repo=fnmedia-dl", s)          # 非敏感参数保留
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(updater._mask_secrets("HTTP 502 bad gateway"),
+                         "HTTP 502 bad gateway")
+
+
+class TestFallbackSwitchNotice(unittest.TestCase):
+    """下载换源透明提示：切换备用源在进度文案留痕，全程对用户可见。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.dest = Path(self._td.name) / "u.fpk"
+        with updater._lock:
+            updater._state.update(stage="idle", percent=0, detail="", error="",
+                                 from_version="", to_version="", done=False)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _run(self, impl, urls):
+        from unittest import mock
+        with mock.patch.object(updater, "download_fpk", side_effect=impl), \
+             mock.patch.object(updater.time, "sleep"):
+            updater.download_verified(urls, self.dest)
+        return updater.progress()
+
+    def test_switch_notice_persists_after_success(self):
+        def impl(url, dest, client=None):
+            if "http://a/" in url:
+                raise updater.UpdateError("下载失败：HTTP 502")
+            dest.write_bytes(b"ok!")
+            return 3
+
+        p = self._run(impl, ["http://a/x.fpk", "http://b/x.fpk"])
+        self.assertIn("已自动切换备用源", p["detail"])
+        self.assertIn("1 次", p["detail"])             # 成功后留痕计数
+
+    def test_no_switch_keeps_plain_detail(self):
+        def impl(url, dest, client=None):
+            dest.write_bytes(b"ok!")
+            return 3
+
+        p = self._run(impl, ["http://a/x.fpk"])
+        self.assertEqual(p["detail"], "下载校验通过")
+
+
 class TestRequirementsChanged(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()

@@ -267,5 +267,63 @@ class TestCheck(unittest.TestCase):
             updatesrc.check(cfg, "0.1.0", client=_client(handler))
 
 
+class TestFallbackNotice(unittest.TestCase):
+    """回退透明提示：备用源被启用时说明原因与切换目标；首选成功不提示。"""
+
+    def test_first_source_ok_no_notice(self):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=MANIFEST)
+
+        d = updatesrc.check(CFG, "0.1.0", client=_client(handler))
+        self.assertEqual(d["notice"], "")
+
+    def test_fallback_notice_explains_switch(self):
+        def handler(req: httpx.Request) -> httpx.Response:
+            if "mirror.example.com" in str(req.url):
+                return httpx.Response(500)
+            if req.url.path.endswith("/releases/latest"):
+                return httpx.Response(200, json=GH_RELEASE)
+            return httpx.Response(200, text="cd" * 32 + "  x.fpk\n")
+
+        d = updatesrc.check(CFG, "0.1.0", client=_client(handler))
+        self.assertIn("已自动切换到备用源", d["notice"])
+        self.assertIn("github", d["notice"])          # 切换目标
+        self.assertIn("repobox", d["notice"])         # 失败源
+        self.assertIn("HTTP 500", d["notice"])        # 失败原因
+
+    def test_all_sources_fail_lists_names(self):
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(500)
+
+        with self.assertRaises(updatesrc.SourceError) as cm:
+            updatesrc.check(CFG, "0.1.0", client=_client(handler))
+        msg = str(cm.exception)
+        self.assertIn("repobox", msg)
+        self.assertIn("github", msg)
+
+
+class TestFormatConsistency(unittest.TestCase):
+    """两源更新格式一致：归一化后字段结构完全相同（切换源不改变消费方）。"""
+
+    def test_normalized_shape_identical(self):
+        def h_mirror(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=MANIFEST)
+
+        def h_github(req: httpx.Request) -> httpx.Response:
+            if req.url.path.endswith("/releases/latest"):
+                return httpx.Response(200, json=GH_RELEASE)
+            return httpx.Response(200, text="cd" * 32 + "  x.fpk\n")
+
+        d1 = updatesrc.check(CFG, "0.1.0", client=_client(h_mirror))
+        cfg_gh = {"update": {"sources": [CFG["update"]["sources"][1]]}}
+        d2 = updatesrc.check(cfg_gh, "0.1.0", client=_client(h_github))
+        self.assertEqual(set(d1.keys()), set(d2.keys()))
+        self.assertEqual(set(d1["assets"][0].keys()),
+                         set(d2["assets"][0].keys()))
+        for k in ("ok", "current", "latest", "has_update", "url", "notes",
+                  "source", "notice", "assets", "fetched_at"):
+            self.assertIn(k, d1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

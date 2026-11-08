@@ -1858,5 +1858,27 @@ class TestDeviceTimeoutAndHarvest(unittest.TestCase):
         self.assertIn("parent_folder_id", msg)
 
 
+class TestCredentialHygiene(unittest.TestCase):
+    """凭据防泄露：迅雷协议常量可 env 覆盖；对外配置统一掩码且不动原对象。"""
+
+    def test_client_secret_env_override(self):
+        import importlib
+        from unittest import mock
+        from backends import thunder_cloud
+        with mock.patch.dict("os.environ", {"XL_CLIENT_SECRET": "env-override"}):
+            importlib.reload(thunder_cloud)
+            self.assertEqual(thunder_cloud.CLIENT_SECRET, "env-override")
+        importlib.reload(thunder_cloud)             # 恢复默认值
+
+    def test_redacted_masks_update_token(self):
+        from config import redacted
+        cfg = {"update": {"sources": [
+            {"name": "repobox", "type": "repobox", "base_url": "https://x",
+             "repo": "r", "token": "rbx_secretvalue"}]}}
+        out = redacted(cfg)
+        self.assertEqual(out["update"]["sources"][0]["token"], "******")
+        self.assertEqual(cfg["update"]["sources"][0]["token"], "rbx_secretvalue")
+
+
 if __name__ == "__main__":
     unittest.main()

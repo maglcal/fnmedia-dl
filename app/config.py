@@ -40,12 +40,13 @@ DEFAULT_CONFIG: dict = {
         "user_id": "",
     },
     # 在线更新源：按序尝试，第一个可用为准；下载失败自动换下一个源。
-    # repobox = 自建 RepoBox 镜像（国内快，base_url 填你的域名；留空自动跳过）
-    # github = 官方源（兜底，国内慢但保底可用）
+    # repobox = 自建仓库（your-repo.example.com，raw 公开可读无需 token；token 仅同步写入用，
+    #           勿写进公开配置——检查/下载是只读操作）
+    # github = 官方源（备用，自建源连不上/超时/报错时自动切换并提示）
     "update": {
         "sources": [
             {"name": "repobox", "type": "repobox",
-             "base_url": "", "repo": "fnmedia-dl", "token": ""},
+             "base_url": "https://your-repo.example.com", "repo": "fnmedia-dl", "token": ""},
             {"name": "github", "type": "github",
              "repo": "maglcal/fnmedia-dl"},
         ],

@@ -34,12 +34,16 @@ XLUSER_BASE = "https://xluser-ssl.xunlei.com"
 XLUSER_API = XLUSER_BASE + "/v1"
 DRIVE_API = "https://api-pan.xunlei.com/drive/v1"
 
-CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+# 迅雷开放平台客户端应用参数（协议常量，
+# 所有第三方实现共用同一组，非用户私有凭据；登录协议必需，无法移除）。
+# 防泄露审计通道：可用环境变量 XL_CLIENT_ID / XL_CLIENT_SECRET / XL_APP_KEY
+# 覆盖（默认值仅作协议兼容，泄露不直接危及用户账户）。
+CLIENT_ID = os.environ.get("XL_CLIENT_ID") or "Xp6vsxz_7IYVw2BB"
+CLIENT_SECRET = os.environ.get("XL_CLIENT_SECRET") or "Xp6vsy4tN9toTVdMSpomVdXpRmES"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APP_ID = "40"
-APP_KEY = "34a062aaa22f906fca4fefe9fb3a3021"
+APP_KEY = os.environ.get("XL_APP_KEY") or "34a062aaa22f906fca4fefe9fb3a3021"
 SIGN_PROVIDER = "access_end_point_token"
 REDIRECT_URI = "xlaccsdk01://xunlei.com/callback?state=harbor"
 
