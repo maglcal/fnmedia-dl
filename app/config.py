@@ -40,13 +40,16 @@ DEFAULT_CONFIG: dict = {
         "user_id": "",
     },
     # 在线更新源：按序尝试，第一个可用为准；下载失败自动换下一个源。
-    # repobox = 自建仓库（your-repo.example.com，raw 公开可读无需 token；token 仅同步写入用，
-    #           勿写进公开配置——检查/下载是只读操作）
-    # github = 官方源（备用，自建源连不上/超时/报错时自动切换并提示）
+    # 个人镜像源（type=repobox）属**私有配置**——在本机 state/config.json 的
+    # update.sources 里按下列形状自行添加（排最前优先），勿把个人镜像地址
+    # 写进公开源码/默认配置/安装包：
+    #   {"name": "repobox", "type": "repobox",
+    #    "base_url": "https://your-repo.example.com", "repo": "<仓库名>", "token": ""}
+    # repobox raw 清单/资产公开可读无需 token（token 仅同步写入用）；
+    # base_url 留空自动跳过。
+    # github = 官方源（镜像源连不上/超时/报错时自动切换并提示）
     "update": {
         "sources": [
-            {"name": "repobox", "type": "repobox",
-             "base_url": "https://your-repo.example.com", "repo": "fnmedia-dl", "token": ""},
             {"name": "github", "type": "github",
              "repo": "maglcal/fnmedia-dl"},
         ],

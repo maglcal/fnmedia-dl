@@ -79,38 +79,12 @@ cd app && python serve.py --http 127.0.0.1:8787
 # 打开 http://127.0.0.1:8787
 ```
 
-## 更新源配置（国内镜像加速）
+## 在线更新
 
-GitHub Releases 在国内访问慢/超时，插件支持**多更新源**：默认优先走自建
-仓库（`your-repo.example.com`，国内直链），失败自动回退 GitHub 官方源并**明确提示**
-（检查与下载均在进度/状态区显示「已切换备用源」及原因，更新流程自动继续，
-对用户透明）。
-
-### 切换 / 配置更新源
-
-在 `state/config.json` 的 `update.sources` 数组里配置，**按数组顺序依次尝试**，
-第一个可用的源为准：
-
-```json
-"update": {
-  "sources": [
-    {"name": "repobox", "type": "repobox",
-     "base_url": "https://your-repo.example.com",
-     "repo": "fnmedia-dl", "token": ""},
-    {"name": "github", "type": "github", "repo": "maglcal/fnmedia-dl"}
-  ],
-  "timeout": 15,
-  "retries": 2
-}
-```
-
-- `type=repobox`：自建仓库（your-repo.example.com）。raw 清单/资产**公开可读，无需
-  token**（`token` 仅同步写入时需要，见下「凭据安全」）；`base_url` 留空自动
-  跳过（即只用官方源）。
-- `type=github`：GitHub 官方 Releases 备用（自建源不可用时自动切换）。
-- 想只用自建源：删掉 github 条目即可。
-- 想把镜像换成别的地址：改 `base_url` 即可（需按 `latest.json` 清单协议提供）。
-- `timeout`（单请求超时秒）/`retries`（单源请求重试次数）按需调整。
+管理页「关于 → 检查更新」在线升级。多源按序尝试、失败自动换源并在界面
+**明确提示**（哪路源、什么原因、已切换到哪），更新流程自动继续，对用户
+透明；更新源可在本机 `state/config.json` 的 `update.sources` 中配置
+（**个人镜像地址属私有配置，不写入公开仓库**）。
 
 ### 回退与重试策略
 
