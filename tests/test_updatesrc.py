@@ -92,6 +92,23 @@ class TestVerTuple(unittest.TestCase):
         self.assertEqual(updatesrc._ver_tuple("1.x.3"), (1, 0, 3))
         self.assertEqual(updatesrc._ver_tuple(""), (0, 0, 0))
 
+    def test_four_segment_branch_version(self):
+        # 分支测试版四段号：主版本号 0.1.36 + 分支序号 1，不截断
+        self.assertEqual(updatesrc._ver_tuple("0.1.36.1"), (0, 1, 36, 1))
+        self.assertEqual(updatesrc._ver_tuple("v0.1.25.3"), (0, 1, 25, 3))
+
+    def test_branch_ordering(self):
+        # 主线三段与分支四段混比：0.1.36 < 0.1.36.1 < 0.1.37
+        self.assertTrue(updatesrc._ver_newer("0.1.36.1", "0.1.36"))
+        self.assertTrue(updatesrc._ver_newer("0.1.37", "0.1.36.1"))
+        self.assertFalse(updatesrc._ver_newer("0.1.36", "0.1.36.1"))
+        self.assertFalse(updatesrc._ver_newer("0.1.36.1", "0.1.37"))
+        # 补零对齐：0.1.36 与 0.1.36.0 等价，不判更新
+        self.assertFalse(updatesrc._ver_newer("0.1.36.0", "0.1.36"))
+        self.assertFalse(updatesrc._ver_newer("0.1.36", "0.1.36.0"))
+        # 分支序号递增
+        self.assertTrue(updatesrc._ver_newer("0.1.36.2", "0.1.36.1"))
+
 
 class TestStripVer(unittest.TestCase):
     """发布标识 → 纯版本号：新格式 main-vX.Y.Z 与旧格式 vX.Y.Z 兼容。"""
@@ -109,6 +126,11 @@ class TestStripVer(unittest.TestCase):
         self.assertEqual(updatesrc.strip_ver(""), "")
         self.assertEqual(updatesrc.strip_ver(None), "")
         self.assertEqual(updatesrc.strip_ver("  main-v0.2.0  "), "0.2.0")
+
+    def test_branch_four_segment(self):
+        # 分支测试版四段号剥前缀后原样保留
+        self.assertEqual(updatesrc.strip_ver("v0.1.36.1"), "0.1.36.1")
+        self.assertEqual(updatesrc.strip_ver("main-v0.1.36.1"), "0.1.36.1")
 
 
 class TestMainVTagFormat(unittest.TestCase):

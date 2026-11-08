@@ -66,17 +66,32 @@ def strip_ver(s: str) -> str:
     return s.lstrip("vV").strip()
 
 
-def _ver_tuple(v: str) -> tuple[int, int, int]:
+def _ver_tuple(v: str) -> tuple[int, ...]:
+    """版本号 → 数字元组（N 段，不足 3 段补零，不截断）。
+
+    支持分支测试版四段号 v0.1.36.1（主版本号 0.1.36 + 分支序号 1）：
+    主线三段 0.1.36 / 0.1.37 与分支四段 0.1.36.1 同规则比较。
+    """
     import re
     nums: list[int] = []
     for piece in (v or "").split("."):
         m = re.search(r"\d+", piece)
         nums.append(int(m.group()) if m else 0)
-        if len(nums) == 3:
-            break
     while len(nums) < 3:
         nums.append(0)
     return tuple(nums)
+
+
+def _ver_newer(a: str, b: str) -> bool:
+    """a 是否比 b 新：不同段数自动补零对齐后按字典序比较。
+
+    分支四段与主线三段混比：0.1.36 < 0.1.36.1 < 0.1.37。
+    """
+    ta, tb = _ver_tuple(a), _ver_tuple(b)
+    n = max(len(ta), len(tb))
+    ta += (0,) * (n - len(ta))
+    tb += (0,) * (n - len(tb))
+    return ta > tb
 
 
 def _get(client: httpx.Client, url: str, *, headers: dict,
@@ -222,7 +237,7 @@ def _normalize(current: str, src: dict, info: dict, cfg: dict,
         assets.append({**a, "fallback_urls": fallbacks})
     latest = info.get("version") or ""
     return {"ok": True, "current": current, "latest": latest or current,
-            "has_update": bool(latest) and _ver_tuple(latest) > _ver_tuple(current),
+            "has_update": bool(latest) and _ver_newer(latest, current),
             "url": info.get("html_url") or "",
             "notes": (info.get("notes") or "")[:2000],
             "source": src.get("name") or src.get("type") or "",

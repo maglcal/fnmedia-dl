@@ -57,8 +57,17 @@ print("[fpk] stage 复制完成（python fallback）")
 PYSTAGE
 fi
 
-MANIFEST_VER="$(echo "${VERSION}" | sed -E 's/([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-sed "s/@VERSION@/${MANIFEST_VER}/" "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+# 版本号段数判定（用户定规范）：三段=正式发布版 main-vX.Y.Z，四段=分支测试版 vX.Y.Z.x
+SEG_COUNT="$(echo "${VERSION}" | awk -F. '{print NF}')"
+if [ "${SEG_COUNT}" -ge 4 ]; then
+  RELEASE_TAG="v${VERSION}"        # 四段及以上：分支测试版（如 v0.1.36.1）
+else
+  RELEASE_TAG="main-v${VERSION}"   # 三段：正式发布版（如 main-v0.1.36）
+fi
+# manifest version 用完整版本号（支持四段分支号；fnOS 宽松接受，安装校验若拒则回退 0.1.36-1 形式）
+MANIFEST_VER="${VERSION}"
+sed -e "s/@VERSION@/${MANIFEST_VER}/g" -e "s/@TAG@/${RELEASE_TAG}/g" \
+    "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
 # UI 资源版本戳（?v=@VERSION@）防浏览器旧缓存：与 manifest 同步替换
 if [ -f "${STAGE}/app/repo/app/ui/index.html" ]; then
   sed -i "s/@VERSION@/${MANIFEST_VER}/g" "${STAGE}/app/repo/app/ui/index.html"
@@ -90,8 +99,7 @@ WORK="$(mktemp -d)"; trap 'rm -rf "${WORK}"' EXIT
 BUILT="$(find "${WORK}" "${STAGE}" -maxdepth 2 -name '*.fpk' -print -quit 2>/dev/null || true)"
 [ -n "${BUILT}" ] || { echo "ERROR: fnpack 未产出 .fpk" >&2; exit 1; }
 mkdir -p "${OUT_DIR}"
-# 发布标识统一 main-vX.Y.Z（tag / Release / fpk 文件名），VERSION 文件保持纯 X.Y.Z
-RELEASE_TAG="main-v${VERSION}"
+# 发布标识：三段 main-vX.Y.Z（正式发布）/ 四段 vX.Y.Z.x（分支测试）；VERSION 文件存完整版本号
 FINAL="${OUT_DIR}/fnmedia-dl-${RELEASE_TAG}.fpk"
 mv "${BUILT}" "${FINAL}"
 ( cd "$(dirname "${FINAL}")" && sha256sum "$(basename "${FINAL}")" > "$(basename "${FINAL}").sha256" )

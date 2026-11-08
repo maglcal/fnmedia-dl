@@ -135,7 +135,7 @@ Repository Secrets 即可启用：
 REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag main-vX.Y.Z] [--force]
 ```
 
-### 发布命名规则（main-vX.Y.Z）
+### 发布命名规则（main-vX.Y.Z / 分支测试 vX.Y.Z.x）
 
 从 `main-v0.1.35` 起，发布标识统一 **`main-vX.Y.Z`**（`main` 之后跟版本号，
 如 `main-v0.1.35`）：
@@ -143,7 +143,14 @@ REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag main-vX.Y
 - **git tag / GitHub Release 标签**：`main-vX.Y.Z`；
 - **fpk 资产文件名**：`fnmedia-dl-main-vX.Y.Z.fpk`（配套 `.fpk.sha256`）；
 - **版本号本体**（VERSION 文件、manifest version 字段、更新比较）：`vX.Y.Z` /
-  纯 `X.Y.Z`，**不带 `main-` 前缀**——fnOS 升级比较与插件内版本比较只认数字三段。
+  纯 `X.Y.Z`，**不带 `main-` 前缀**。
+
+**分支测试版本号（`vX.Y.Z.x`）**：分支测试时以当前主版本号为基础，末尾追加一位
+递增的分支序号标识分支版本（主版本号 `v0.1.36` → 分支版本 `v0.1.36.1`、
+`v0.1.36.2` ……），分支测试包名 `fnmedia-dl-vX.Y.Z.x.fpk`（不带 `main-` 前缀）。
+分支测试通过并合并回 main 时，主版本号末位递增一位（`v0.1.36` → `v0.1.37`），
+再按 `main-vX.Y.Z` 正式发布。分支四段号与主线三段号统一规则比较
+（`0.1.36` < `0.1.36.1` < `0.1.37`）。
 
 解析端（`app/updatesrc.py` 的 `strip_ver`，updater/同步脚本共用同一规则）剥
 `main-v`/`v` 前缀取纯版本，旧格式 `v0.1.x` tag 兼容可解析；历史 tag 为旧命名，
