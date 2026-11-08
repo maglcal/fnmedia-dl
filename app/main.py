@@ -26,6 +26,11 @@
   POST /api/history/check    下载历史查重（是否下载过某链接）
   POST /api/tasks/{backend}/{id}/pause|resume|retry
   DELETE /api/tasks/{backend}/{id}
+  GET  /api/queue            任务队列与定时设置
+  POST /api/queue            链接入队
+  DELETE /api/queue/{id}     移除队列项
+  POST /api/queue/run        立即派发全部待发项
+  POST /api/queue/settings   每日定时派发设置
 """
 from __future__ import annotations
 
@@ -34,6 +39,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -44,13 +51,14 @@ from pydantic import BaseModel
 
 import config as cfgmod
 import links as linksmod
+import taskqueue as tqmod
+import updatesrc
 import updater as updmod
 import xunlei_docker as xdmod
 from backends.base import BackendError
 from downloader import DownloadManager
 
 UI_DIR = Path(__file__).resolve().parent / "ui"
-GITHUB_REPO = "maglcal/fnmedia-dl"
 
 
 def _read_version() -> str:
@@ -105,6 +113,22 @@ def _manager() -> DownloadManager:
     return DownloadManager(cfgmod.load())
 
 
+def _queue() -> tqmod.TaskQueue:
+    return tqmod.TaskQueue(Path(cfgmod.STATE_DIR) / "queue.json")
+
+
+def _queue_dispatch(mgr: DownloadManager, backend: str = "auto"):
+    """队列派发闭包：沿用界面所选通道（0.1.28 前硬编码 auto——无视用户的
+    通道选择，任务可能被降级链派去别的通道，「派发成功」但迅雷里没有），
+    未选/定时派发用 auto 降级链；全局默认目录兜底。"""
+    def _fn(url: str, directory: str | None) -> dict:
+        return mgr.dispatch(linksmod.parse_line(url),
+                            backend=backend or "auto",
+                            directory=directory
+                            or mgr.cfg.get("default_dir") or None)
+    return _fn
+
+
 # ------------------------------------------------------------ 页面
 
 @app.get("/")
@@ -119,45 +143,14 @@ def health():
     return {"ok": True, "version": VERSION, "name": "fnmedia-dl"}
 
 
-def _ver_tuple(v: str) -> tuple[int, int, int]:
-    nums: list[int] = []
-    for piece in (v or "").split("."):
-        m = re.match(r"\d+", piece)
-        nums.append(int(m.group()) if m else 0)
-        if len(nums) == 3:
-            break
-    while len(nums) < 3:
-        nums.append(0)
-    return tuple(nums)
-
-
 @app.get("/api/update/check")
 def update_check():
-    """在线更新：查 GitHub Releases 最新版（境外接口，trust_env 放行走代理）。"""
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    """在线更新检查：多源按序尝试（自建 RepoBox 镜像优先，GitHub 兜底），
+    每个源内部重试；全部失败才报错。"""
     try:
-        resp = httpx.get(url, timeout=15, trust_env=True, headers={
-            "accept": "application/vnd.github+json",
-            "user-agent": f"fnmedia-dl/{VERSION}"})
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"连接 GitHub 失败（可检查网络/代理设置）：{exc}")
-    if resp.status_code == 404:
-        return {"ok": True, "current": VERSION, "latest": VERSION,
-                "has_update": False, "detail": "仓库暂无发布版本"}
-    if resp.status_code != 200:
-        raise HTTPException(502, f"GitHub API 返回 HTTP {resp.status_code}")
-    data = resp.json()
-    latest = str(data.get("tag_name") or "").lstrip("vV").strip()
-    has = bool(latest) and _ver_tuple(latest) > _ver_tuple(VERSION)
-    return {
-        "ok": True, "current": VERSION, "latest": latest or VERSION,
-        "has_update": has,
-        "url": data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases",
-        "notes": (data.get("body") or "")[:2000],
-        "assets": [{"name": a.get("name"), "url": a.get("browser_download_url"),
-                    "size": a.get("size")}
-                   for a in (data.get("assets") or [])],
-    }
+        return updatesrc.check(cfgmod.load(), VERSION)
+    except updatesrc.SourceError as exc:
+        raise HTTPException(502, str(exc))
 
 
 class UpdateDownloadReq(BaseModel):
@@ -167,17 +160,30 @@ class UpdateDownloadReq(BaseModel):
 
 @app.post("/api/update/download")
 def update_download(req: UpdateDownloadReq):
-    """一键在线更新：后台线程下载 fpk → 替换 → 重启服务，进度走 /api/update/progress。"""
-    url = req.url or ""
+    """一键在线更新：后台线程下载 fpk → 替换 → 重启服务，进度走 /api/update/progress。
+
+    下载地址来自检查结果（镜像源优先），并带齐其余源的回退候选——
+    下载失败/校验不符时自动重试并换源（updater.download_verified）。"""
+    info = update_check()
+    fpk_assets = [a for a in info.get("assets", [])
+                  if (a.get("name") or "").endswith(".fpk")]
+    asset = next((a for a in fpk_assets
+                  if req.url and a.get("url") == req.url), None)
+    if asset is None and req.url:
+        # 手动指定地址：无清单信息，仅做地址形状放行
+        asset = {"url": req.url, "fallback_urls": [], "sha256": "", "size": 0}
+    if asset is None:
+        asset = fpk_assets[0] if fpk_assets else {}
+    url = asset.get("url") or ""
     if not url:
-        # 未显式给 URL 时兜底取最新 release 的 fpk 资产
-        info = update_check()
-        for asset in info.get("assets", []):
-            if (asset.get("name") or "").endswith(".fpk"):
-                url = asset.get("url") or ""
-                break
+        raise HTTPException(400, "没有可用的 .fpk 资产")
     try:
-        return {"ok": True, **updmod.start(url, req.version)}
+        return {"ok": True, **updmod.start(
+            url, req.version,
+            fallback_urls=asset.get("fallback_urls") or [],
+            sha256=asset.get("sha256") or "",
+            expected_size=int(asset.get("size") or 0),
+            allowed_prefixes=updatesrc.allowed_prefixes(cfgmod.load()))}
     except updmod.UpdateError as exc:
         raise HTTPException(400, str(exc))
 
@@ -197,6 +203,9 @@ def backends_status():
     out = {}
     for key, impl in mgr.backends().items():
         out[key] = {"label": impl.label, **impl.status()}
+    if "thunder_engine" in out:
+        # 今日配额用量（非会员每日创建次数有限），UI 引擎卡展示
+        out["thunder_engine"]["quota"] = mgr.quota.snapshot()
     return out
 
 
@@ -208,6 +217,14 @@ def backends_test(req: BackendTestReq):
     if not impl:
         raise HTTPException(404, f"未知通道：{req.backend}")
     return {"backend": req.backend, **impl.status()}
+
+
+@app.get("/api/diagnose")
+def diagnose():
+    """分层自诊断（0.1.31）：服务端配置/代理转发/依赖服务连接三层逐层探活，
+    「提示502」类问题一键定位故障层。只读探测，不登录不建目录。"""
+    import diag as diagmod
+    return diagmod.run(VERSION)
 
 
 # ------------------------------------------------------------ Docker 版迅雷一键部署
@@ -326,6 +343,15 @@ def config_put(req: ConfigPut):
             tc_in[key] = cur.get("thunder_cloud", {}).get(key, "")
     if incoming.get("aria2", {}).get("secret") == "******":
         incoming["aria2"]["secret"] = cur.get("aria2", {}).get("secret", "")
+    # update.sources 数组整体替换；其中 token 传 ****** 表示“保持不变”
+    upd_in = incoming.get("update", {})
+    if isinstance(upd_in, dict) and isinstance(upd_in.get("sources"), list):
+        cur_tokens = {s.get("name"): s.get("token", "")
+                      for s in cur.get("update", {}).get("sources", [])
+                      if isinstance(s, dict)}
+        for s in upd_in["sources"]:
+            if isinstance(s, dict) and s.get("token") == "******":
+                s["token"] = cur_tokens.get(s.get("name"), "")
     # 分段合并而非整段替换：表单只带表单键，device_id / 登录令牌 /
     # 风控验证状态（review_url/review_token）等隐藏键必须保留。
     merged_cfg = {**cur, **incoming}
@@ -442,14 +468,17 @@ def resume_task(backend: str, task_id: str):
 
 @app.post("/api/tasks/{backend}/{task_id}/retry")
 def retry_task(backend: str, task_id: str):
-    """失败/已清理任务重试：删旧任务后按原始链接原通道重新派发。"""
+    """失败/已清理任务重试：删旧任务后按原始链接原通道重新派发；
+    原通道撞每日配额时自动换通道（结果带 switched/message）。"""
     mgr = _manager()
     try:
         res = mgr.retry(backend, task_id)
     except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误
         raise HTTPException(502, str(exc))
     return {"ok": True, "backend": res.get("backend"),
-            "id": res.get("id"), "label": res.get("label")}
+            "id": res.get("id"), "label": res.get("label"),
+            "switched": bool(res.get("switched")),
+            "message": res.get("message", "")}
 
 
 @app.delete("/api/tasks/{backend}/{task_id}")
@@ -464,6 +493,84 @@ def _control(action: str, backend: str, task_id: str):
     except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误
         raise HTTPException(502, str(exc))
     return {"ok": True}
+
+
+# ------------------------------------------------------------ 任务队列（每日定时派发）
+
+@app.get("/api/queue")
+def queue_state():
+    return {"ok": True, **_queue().snapshot()}
+
+
+class QueueAddReq(BaseModel):
+    links: list[str] = []
+    text: str = ""
+    directory: str | None = None
+
+
+@app.post("/api/queue")
+def queue_add(req: QueueAddReq):
+    urls = [u.strip() for u in req.links if u.strip()]
+    if req.text.strip():
+        urls.extend(li.url for li in linksmod.parse_text(req.text) if li.url)
+    if not urls:
+        raise HTTPException(400, "没有可入队的链接")
+    q = _queue()
+    added = q.add(urls, directory=req.directory or None)
+    return {"ok": True, "added": [i["id"] for i in added], **q.snapshot()}
+
+
+@app.delete("/api/queue/{item_id}")
+def queue_remove(item_id: str):
+    q = _queue()
+    if not q.remove(item_id):
+        raise HTTPException(404, "队列项不存在")
+    return {"ok": True, **q.snapshot()}
+
+
+class QueueRunReq(BaseModel):
+    backend: str = "auto"
+
+
+@app.post("/api/queue/run")
+def queue_run(req: QueueRunReq | None = None):
+    """立即派发全部待发项。backend 沿用界面通道选择（缺省 auto 降级链）。"""
+    mgr = _manager()
+    q = _queue()
+    results = q.run_now(_queue_dispatch(mgr, (req.backend if req else "auto")))
+    return {"ok": True, "results": results, **q.snapshot()}
+
+
+class QueueSettingsReq(BaseModel):
+    enabled: bool = False
+    time: str = "00:05"
+
+
+@app.post("/api/queue/settings")
+def queue_settings(req: QueueSettingsReq):
+    q = _queue()
+    try:
+        q.set_settings(enabled=req.enabled, time_str=req.time)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, **q.snapshot()}
+
+
+@app.on_event("startup")
+def _queue_worker_start():
+    """队列定时派发守护线程：每 30s 检查一次，到点且当天未跑过则派发待发项。"""
+    def _loop():
+        while True:
+            time.sleep(30)
+            try:
+                q = _queue()
+                if not q.should_run():
+                    continue
+                mgr = _manager()
+                q.tick(_queue_dispatch(mgr))
+            except Exception:  # noqa: BLE001 - 后台线程绝不因异常退出
+                pass
+    threading.Thread(target=_loop, daemon=True, name="queue-ticker").start()
 
 
 @app.exception_handler(Exception)

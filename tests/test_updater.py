@@ -2,6 +2,7 @@
 """在线更新器测试（假 fpk + 临时目录，全程无网络）。"""
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
@@ -184,6 +185,114 @@ class TestValidateUrl(unittest.TestCase):
     def test_reject_empty(self):
         self.assertFalse(updater.validate_asset_url(""))
 
+    def test_mirror_prefix_allowed(self):
+        """已配置镜像源前缀放行（含跨源回退候选）。"""
+        self.assertTrue(updater.validate_asset_url(
+            "http://mirror.example.com/raw/fnmedia-dl/releases/"
+            "v0.1.24/fnmedia-dl-0.1.24.fpk",
+            ["http://mirror.example.com/raw/fnmedia-dl/"]))
+
+    def test_mirror_prefix_still_rejects_non_fpk_and_traversal(self):
+        p = ["http://mirror.example.com/raw/fnmedia-dl/"]
+        self.assertFalse(updater.validate_asset_url(
+            "http://mirror.example.com/raw/fnmedia-dl/x.exe", p))
+        self.assertFalse(updater.validate_asset_url(
+            "http://mirror.example.com/raw/fnmedia-dl/../evil.fpk", p))
+
+    def test_unlisted_mirror_rejected(self):
+        self.assertFalse(updater.validate_asset_url(
+            "http://other.example.com/raw/fnmedia-dl/x.fpk",
+            ["http://mirror.example.com/raw/fnmedia-dl/"]))
+
+
+class TestDownloadVerified(unittest.TestCase):
+    def setUp(self):
+        # 打桩下载与退避，专注候选切换/校验逻辑
+        self.calls: list[str] = []
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dest = Path(self._tmp.name) / "a.fpk"
+        self._orig_download = updater.download_fpk
+        self._orig_sleep = updater.time.sleep
+        updater.time.sleep = lambda s: None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        updater.download_fpk = self._orig_download
+        updater.time.sleep = self._orig_sleep
+        self._tmp.cleanup()
+
+    def _stub_download(self, impl):
+        def fake(url, dest, client=None):
+            self.calls.append(url)
+            return impl(url, dest)
+        updater.download_fpk = fake
+
+    def test_first_candidate_ok(self):
+        def impl(url, dest):
+            dest.write_bytes(b"hello")
+            return 5
+        self._stub_download(impl)
+        size = updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5)
+        self.assertEqual(size, 5)
+        self.assertEqual(self.calls, ["http://a/x.fpk"])
+
+    def test_fallback_on_download_error(self):
+        def impl(url, dest):
+            if "http://a/" in url:
+                raise updater.UpdateError("下载失败：HTTP 500")
+            dest.write_bytes(b"hello")
+            return 5
+        self._stub_download(impl)
+        updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+        self.assertIn("http://b/x.fpk", self.calls)
+
+    def test_sha256_mismatch_switches_candidate(self):
+        def impl(url, dest):
+            dest.write_bytes(b"hello" if "http://b/" in url else b"evil!")
+            return 5
+        self._stub_download(impl)
+        good = hashlib.sha256(b"hello").hexdigest()
+        size = updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, sha256=good)
+        self.assertEqual(size, 5)
+        self.assertIn("http://b/x.fpk", self.calls)
+
+    def test_size_mismatch_switches_candidate(self):
+        def impl(url, dest):
+            dest.write_bytes(b"hello" if "http://b/" in url else b"hi")
+            return 2 if "http://a/" in url else 5
+        self._stub_download(impl)
+        updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5)
+        self.assertIn("http://b/x.fpk", self.calls)
+
+    def test_all_fail_raises_with_summary(self):
+        def impl(url, dest):
+            raise updater.UpdateError("下载失败：HTTP 500")
+        self._stub_download(impl)
+        with self.assertRaises(updater.UpdateError) as cm:
+            updater.download_verified(
+                ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+        msg = str(cm.exception)
+        self.assertIn("所有下载候选均失败", msg)
+        self.assertIn("候选1", msg)
+        self.assertIn("候选2", msg)
+        # 每候选重试 2 次
+        self.assertEqual(len(self.calls), 4)
+
+    def test_network_error_also_retries_and_falls_back(self):
+        def impl(url, dest):
+            if "http://a/" in url:
+                raise updater.httpx.ConnectError("boom")
+            dest.write_bytes(b"ok!")
+            return 3
+        self._stub_download(impl)
+        updater.download_verified(
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+        self.assertIn("http://b/x.fpk", self.calls)
+
 
 class TestProgressState(unittest.TestCase):
     def test_set_and_progress_snapshot(self):
@@ -199,6 +308,91 @@ class TestProgressState(unittest.TestCase):
         # 不带 stage 的局部更新（回滚兜底路径）
         updater._set(detail="已回滚到更新前版本")
         self.assertEqual(updater.progress()["stage"], "downloading")
+
+
+class TestStartVersionStrip(unittest.TestCase):
+    """start() 的 to_version 归一：新格式 main-vX.Y.Z 与旧 vX.Y.Z 均剥成纯 X.Y.Z。"""
+
+    URL = ("https://github.com/maglcal/fnmedia-dl/releases/download/"
+           "main-v0.2.0/fnmedia-dl-main-v0.2.0.fpk")
+
+    def tearDown(self):
+        with updater._lock:
+            updater._state.update(stage="idle", percent=0, detail="", error="",
+                                 from_version="", to_version="", done=False)
+
+    def _start(self, version: str) -> dict:
+        from unittest import mock
+        with mock.patch.object(updater, "_run"):   # 不真下载
+            updater.start(self.URL, version=version)
+            return updater.progress()
+
+    def test_main_v_prefix_stripped(self):
+        self.assertEqual(self._start("main-v0.2.0")["to_version"], "0.2.0")
+
+    def test_legacy_v_prefix_stripped(self):
+        self.assertEqual(self._start("v0.2.0")["to_version"], "0.2.0")
+
+    def test_plain_version_kept(self):
+        self.assertEqual(self._start("0.2.0")["to_version"], "0.2.0")
+
+
+class TestMaskSecrets(unittest.TestCase):
+    """错误/进度文案的 URL 敏感参数掩码（防凭据经提示泄露）。"""
+
+    def test_masks_sensitive_query_params(self):
+        s = updater._mask_secrets(
+            "https://x/y?token=abc123&repo=fnmedia-dl&secret=zz99&key=k1")
+        self.assertNotIn("abc123", s)
+        self.assertNotIn("zz99", s)
+        self.assertIn("token=******", s)
+        self.assertIn("secret=******", s)
+        self.assertIn("key=******", s)
+        self.assertIn("repo=fnmedia-dl", s)          # 非敏感参数保留
+
+    def test_plain_text_unchanged(self):
+        self.assertEqual(updater._mask_secrets("HTTP 502 bad gateway"),
+                         "HTTP 502 bad gateway")
+
+
+class TestFallbackSwitchNotice(unittest.TestCase):
+    """下载换源透明提示：切换备用源在进度文案留痕，全程对用户可见。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.dest = Path(self._td.name) / "u.fpk"
+        with updater._lock:
+            updater._state.update(stage="idle", percent=0, detail="", error="",
+                                 from_version="", to_version="", done=False)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _run(self, impl, urls):
+        from unittest import mock
+        with mock.patch.object(updater, "download_fpk", side_effect=impl), \
+             mock.patch.object(updater.time, "sleep"):
+            updater.download_verified(urls, self.dest)
+        return updater.progress()
+
+    def test_switch_notice_persists_after_success(self):
+        def impl(url, dest, client=None):
+            if "http://a/" in url:
+                raise updater.UpdateError("下载失败：HTTP 502")
+            dest.write_bytes(b"ok!")
+            return 3
+
+        p = self._run(impl, ["http://a/x.fpk", "http://b/x.fpk"])
+        self.assertIn("已自动切换备用源", p["detail"])
+        self.assertIn("1 次", p["detail"])             # 成功后留痕计数
+
+    def test_no_switch_keeps_plain_detail(self):
+        def impl(url, dest, client=None):
+            dest.write_bytes(b"ok!")
+            return 3
+
+        p = self._run(impl, ["http://a/x.fpk"])
+        self.assertEqual(p["detail"], "下载校验通过")
 
 
 class TestRequirementsChanged(unittest.TestCase):

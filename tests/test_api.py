@@ -59,10 +59,15 @@ class TestAPI(unittest.TestCase):
         self.assertIn("done", body)
 
     def test_update_download_rejects_bad_url(self):
-        r = self.client.post("/api/update/download",
-                             json={"url": "https://evil.example.com/x.fpk"})
+        from unittest import mock
+        empty = {"ok": True, "current": "0.1.0", "latest": "0.1.0",
+                 "has_update": False, "url": "", "notes": "", "source": "",
+                 "assets": [], "fetched_at": 0}
+        with mock.patch.object(main.updatesrc, "check", return_value=empty):
+            r = self.client.post("/api/update/download",
+                                 json={"url": "https://evil.example.com/x.fpk"})
         self.assertEqual(r.status_code, 400)
-        self.assertIn("GitHub", r.json()["detail"])
+        self.assertIn("官方 Releases", r.json()["detail"])
 
     def test_ui_assets_no_cache(self):
         """UI 页面/脚本禁协商缓存：在线更新后 iframe 不吃旧页。"""
@@ -74,43 +79,53 @@ class TestAPI(unittest.TestCase):
         r = self.client.get("/api/health")
         self.assertNotEqual(r.headers.get("cache-control"), "no-cache")
 
+    def test_diagnose_endpoint_shape(self):
+        """0.1.31：/api/diagnose 透传 diag.run 的分层结果（探针打桩）。"""
+        from unittest import mock
+        fake = {"ok": False, "version": "0.1.31", "steps": [
+            {"step": "服务版本", "ok": True, "ms": 1, "detail": "v0.1.31"},
+            {"step": "中继目录表", "ok": False, "ms": 5000,
+             "detail": "超时（>5s 无响应）"}]}
+        with mock.patch("diag.run", return_value=fake):
+            r = self.client.get("/api/diagnose")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(len(body["steps"]), 2)
+        self.assertEqual(body["steps"][1]["step"], "中继目录表")
+
     def test_update_check(self):
+        """API 透传多源检查结果（多源逻辑见 test_updatesrc.py）。"""
         from unittest import mock
         payload = {
-            "tag_name": "v9.9.9",
-            "html_url": "https://github.com/maglcal/fnmedia-dl/releases/tag/v9.9.9",
-            "body": "更新说明",
+            "ok": True, "current": "0.1.0", "latest": "9.9.9",
+            "has_update": True,
+            "url": "https://github.com/maglcal/fnmedia-dl/releases/tag/v9.9.9",
+            "notes": "更新说明", "source": "repobox",
             "assets": [{"name": "fnmedia-dl-9.9.9.fpk",
-                        "browser_download_url": "https://x/a.fpk", "size": 12}],
+                        "url": "http://mirror.example.com/raw/fnmedia-dl/x.fpk",
+                        "fallback_urls": ["https://github.com/maglcal/fnmedia-dl/"
+                                          "releases/download/v9.9.9/fnmedia-dl-9.9.9.fpk"],
+                        "sha256": "ab", "size": 12}],
+            "fetched_at": 0,
         }
-
-        class _Resp:
-            status_code = 200
-
-            @staticmethod
-            def json():
-                return payload
-
-        with mock.patch.object(main.httpx, "get", return_value=_Resp()):
+        with mock.patch.object(main.updatesrc, "check", return_value=payload):
             r = self.client.get("/api/update/check")
         self.assertEqual(r.status_code, 200)
         d = r.json()
         self.assertEqual(d["latest"], "9.9.9")
         self.assertTrue(d["has_update"])
         self.assertEqual(d["assets"][0]["name"], "fnmedia-dl-9.9.9.fpk")
+        self.assertEqual(d["assets"][0]["fallback_urls"],
+                         payload["assets"][0]["fallback_urls"])
 
-        # 404（仓库尚无 release）→ 明确文案而不是报错
-        class _Resp404:
-            status_code = 404
-
-            @staticmethod
-            def json():
-                return {}
-
-        with mock.patch.object(main.httpx, "get", return_value=_Resp404()):
+        # 全部更新源不可用 → 502 明确文案
+        from updatesrc import SourceError
+        with mock.patch.object(main.updatesrc, "check",
+                               side_effect=SourceError("全部更新源不可用")):
             r2 = self.client.get("/api/update/check")
-        self.assertEqual(r2.status_code, 200)
-        self.assertFalse(r2.json()["has_update"])
+        self.assertEqual(r2.status_code, 502)
+        self.assertIn("更新源", r2.json()["detail"])
 
     def test_parse(self):
         r = self.client.post("/api/parse", json={
@@ -196,6 +211,66 @@ class TestAPI(unittest.TestCase):
         # 空请求
         r3 = self.client.post("/api/history/check", json={"links": []})
         self.assertEqual(r3.status_code, 400)
+
+    def test_retry_quota_switch_message(self):
+        """重试撞配额自动换通道：响应带 switched/message 供前端提示。"""
+        eng = FakeBackend("thunder_engine", "引擎")
+        self._patch_backends({"thunder_engine": eng,
+                              "aria2": FakeBackend("aria2", "aria2")})
+        r = self.client.post("/api/tasks", json={
+            "links": ["https://x/q.iso"], "backend": "thunder_engine"})
+        tid = r.json()["results"][0]["id"]
+        eng._add_ok = False
+        eng._add_error = "HTTP 402: task_create_count_limit 任务创建次数达到上限"
+        r = self.client.post(f"/api/tasks/thunder_engine/{tid}/retry")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["switched"])
+        self.assertEqual(body["backend"], "aria2")
+        self.assertIn("配额", body["message"])
+
+    # ------------------------------------------------ 任务队列（每日定时派发）
+
+    def test_queue_state_empty(self):
+        r = self.client.get("/api/queue")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["items"], [])
+        self.assertIn("settings", body)
+
+    def test_queue_flow(self):
+        self._patch_backends({"aria2": FakeBackend("aria2", "aria2")})
+        # 入队
+        r = self.client.post("/api/queue", json={"links": ["https://x/a.iso"]})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(len(body["items"]), 1)
+        qid = body["items"][0]["id"]
+        self.assertEqual(body["items"][0]["status"], "queued")
+        # 空请求拒绝
+        r = self.client.post("/api/queue", json={"links": []})
+        self.assertEqual(r.status_code, 400)
+        # 定时设置（含非法时间）
+        r = self.client.post("/api/queue/settings",
+                             json={"enabled": True, "time": "00:05"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["settings"]["enabled"])
+        r = self.client.post("/api/queue/settings",
+                             json={"enabled": True, "time": "99:99"})
+        self.assertEqual(r.status_code, 400)
+        # 立即派发
+        r = self.client.post("/api/queue/run", json={})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(len(body["results"]), 1)
+        self.assertTrue(body["results"][0]["ok"])
+        self.assertEqual(body["items"][0]["status"], "done")
+        # 移除 + 二次移除 404
+        r = self.client.delete(f"/api/queue/{qid}")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["items"], [])
+        r = self.client.delete(f"/api/queue/{qid}")
+        self.assertEqual(r.status_code, 404)
 
     def test_config_roundtrip(self):
         r = self.client.put("/api/config", json={"config": {

@@ -90,8 +90,12 @@ class ThunderEngine(Backend):
         if name:
             resource.name = name
         try:
+            # on_unresolvable="direct"：目录表查询彻底失败时回退 0.1.22 直传
+            # 形状（id 空 + 路径原样）——引擎按路径自行落盘（用户环境实测可用），
+            # 本地引擎的最后兜底；云端不用（云端 id 空任务永不启动）。
             return self.core.create_task(url, resource, space,
-                                         directory=directory or self.dir)
+                                         directory=directory or self.dir,
+                                         on_unresolvable="direct")
         except BackendError as exc:
             raise BackendError(f"创建任务失败：{exc}") from exc
 

@@ -77,7 +77,7 @@ $$(".tab").forEach((btn) => {
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "tasks") loadTasks();
     if (btn.dataset.tab === "settings") loadConfig();
-    if (btn.dataset.tab === "add") loadChips();
+    if (btn.dataset.tab === "add") { loadChips(); loadQueue(); }
   });
 });
 
@@ -94,6 +94,17 @@ async function loadChips() {
       div.title = st.detail || "";
       div.textContent = st.label || key;
       box.appendChild(div);
+    }
+    // 引擎今日配额行（通道设置页「迅雷下载引擎」卡）
+    const q = data.thunder_engine && data.thunder_engine.quota;
+    const qEl = $("#teQuota");
+    if (qEl) {
+      qEl.textContent = q
+        ? `📊 今日已创建 ${q.used} 个任务 · ` +
+          (q.blocked
+            ? "今日配额已满（派发将跳过引擎，明日自动恢复；可走迅雷远程通道）"
+            : "配额状态正常")
+        : "";
     }
   } catch (e) {
     $("#backendChips").innerHTML = `<div class="chip bad" title="${e.message}">通道状态获取失败</div>`;
@@ -250,8 +261,9 @@ function renderTasks(tasks, backendErrors) {
       try {
         const url = `/api/tasks/${encodeURIComponent(backend)}/${encodeURIComponent(id)}` +
                     (act === "delete" ? "" : `/${act}`);
-        await API.send(url, act === "delete" ? "DELETE" : "POST");
-        toast(ACT_TEXT[act] || "已完成");
+        const r = await API.send(url, act === "delete" ? "DELETE" : "POST");
+        // 重试可能自动换了通道（原通道配额已满），优先展示后端提示
+        toast(act === "retry" && r && r.message ? r.message : (ACT_TEXT[act] || "已完成"));
         loadTasks();
       } catch (e) {
         toast("操作失败：" + e.message);
@@ -365,6 +377,7 @@ async function loadConfig() {
   loadFs();
   loadTcReview();
   loadXdStatus();
+  loadChips();   // 同步刷新引擎配额行（#teQuota 在本页）
 }
 
 /* 目录与授权：共享目录、已授权目录、目录检测 */
@@ -732,16 +745,54 @@ on("#updateCheckBtn", "click", async () => {
         UPD.target = r.latest;
         $("#updateRunBtn").hidden = false;
       }
-      st.innerHTML =
+      const notice = r.notice
+        ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "";
+      st.innerHTML = notice +
         `发现新版本 <b>v${r.latest}</b>（当前 v${r.current}）` +
         (fpk ? "，可点「一键更新」在线升级" :
           (r.url ? ` —— <a href="${r.url}" target="_blank" rel="noreferrer">前往下载</a>` : ""));
     } else {
       $("#updateRunBtn").hidden = true;
-      st.textContent = `✓ 已是最新版本（v${r.current}）`;
+      st.innerHTML = (r.notice
+        ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "") +
+        `✓ 已是最新版本（v${r.current}）`;
     }
   } catch (e) {
     st.textContent = "✗ 检查更新失败：" + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ---------------- 自诊断（0.1.31：502 类问题逐层定位） ---------------- */
+on("#diagBtn", "click", async () => {
+  const btn = $("#diagBtn");
+  const box = $("#diagResult");
+  btn.disabled = true;
+  box.hidden = false;
+  box.className = "dir-status";
+  box.textContent = "正在逐层探测（约 10~30 秒）…";
+  try {
+    const r = await API.get("/api/diagnose");
+    const rows = (r.steps || []).map((s) => {
+      // 0.1.36 三态：瞬态步骤（首步超时但同链路后续已恢复）标 ⚠ 不标 ✗
+      const mark = s.transient ? "⚠" : (s.ok ? "✓" : "✗");
+      // 0.1.34：detail 含上游错误原文（可能带 <…> 形态），必须转义——
+      // 否则被当 HTML 标签吞掉（0.1.33 实测 <hash>/<id> 占位符显示为空）
+      return `<div>${mark} ${esc(s.step)}（${s.ms}ms）：${esc(s.detail || "")}</div>`;
+    });
+    const hasT = (r.steps || []).some((s) => s.transient);
+    box.className = "dir-status" + (r.ok ? "" : " bad");
+    box.innerHTML =
+      (r.ok
+        ? "✓ 关键链路全部正常" +
+          (hasT ? "（⚠ 含瞬态步骤：偶发超时已自愈，不影响使用）" : "")
+        : "✗ 存在异常步骤，请看下方定位") +
+      `<br>${rows.join("")}` +
+      (r.ok ? "" : "<br>第一个 ✗ 步骤即故障层；仍无法解决请带此结果反馈。");
+  } catch (e) {
+    box.className = "dir-status bad";
+    box.textContent = "✗ 自诊断失败：" + e.message;
   } finally {
     btn.disabled = false;
   }
@@ -807,13 +858,13 @@ on("#updateRunBtn", "click", async () => {
       stageEl.textContent = "服务重启中，等待新版本生效…";
       bar.style.width = "100%";
       pctEl.textContent = "100%";
-      const oldVer = (p.from_version || "").replace(/^v/, "");
-      const newVer = (p.to_version || UPD.target || "").replace(/^v/, "");
+      const oldVer = (p.from_version || "").replace(/^(main-)?v/i, "");
+      const newVer = (p.to_version || UPD.target || "").replace(/^(main-)?v/i, "");
       const deadline = Date.now() + 90000;
       const healthTimer = setInterval(async () => {
         try {
           const h = await API.get("/api/health");
-          const v = (h.version || "").replace(/^v/, "");
+          const v = (h.version || "").replace(/^(main-)?v/i, "");
           if (v && v !== oldVer) {
             clearInterval(healthTimer);
             st.className = "dir-status ok";
@@ -841,12 +892,142 @@ on("#updateRunBtn", "click", async () => {
   }, 1000);
 });
 
+/* ---------------- 任务队列（每日定时派发） ---------------- */
+async function loadQueue() {
+  try {
+    renderQueue(await API.get("/api/queue"));
+  } catch (e) {
+    const box = $("#queueStatus");
+    if (box) {
+      box.hidden = false;
+      box.className = "dir-status bad";
+      box.textContent = "队列加载失败：" + e.message;
+    }
+  }
+}
+
+const QSTATE_BADGE = {
+  queued: `<span class="result-warn">待派发</span>`,
+  done: `<span class="result-ok">✓ 已派发</span>`,
+  failed: `<span class="result-fail">✗ 派发失败</span>`,
+};
+
+function renderQueue(s) {
+  const items = (s && s.items) || [];
+  const st = (s && s.settings) || {};
+  const auto = $("#queueAuto");
+  const tm = $("#queueTime");
+  if (auto) auto.checked = !!st.enabled;
+  if (tm && st.time) tm.value = st.time;
+
+  const ul = $("#queueList");
+  if (ul) {
+    ul.innerHTML = "";
+    if (!items.length) {
+      ul.innerHTML = `<li class="empty">队列为空：在上方粘贴链接后点「加入队列」</li>`;
+    }
+    for (const it of items) {
+      const li = document.createElement("li");
+      li.innerHTML = `
+        <span class="link-name">${esc(it.name || it.url)}</span>
+        <span class="link-reason">${esc(it.url)}</span>
+        ${QSTATE_BADGE[it.status] || esc(it.status)}
+        ${it.status === "done" && it.backend ? `<span class="link-reason">${esc(it.backend)}</span>` : ""}
+        ${it.status === "failed" && it.error ? `<span class="result-fail">${esc(it.error)}</span>` : ""}
+        <button class="btn danger" data-qdel="${esc(it.id)}">移除</button>`;
+      ul.appendChild(li);
+    }
+    ul.querySelectorAll("button[data-qdel]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          renderQueue(await API.send(`/api/queue/${encodeURIComponent(btn.dataset.qdel)}`, "DELETE"));
+        } catch (e) {
+          toast("移除失败：" + e.message);
+        }
+      });
+    });
+  }
+
+  const box = $("#queueStatus");
+  if (box) {
+    box.hidden = false;
+    box.className = "dir-status";
+    box.textContent = st.enabled
+      ? `✓ 每日 ${st.time || "00:05"} 自动派发待发项` +
+        (st.last_run ? ` · 上次派发：${st.last_run}` : "")
+      : "定时派发未开启：勾选「每日定时派发」并保存，每天到点自动放行队列";
+  }
+}
+
+async function enqueue(text, directory) {
+  return API.send("/api/queue", "POST", { text, directory });
+}
+
+on("#btnEnqueue", "click", async () => {
+  const text = $("#linkInput").value.trim();
+  if (!text) return toast("请先在上方粘贴链接");
+  try {
+    const r = await enqueue(text, $("#dirInput").value.trim() || null);
+    toast(`✓ 已加入队列 ${(r.added || []).length} 条（尚未派发）——点「加入队列并立即派发」或「立即派发待发项」放行`);
+    renderQueue(r);
+  } catch (e) {
+    toast("入队失败：" + e.message);
+  }
+});
+
+on("#btnEnqueueRun", "click", async () => {
+  const text = $("#linkInput").value.trim();
+  if (!text) return toast("请先在上方粘贴链接");
+  const btn = $("#btnEnqueueRun");
+  if (btn) btn.disabled = true;
+  try {
+    await enqueue(text, $("#dirInput").value.trim() || null);
+    const r = await API.send("/api/queue/run", "POST", { backend: $("#backendSelect").value || "auto" });
+    const results = r.results || [];
+    toast(`派发完成：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
+    renderQueue(r);
+  } catch (e) {
+    toast("派发失败：" + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+});
+
+on("#btnQueueRun", "click", async () => {
+  const btn = $("#btnQueueRun");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await API.send("/api/queue/run", "POST", { backend: $("#backendSelect").value || "auto" });
+    const results = r.results || [];
+    toast(`队列派发完成：成功 ${results.filter((x) => x.ok).length} / ${results.length}`);
+    renderQueue(r);
+  } catch (e) {
+    toast("派发失败：" + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+});
+
+on("#btnQueueSave", "click", async () => {
+  try {
+    const r = await API.send("/api/queue/settings", "POST", {
+      enabled: $("#queueAuto").checked,
+      time: $("#queueTime").value || "00:05",
+    });
+    toast($("#queueAuto").checked ? "✓ 已开启每日定时派发" : "已关闭每日定时派发");
+    renderQueue(r);
+  } catch (e) {
+    toast("保存失败：" + e.message);
+  }
+});
+
 /* ---------------- init ----------------
    顶层执行到这说明脚本未被中途异常带崩；给页面看门狗一个就绪信号。
    看门狗见 index.html 尾部（脚本没跑起来时给用户明确提示而不是静默残废）。 */
 try {
   loadChips();
   loadVersion();
+  loadQueue();
   scheduleAutoRefresh();
   window.__fnmediaReady = true;
 } catch (e) {

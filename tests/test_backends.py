@@ -6,15 +6,18 @@ import hashlib
 import json
 import re
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
+from backends import drive_core                       # noqa: E402
 from backends.aria2 import Aria2                      # noqa: E402
-from backends.base import BackendError                 # noqa: E402
+from backends.base import BackendError, ParsedResource    # noqa: E402
 from backends.drive_core import DriveCore, task_to_view  # noqa: E402
 from backends.thunder_cloud import (                   # noqa: E402
     ALGORITHMS, CLIENT_ID, CLIENT_VERSION, PACKAGE_NAME, REVIEW_UA,
@@ -129,6 +132,301 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(captured["params"]["sub_file_index"], "--1,")
         self.assertEqual(captured["file_size"], "10")
 
+    # ---- parent_folder_id 解析（2026-11-08 用户实测任务永远排队中 0.0% 的原因：
+    #      缺省 parent_folder_id 的任务不会开始下载，已验证） ----
+
+    def _folder_handler(self, *, config=None, files=None, made=None, post_seen=None):
+        """目录解析链 mock：/device/config + GET/POST /drive/v1/files。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json=config or {})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": files or []})
+            if path.endswith("/files") and request.method == "POST":
+                if post_seen is not None:
+                    post_seen.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": made or "made-1"}})
+            return httpx.Response(200, json={"task": {"id": "t-x"}})
+        return handler
+
+    def test_resolve_root_by_config_hint(self):
+        """下载根 = /device/config download_paths 与目录表 realPath 匹配。"""
+        core = self._mk(self._folder_handler(
+            config={"download_paths": ["/downloads"]},
+            files=[{"id": "dir-1", "name": "downloads", "params": {"RealPath": "/downloads/"}},
+                   {"id": "dir-2", "name": "other", "params": {"RealPath": "/other/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""),
+                         ("dir-1", "/downloads/"))
+
+    def test_resolve_root_single_folder_and_name(self):
+        """无 /device/config：唯一顶层目录 / 常见下载根名兜底。"""
+        core = self._mk(self._folder_handler(
+            files=[{"id": "only", "name": "x", "params": {"RealPath": "/x/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""),
+                         ("only", "/x/"))
+        core = self._mk(self._folder_handler(
+            files=[{"id": "a", "name": "aaa", "params": {"RealPath": "/aaa/"}},
+                   {"id": "b", "name": "downloads", "params": {"RealPath": "/data/downloads/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""),
+                         ("b", "/data/downloads/"))
+
+    def test_resolve_root_heuristic_fallback(self):
+        """最后兜底：首个顶层目录的 parent_id 或 id。"""
+        core = self._mk(self._folder_handler(
+            files=[{"id": "a", "name": "aaa", "parent_id": "root-9"},
+                   {"id": "b", "name": "bbb", "parent_id": "root-9"}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
+
+    def test_folders_shape_retry_space_shape(self):
+        """目录列表 扩展形状（带 with）为空/报错时自动换 空间形状
+        （无 with + device_space= 空参数，同生态实测可用）——0.1.28 用户
+        实测其环境 扩展形状取不到目录表，整条解析链跟着崩。"""
+        seen = []
+
+        def handler(request):
+            if request.url.path.endswith("/files") and request.method == "GET":
+                seen.append(dict(request.url.params))
+                if "with" in request.url.params:
+                    return httpx.Response(200, json={"files": []})
+                return httpx.Response(200, json={"files": [
+                    {"id": "a", "name": "电影", "parent_id": "root-9"},
+                    {"id": "b", "name": "动漫", "parent_id": "root-9"}]})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
+        self.assertEqual(len(seen), 2)          # 两种形状都试过
+        self.assertIn("with", seen[0])
+        self.assertNotIn("with", seen[1])
+        self.assertIn("device_space", seen[1])
+
+    def test_folders_shape_ladder_to_minimal(self):
+        """引擎形状（扩展/空间）全挂时还有标准/极简形状兜底——
+        0.1.29：云端 api-pan 网关 502 引擎形状，极简形状（无 filters/
+        page_token/with/device_space）是兼容面最大的一种。"""
+        seen = []
+
+        def handler(request):
+            if request.url.path.endswith("/files") and request.method == "GET":
+                p = dict(request.url.params)
+                seen.append(p)
+                if "with" in p or "device_space" in p or "filters" in p:
+                    return httpx.Response(502, text="bad gateway")
+                return httpx.Response(200, json={"files": [
+                    {"id": "a", "name": "电影", "parent_id": "root-9"},
+                    {"id": "b", "name": "动漫", "parent_id": "root-9"}]})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("root-9", ""))
+        self.assertEqual(len(seen), 4)          # 扩展 → 空间 → 标准 → 极简
+        self.assertNotIn("filters", seen[3])
+        self.assertNotIn("page_token", seen[3])
+        self.assertNotIn("with", seen[3])
+        self.assertNotIn("device_space", seen[3])
+
+    def test_folders_all_shapes_fail_aggregate_error(self):
+        """全形状报错 → 聚合错误（每形状错误都保留，502/超时一眼可辨）。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+        core = self._mk(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("sp", "")
+        msg = str(ctx.exception)
+        for label in ("扩展形状", "空间形状", "标准形状", "极简形状"):
+            self.assertIn(label, msg)
+        self.assertIn("502", msg)
+
+    def test_folders_aggregate_merges_same_cause(self):
+        """0.1.34 聚合同因合并：各形状同一错误只展开一次（标签全保留，
+        ×N 计数）——长指引逐形状重复会把诊断/派发输出淹掉。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+        core = self._mk(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("sp", "")
+        msg = str(ctx.exception)
+        self.assertIn("4 处同因", msg)
+        self.assertIn("扩展形状", msg)
+        self.assertIn("极简形状", msg)
+        self.assertEqual(msg.count("HTTP 502: bad gateway"), 1)
+
+    def test_cloud_folder_shapes_standard_first(self):
+        """云端通道（_CloudDrive）api-pan 回退阶梯裁剪为标准/极简 2 形状
+        （0.1.31）：引擎形状（with/device_space）对 api-pan 直接 502，
+        多试纯属浪费响应预算。"""
+        from backends.thunder_cloud import ThunderCloud
+        tc = ThunderCloud(httpx.Client(), {}, None)
+        labels = [label for label, _ in tc.core._folder_shapes("sp", "")]
+        self.assertEqual(labels, ["标准形状", "极简形状"])
+
+    def test_folders_kind_filter_client_side(self):
+        """极简形状无服务端过滤：kind 非 drive#folder 的条目客户端兜底剔除。"""
+        core = self._mk(self._folder_handler(files=[
+            {"id": "f1", "name": "file.bin", "kind": "drive#file"},
+            {"id": "d1", "name": "电影", "kind": "drive#folder"},
+            {"id": "d2", "name": "剧集"}]))
+        self.assertEqual(core.resolve_dest_folder("sp", ""), ("d1", ""))
+
+    def test_resolve_subdir_walk_and_create(self):
+        """子目录逐段解析，缺级自动建。"""
+        made = []
+        subs = [{"id": "sub-1", "name": "电影", "params": {"RealPath": "/downloads/电影/"}}]
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "dir-1", "name": "downloads",
+                         "params": {"RealPath": "/downloads/"}}]})
+                return httpx.Response(200, json={"files": subs})
+            if path.endswith("/files") and request.method == "POST":
+                made.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "made-%d" % len(made)}})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "电影/2025"),
+                         ("made-1", "/downloads/电影/2025/"))
+        self.assertEqual(made, [{"parent_id": "sub-1", "name": "2025",
+                                 "space": "sp", "kind": "drive#folder"}])
+
+    def test_resolve_outside_root_keeps_root_id(self):
+        """根外绝对目录不再报错（0.1.26 硬拒是回归）：保留根 id 让任务能
+        开始下载，路径原样给引擎尽力落盘。"""
+        core = self._mk(self._folder_handler(
+            config={"download_paths": ["/downloads"]},
+            files=[{"id": "dir-1", "name": "downloads", "params": {"RealPath": "/downloads/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", "/vol1/other"),
+                         ("dir-1", "/vol1/other"))
+
+    def test_create_task_resolves_parent_folder(self):
+        """未显式给 parent_folder_id 时自动解析——这是任务开始下载的必要字段。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": 4242}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "space-1")
+        self.assertEqual(tid, "4242")            # 引擎整型 id 归一字符串
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
+
+    # ---- 解析阶梯式降级（0.1.28）：id 缺省任务永远不启动——只要还解析得出
+    #      目录 id 就带上 id 让任务能下载，路径尽力而为；全解析失败才报错 ----
+
+    def test_create_task_partial_when_folder_setup_denied(self):
+        """建目录被拒（引擎账号对该目录无读写权）→ 降级用根 id +
+        完整目标路径，任务照常能开始下载。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if path.endswith("/files") and request.method == "POST":
+                return httpx.Response(200, json={"error_code": 403,
+                                                 "error": "permission denied"})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-1"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="电影/2025")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"],
+                         "/downloads/电影/2025/")
+
+    def test_create_task_keeps_root_for_dir_outside_root(self):
+        """根外绝对目录：保留根 id + 路径原样（不报错也不丢 id）。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-2"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="/vol1/media/剧集")
+        self.assertEqual(tid, "t-2")
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"],
+                         "/vol1/media/剧集")
+
+    def test_create_task_no_silent_task_when_root_unresolvable(self):
+        """目录表全挂、任何 id 都拿不到时显式报错——静默建 id 空的任务 =
+        永远排队中（0.1.27 回退直传已被用户实测证明不启动下载）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": []})
+            return httpx.Response(200, json={"task": {"id": "t-3"}})
+        core = self._mk(handler)
+        with self.assertRaises(BackendError):
+            core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                             "sp", directory="/vol1/media")
+
+    def test_create_task_empty_dir_needs_resolvable_root(self):
+        """无设置目录且下载根解析失败 → 显式报错
+        （回退两字段全空 = 任务永远排队中，静默建出来比报错更糟）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": []})
+            return httpx.Response(200, json={"task": {"id": "t-4"}})
+        core = self._mk(handler)
+        with self.assertRaises(BackendError):
+            core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                             "sp")
+
+    def test_create_task_engine_direct_fallback_when_unresolvable(self):
+        """本地引擎最后兜底（on_unresolvable="direct"）：目录表查询全挂时
+        回退 0.1.22 直传形状（id 空 + 路径原样）——引擎按路径自行落盘
+        （用户环境实测可用）；默认（云端）仍报错不建死任务。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(502, text="bad gateway")
+            if request.method == "GET" and path.endswith("/tasks"):
+                # 0.1.32 反查兜底会拉任务列表：无可反查条目 → 维持直传兜底
+                return httpx.Response(200, json={"tasks": []})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-5"}})
+        core = self._mk(handler)
+        tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                               "sp", directory="/vol1/media",
+                               on_unresolvable="direct")
+        self.assertEqual(tid, "t-5")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/vol1/media")
+
     def test_set_phase_and_delete(self):
         calls = []
 
@@ -219,6 +517,12 @@ class TestThunderEngine(unittest.TestCase):
             if path.endswith("/drive/v1/tasks"):
                 return httpx.Response(200, json={"tasks": [{
                     "params": {"target": "dev-space"}}]})
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/drive/v1/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads", "parent_id": "root-1",
+                     "params": {"RealPath": "/downloads/"}}]})
             if path.endswith("/drive/v1/resource/list"):
                 return httpx.Response(200, json={
                     "list": {"resources": [{"name": "f", "file_size": 1}]}})
@@ -234,6 +538,10 @@ class TestThunderEngine(unittest.TestCase):
         # pan-auth 头应携带从面板提取的 JWT
         task_req = seen["/webman/3rdparty/pan-xunlei-com/index.cgi/drive/v1/task"][0]
         self.assertEqual(task_req.headers.get("pan-auth"), "JWT-TOKEN-123")
+        # parent_folder_id/path 必须是解析出的真实下载目录（缺失任务不会开始下载）
+        body = json.loads(task_req.content)
+        self.assertEqual(body["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(body["params"]["parent_folder_path"], "/downloads/")
 
     def test_bad_panel(self):
         def handler(request):
@@ -281,6 +589,12 @@ class TestThunderCloudFlow(unittest.TestCase):
                     "refresh_token": "rt-1", "user_id": "u1"})
             if path.endswith("/user/me"):
                 return httpx.Response(200, json={"user_id": "u1"})
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/drive/v1/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "cdir-1", "name": "downloads", "parent_id": "root-1",
+                     "params": {"RealPath": "/downloads/"}}]})
             if path.endswith("/drive/v1/tasks"):
                 return httpx.Response(200, json={"tasks": [{
                     "params": {"target": "remote-1"}, "name": "runner"}]})
@@ -309,6 +623,10 @@ class TestThunderCloudFlow(unittest.TestCase):
         task_req = seen["https://api-pan.xunlei.com/drive/v1/task"][0]
         self.assertEqual(task_req.headers["authorization"], "Bearer at-1")
         self.assertEqual(task_req.headers["x-captcha-token"], "ct-1")
+        # parent_folder_id/path 必须是解析出的真实下载目录（缺失任务不会开始下载）
+        body = json.loads(task_req.content)
+        self.assertEqual(body["params"]["parent_folder_id"], "cdir-1")
+        self.assertEqual(body["params"]["parent_folder_path"], "/downloads/")
         # 令牌已持久化
         self.assertTrue(saved)
         self.assertEqual(saved[-1]["access_token"], "at-1")
@@ -533,6 +851,11 @@ class TestThunderCloudFixes(unittest.TestCase):
 
         def handler(request):
             if request.url.path.endswith("/tasks"):
+                if request.url.params.get("type") == "user#runner":
+                    # 设备发现（_target_of 在线校验）——不计入翻页序列
+                    return httpx.Response(200, json={"tasks": [
+                        {"id": "r1", "name": "dev",
+                         "params": {"target": "remote-1"}}]})
                 seen.append(str(request.url))
                 if not request.url.params.get("page_token", ""):
                     return httpx.Response(200, json={
@@ -933,6 +1256,628 @@ class TestReviewSms(unittest.TestCase):
         self.assertEqual(conf["creditkey"], "")
         self.assertEqual(conf["review_key"], "")
         self.assertEqual(conf["review_cookies"], {})
+
+
+class TestCloudDeviceApi(unittest.TestCase):
+    """云端设备专属 API（0.1.30）：api-pan 的 /drive/v1/files 只服务云盘空间，远程设备（user#runner 空间）的目录表/建目录/设备配置必须走 INNER_API 发现的设备专属域名。"""
+
+    def _tc(self, handler):
+        conf = {"login_name": "u", "password": "p", "device_id": "c" * 32,
+                "access_token": "at-1", "target": "remote-1"}
+        return ThunderCloud(_client(handler), conf)
+
+    def _mk(self, handler):
+        # 解析缓存是 DriveCore 基类机制，用基类实例直接验证
+        return DriveCore(_client(handler), "http://engine/drive/v1",
+                         lambda: {"h": "1"})
+
+    def test_relay_full_shape_and_no_apipan(self):
+        """目录表走设备 API 完整形状：plugin 凭据、
+        device_space=、filters 三条件、with=…HistoryDownloadPath、with_audit、
+        order=TYPE_DESC 全齐，且绝不打 api-pan /files。"""
+        seen, unexpected = {}, []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                seen["inner"] = dict(request.url.params)
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p1/"
+                            "?plugin_app_id=pid-1&plugin_app_token=ptok-1"})
+            if host == "relay.example" and path.endswith("/drive/v1/files") \
+                    and request.method == "GET":
+                seen["files_path"] = path
+                seen["files"] = dict(request.url.params)
+                seen["with_multi"] = request.url.params.get_list("with")
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/"}}]})
+            unexpected.append(f"{request.method} {host}{path}")
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        files = tc.core._folders("remote-1", "")
+        self.assertEqual([f["id"] for f in files], ["d1"])
+        self.assertEqual(unexpected, [])        # 未打 api-pan /files
+        self.assertEqual(seen["inner"], {"space": "remote-1"})
+        self.assertEqual(seen["files_path"], "/p1/drive/v1/files")
+        p = seen["files"]
+        self.assertEqual(p["space"], "remote-1")
+        self.assertEqual(p["device_space"], "")
+        self.assertEqual(p["parent_id"], "")
+        self.assertEqual(p["plugin_app_id"], "pid-1")
+        self.assertEqual(p["plugin_app_token"], "ptok-1")
+        self.assertEqual(p["with_audit"], "true")
+        self.assertEqual(p["order"], "TYPE_DESC")
+        self.assertEqual(p["page_token"], "")
+        self.assertEqual(seen["with_multi"],
+                         ["withCategoryDiskMountPath",
+                          "withCategoryHistoryDownloadPath"])
+        self.assertEqual(json.loads(p["filters"]), {
+            "trashed": {"eq": False},
+            "phase": {"eq": "PHASE_TYPE_COMPLETE"},
+            "kind": {"eq": "drive#folder"}})
+
+    def test_relay_links_variant_cached_and_slash_norm(self):
+        """INNER_API 的 links[].url 变体可解析；link 无尾斜杠时 base 自动补
+        （SDK ApiDomain+路径 是字符串拼接）；发现结果按 space 缓存。"""
+        calls, paths = [], []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                calls.append(1)
+                return httpx.Response(200, json={"links": [{
+                    "url": "https://relay.example/p2"
+                           "?plugin_app_id=pid-2&plugin_app_token=ptok-2"}]})
+            if host == "relay.example":
+                paths.append(path)
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        tc.core._folders("remote-1", "")
+        tc.core._folders("remote-1", "x")
+        self.assertEqual(len(calls), 1)          # 发现缓存：只查一次 INNER_API
+        self.assertEqual(paths, ["/p2/drive/v1/files"] * 2)
+
+    def test_relay_failure_refreshes_discovery(self):
+        """设备 API 首轮全挂 → 强制重发现重试一轮（凭据过期自愈），仍失败才回退。"""
+        state = {"inner": 0, "files": 0}
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                state["inner"] += 1
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                state["files"] += 1
+                if state["files"] <= 2:          # 第一轮两个形状都 502
+                    return httpx.Response(502, text="bad gateway")
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        files = tc.core._folders("remote-1", "")
+        self.assertEqual([f["id"] for f in files], ["d1"])
+        self.assertEqual(state["inner"], 2)      # 第二轮重新发现
+        self.assertEqual(state["files"], 3)      # 2 失败形状 + 1 重试成功
+
+    def test_inner_api_fails_falls_back_apipan(self):
+        """INNER_API 不可达/无 link → 回退 api-pan 形状阶梯（兼容未来变化）。"""
+        seen = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={})      # 无 link
+            if host == "api-pan.xunlei.com" and path.endswith("/drive/v1/files") \
+                    and request.method == "GET":
+                seen.append(dict(request.url.params))
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        files = tc.core._folders("remote-1", "")
+        self.assertEqual([f["id"] for f in files], ["d1"])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["space"], "remote-1")
+
+    def test_relay_and_apipan_all_fail_aggregate_error(self):
+        """两路全挂 → 聚合错误：设备API 发现错误 + api-pan 各形状错误都保留。
+        0.1.31：api-pan 回退阶梯裁剪为标准/极简 2 形状。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError) as ctx:
+            tc.core._folders("remote-1", "")
+        msg = str(ctx.exception)
+        self.assertIn("设备API发现", msg)
+        self.assertIn("api-pan", msg)
+        self.assertIn("502", msg)
+        for label in ("标准形状", "极简形状"):
+            self.assertIn(label, msg)
+
+    def test_aggregate_merges_same_cause_across_layers(self):
+        """0.1.34 跨层同因合并：设备API 发现与 api-pan 回退阶梯（标准/极简
+        2 形状，0.1.31 裁剪）同一错误时只展开一次（各层标签全保留）。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError) as ctx:
+            tc.core._folders("remote-1", "")
+        msg = str(ctx.exception)
+        self.assertIn("3 处同因", msg)
+        self.assertIn("设备API发现", msg)
+        self.assertIn("标准形状", msg)
+        self.assertIn("极简形状", msg)
+        self.assertEqual(msg.count("迅雷接口响应异常（HTTP 502）"), 1)
+
+    def test_relay_shapes_all_fail_no_apipan_fallback(self):
+        """0.1.31：设备 API 发现成功但 relay 形状全挂 → 直接抛聚合错误，
+        不跑 api-pan 阶梯（api-pan 对设备空间不可用，回退纯属空耗预算）。"""
+        apipan_hits = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                return httpx.Response(502, text="relay down")
+            if host == "api-pan.xunlei.com":
+                apipan_hits.append(path)
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError) as ctx:
+            tc.core._folders("remote-1", "")
+        self.assertIn("未回退 api-pan", str(ctx.exception))
+        self.assertIn("relay down", str(ctx.exception))
+        self.assertEqual(apipan_hits, [])        # api-pan 一次都没打
+
+    def test_resolve_cache_hits_within_ttl(self):
+        """0.1.31：同 (base_url, space, directory) 解析结果 120s 内缓存——
+        批量派发同目录只解析一次（此前每条链接重跑整条目录链）。"""
+        hits = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                hits.append(dict(request.url.params))
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if path.endswith("/files") and request.method == "POST":
+                return httpx.Response(200, json={"file": {"id": "made-x"}})
+            return httpx.Response(200, json={"task": {"id": "t-x"}})
+
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "电影"),
+                         ("made-x", "/downloads/电影/"))
+        n_first = len(hits)
+        # 第二次同参数解析：命中缓存，目录表不再被查
+        self.assertEqual(core.resolve_dest_folder("sp", "电影"),
+                         ("made-x", "/downloads/电影/"))
+        self.assertEqual(len(hits), n_first)
+
+    def test_resolve_cache_isolated_by_client(self):
+        """缓存按 client 身份隔离：每个请求新建 DownloadManager/client，
+        不同 client 不共享缓存（防跨请求串味）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "only", "name": "x", "params": {"RealPath": "/x/"}}]})
+            return httpx.Response(200, json={"task": {"id": "t-x"}})
+
+        core1 = self._mk(handler)
+        core2 = self._mk(handler)              # 不同 client
+        core1.resolve_dest_folder("sp", "")
+        core2.resolve_dest_folder("sp", "")    # 不该命中 core1 的缓存
+        self.assertIsNot(core1.client, core2.client)
+
+    def test_resolve_end_to_end_via_relay_walk_and_create(self):
+        """端到端：relay device/config 提示 + 目录表逐段解析 + 缺级 relay 自动
+        建目录（带 plugin 凭据），全程不打 api-pan 目录接口。"""
+        made, config_hits, unexpected = [], [], []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=pid&plugin_app_token=ptok"})
+            if host == "relay.example" and path.endswith("/device/config"):
+                config_hits.append(host)
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if host == "relay.example" and path.endswith("/drive/v1/files") \
+                    and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "dir-1", "name": "downloads", "kind": "drive#folder",
+                         "params": {"RealPath": "/downloads/"}}]})
+                return httpx.Response(200, json={"files": [
+                    {"id": "sub-1", "name": "电影", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/电影/"}}]})
+            if host == "relay.example" and path.endswith("/drive/v1/files") \
+                    and request.method == "POST":
+                made.append({"body": json.loads(request.content),
+                             "params": dict(request.url.params)})
+                return httpx.Response(200, json={"file": {"id": "made-1"}})
+            unexpected.append(f"{request.method} {host}{path}")
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        self.assertEqual(tc.core.resolve_dest_folder("remote-1", "电影/2025"),
+                         ("made-1", "/downloads/电影/2025/"))
+        self.assertEqual(config_hits, ["relay.example"])   # 提示走设备 API
+        self.assertEqual(unexpected, [])
+        self.assertEqual(len(made), 1)
+        self.assertEqual(made[0]["body"], {
+            "parent_id": "sub-1", "name": "2025",
+            "space": "remote-1", "kind": "drive#folder"})
+        self.assertEqual(made[0]["params"]["plugin_app_id"], "pid")
+        self.assertEqual(made[0]["params"]["plugin_app_token"], "ptok")
+
+    def test_make_folder_relay_post_fails_raises_no_apipan(self):
+        """0.1.31：发现成功但 relay 建目录失败 → 直接抛错，不回退 api-pan
+        （api-pan 对设备空间建目录同样 502，回退纯属浪费响应预算）。"""
+        seen = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                return httpx.Response(200, json={"error_code": 403,
+                                                 "error": "denied"})
+            if host == "api-pan.xunlei.com" and request.method == "POST":
+                seen.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "ap-1"}})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError):
+            tc.core._make_folder("remote-1", "p1", "电影")
+        self.assertEqual(seen, [])           # api-pan 未被触碰
+
+    def test_make_folder_falls_back_apipan_when_discovery_fails(self):
+        """设备 API 发现失败（INNER_API 不可达）→ 建目录回退 api-pan。"""
+        seen = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(502, text="bad gateway")
+            if host == "api-pan.xunlei.com" and request.method == "POST":
+                seen.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "ap-1"}})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        self.assertEqual(tc.core._make_folder("remote-1", "p1", "电影"),
+                         {"id": "ap-1", "name": "电影", "params": {"RealPath": ""}})
+        self.assertEqual(seen, [{"parent_id": "p1", "name": "电影",
+                                 "space": "remote-1", "kind": "drive#folder"}])
+
+    def test_create_task_still_posts_apipan_after_relay_resolve(self):
+        """回归：目录解析走设备 API，但建任务仍 POST api-pan /drive/v1/task，parent_folder_id 来自 relay 解析结果。"""
+        captured = {}
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if host == "api-pan.xunlei.com" and path.endswith("/drive/v1/task") \
+                    and request.method == "POST":
+                captured["host"], captured["path"] = host, path
+                captured.update(json.loads(request.content))
+                return httpx.Response(200, json={"task": {"id": "cloud-9"}})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        tid = tc.core.create_task("https://x/a",
+                                  ParsedResource(name="a", size=1), "remote-1")
+        self.assertEqual(tid, "cloud-9")
+        self.assertEqual(captured["host"], "api-pan.xunlei.com")
+        self.assertEqual(captured["path"], "/drive/v1/task")
+        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
+
+
+class TestDeviceTimeoutAndHarvest(unittest.TestCase):
+    """0.1.32：error_code=2「远程调用失败」=迅雷服务端调用设备超时（社区同报案例）。GET 幂等重试、错误透明化（指引+脱敏证据）、
+    历史任务反查兜底保根 id。"""
+
+    TIMEOUT_BODY = {
+        "error": "external_unknown_err", "error_code": 2,
+        "error_description": "远程调用失败",
+        "error_details": [
+            {"@type": "type.googleapis.com/google.rpc.DebugInfo",
+             "detail": ('Get "http://k8s.xsl/drive-reverse-proxy/v1/proxy/'
+                        '584201392/7abd3182d399f7bdda199550d8babede/x": '
+                        'net/http: request canceled (Client.Timeout exceeded '
+                        'while awaiting headers)')},
+            {"@type": "type.googleapis.com/google.rpc.LocalizedMessage",
+             "locale": "zh-cn", "message": "远程调用失败"}]}
+
+    def _tc(self, handler):
+        conf = {"login_name": "u", "password": "p", "device_id": "c" * 32,
+                "access_token": "at-1", "target": "remote-1"}
+        return ThunderCloud(_client(handler), conf)
+
+    @staticmethod
+    def _core(handler):
+        return DriveCore(_client(handler), "http://engine/drive/v1",
+                         lambda: {"h": "1"})
+
+    def test_get_retries_on_device_timeout_then_succeeds(self):
+        """GET 幂等重试：前 2 次设备超时、第 3 次成功（瞬态自愈）。"""
+        calls = []
+
+        def handler(request):
+            if request.url.path.endswith("/apps/INNER_API"):
+                calls.append(1)
+                if len(calls) < 3:
+                    return httpx.Response(200, json=self.TIMEOUT_BODY)
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            api = tc.core._relay_api("remote-1")
+        self.assertEqual(api["base"], "https://relay.example/p/")
+        self.assertEqual(len(calls), 3)
+
+    def test_post_not_retried_on_device_timeout(self):
+        """POST（建目录）非幂等不重试；报错带可操作指引。"""
+        posts = []
+
+        def handler(request):
+            if request.url.path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if request.method == "POST":
+                posts.append(1)
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            return httpx.Response(200, json={"files": []})
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError) as ctx:
+                tc.core._make_folder("remote-1", "p0", "sub")
+        self.assertEqual(len(posts), 1)
+        msg = str(ctx.exception)
+        self.assertIn("设备端响应超时", msg)
+        self.assertIn("error_code=2", msg)
+
+    def test_device_timeout_message_guidance_and_masked_hint(self):
+        """错误文案含人读指引 + 脱敏证据（哈希/uid 掩码，链路形态保留）。
+        0.1.34：占位符改 [hash]/[id]——尖括号在 UI innerHTML 里会被当
+        标签吞掉（0.1.33 实测显示成 proxy///）。"""
+        def handler(request):
+            return httpx.Response(200, json=self.TIMEOUT_BODY)
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError) as ctx:
+                tc.core._relay_api("remote-1", refresh=True)
+        msg = str(ctx.exception)
+        self.assertIn("设备端响应超时", msg)
+        self.assertIn("迅雷远程插件", msg)
+        self.assertIn("证据", msg)
+        self.assertIn("[hash]", msg)
+        self.assertIn("[id]", msg)
+        self.assertNotIn("7abd3182d399f7bdda199550d8babede", msg)
+        self.assertNotIn("584201392", msg)
+
+    def test_harvest_root_prefers_entry_with_path(self):
+        """历史任务反查：优先采用带 parent_folder_path 的条目。"""
+        def handler(request):
+            if request.url.path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t1", "params": {"parent_folder_id": "f-no-path"}},
+                    {"name": "t2", "params": {"parent_folder_id": "f-2",
+                                              "parent_folder_path": "/downloads/"}},
+                    {"name": "runner", "params": {"target": "remote-1"}}]})
+            return httpx.Response(200, json={})
+
+        self.assertEqual(self._core(handler)._harvest_root("remote-1"),
+                         ("f-2", "/downloads/"))
+
+    def test_harvest_root_none_without_params(self):
+        """无历史任务带 parent_folder_id → None（不误用 target 等杂参）。"""
+        def handler(request):
+            return httpx.Response(200, json={"tasks": [
+                {"name": "r", "params": {"target": "remote-1"}}]})
+
+        self.assertIsNone(self._core(handler)._harvest_root("remote-1"))
+
+    def test_resolve_uses_harvested_root_when_folders_unavailable(self):
+        """目录表全挂（错误体）时：下载根解析反查历史任务兜底，
+        空目录直接返回反查到的 (id, path)。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            if path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t", "params": {
+                        "parent_folder_id": "f-h",
+                        "parent_folder_path": "/downloads/"}}]})
+            return httpx.Response(200, json={})
+
+        self.assertEqual(self._core(handler).resolve_dest_folder("remote-1", ""),
+                         ("f-h", "/downloads/"))
+
+    def test_resolve_harvested_root_degrades_subdir_to_path(self):
+        """反查兜底下子目录仍不可解析（插件没恢复）→ 保留根 id + 完整目标
+        路径交引擎尽力落盘（阶梯降级铁律）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            if path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t", "params": {
+                        "parent_folder_id": "f-h",
+                        "parent_folder_path": "/downloads/"}}]})
+            return httpx.Response(200, json={})
+
+        pid, path = self._core(handler).resolve_dest_folder("remote-1", "movies")
+        self.assertEqual(pid, "f-h")
+        self.assertEqual(path, "/downloads/movies/")
+
+    # -------------------------------------------- 0.1.33 重试治理 / 负缓存
+
+    def test_retries_zero_single_shot_surfaces_error(self):
+        """重试次数可治理（0.1.33）：_device_timeout_retries=0 时单次即错
+        ——诊断探针期靠它让真实错误透出，不被重试链撑爆窗口。"""
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json=self.TIMEOUT_BODY)
+
+        tc = self._tc(handler)
+        tc.core._device_timeout_retries = 0
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError) as ctx:
+                tc.core._request("GET",
+                                 "https://api-pan.xunlei.com/drive/v1/x")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("设备端响应超时", str(ctx.exception))
+
+    def test_deadline_passed_blocks_retry(self):
+        """deadline（0.1.33）：预算耗尽后不再重试设备超时——重试链不得
+        超出解析总预算（0.1.32 诊断窗被撑爆的原因）。"""
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json=self.TIMEOUT_BODY)
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError):
+                tc.core._request("GET",
+                                 "https://api-pan.xunlei.com/drive/v1/x",
+                                 deadline=0)      # monotonic 恒 >0，预算已尽
+        self.assertEqual(len(calls), 1)
+
+    def test_resolve_negative_cache_short_circuits(self):
+        """负缓存（0.1.33）：30s 冷却内同键解析失败直接短路报错——
+        批量派发每条不再重烧整条失败链。"""
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            if request.url.path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            return httpx.Response(200, json={"tasks": []})
+
+        core = self._core(handler)
+        with self.assertRaises(BackendError):
+            core.resolve_dest_folder("remote-1", "")
+        n_first = len(calls)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("remote-1", "")
+        self.assertEqual(len(calls), n_first)      # 命中负缓存，未再打网络
+        self.assertIn("30s 内已失败过", str(ctx.exception))
+        self.assertIn("稍后自动重试", str(ctx.exception))
+
+    def test_resolve_negative_cache_recovers_after_ttl(self):
+        """负缓存成功即清除：冷却过期后解析成功，失败记录不再残留。"""
+        state = {"fail": True}
+
+        def handler(request):
+            if request.url.path.endswith("/files"):
+                if state["fail"]:
+                    return httpx.Response(200, json=self.TIMEOUT_BODY)
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/"}}]})
+            return httpx.Response(200, json={"tasks": []})
+
+        core = self._core(handler)
+        with self.assertRaises(BackendError):
+            core.resolve_dest_folder("remote-1", "")
+        key = ("http://engine/drive/v1", "remote-1", "")
+        self.assertIn(key, drive_core._resolve_neg)
+        # 手动把负缓存记录改旧（模拟 30s 冷却过期），恢复成功路径
+        drive_core._resolve_neg[key] = (
+            time.monotonic() - 31, "旧错误", core.client)
+        state["fail"] = False
+        self.assertEqual(core.resolve_dest_folder("remote-1", ""),
+                         ("d1", "/downloads/"))
+        self.assertNotIn(key, drive_core._resolve_neg)
+
+    def test_resolve_harvest_none_error_includes_guidance(self):
+        """反查无米（0.1.33）：错误附可操作指引——官方 App 建一个任务即带
+        parent_folder_id，反查即恢复（0.1.32 实测设备任务 0 条无从反查）。"""
+        def handler(request):
+            if request.url.path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            return httpx.Response(200, json={"tasks": [
+                {"name": "r", "params": {"target": "remote-1"}}]})
+
+        core = self._core(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("remote-1", "")
+        msg = str(ctx.exception)
+        self.assertIn("历史任务反查", msg)
+        self.assertIn("迅雷 App", msg)
+        self.assertIn("parent_folder_id", msg)
+
+
+class TestCredentialHygiene(unittest.TestCase):
+    """凭据防泄露：迅雷协议常量可 env 覆盖；对外配置统一掩码且不动原对象。"""
+
+    def test_client_secret_env_override(self):
+        import importlib
+        from unittest import mock
+        from backends import thunder_cloud
+        with mock.patch.dict("os.environ", {"XL_CLIENT_SECRET": "env-override"}):
+            importlib.reload(thunder_cloud)
+            self.assertEqual(thunder_cloud.CLIENT_SECRET, "env-override")
+        importlib.reload(thunder_cloud)             # 恢复默认值
+
+    def test_redacted_masks_update_token(self):
+        from config import redacted
+        cfg = {"update": {"sources": [
+            {"name": "repobox", "type": "repobox", "base_url": "https://x",
+             "repo": "r", "token": "rbx_secretvalue"}]}}
+        out = redacted(cfg)
+        self.assertEqual(out["update"]["sources"][0]["token"], "******")
+        self.assertEqual(cfg["update"]["sources"][0]["token"], "rbx_secretvalue")
 
 
 if __name__ == "__main__":

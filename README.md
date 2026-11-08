@@ -57,7 +57,7 @@ fnmedia-dl/
 
 ```bash
 # 在 Linux（fnOS 或构建机）上打包
-bash packaging/fpk/build.sh          # 产出 dist/fnmedia-dl-<版本>.fpk
+bash packaging/fpk/build.sh          # 产出 dist/fnmedia-dl-main-v<版本>.fpk
 ```
 
 把 `.fpk` 上传到 fnOS 应用中心安装；安装向导需勾选同意免责声明。
@@ -78,6 +78,106 @@ sudo bash deploy/install.sh                 # 渲染并启动 systemd 服务
 cd app && python serve.py --http 127.0.0.1:8787
 # 打开 http://127.0.0.1:8787
 ```
+
+## 更新源配置（国内镜像加速）
+
+GitHub Releases 在国内访问慢/超时，插件支持**多更新源**：默认优先走自建
+仓库（`your-repo.example.com`，国内直链），失败自动回退 GitHub 官方源并**明确提示**
+（检查与下载均在进度/状态区显示「已切换备用源」及原因，更新流程自动继续，
+对用户透明）。
+
+### 切换 / 配置更新源
+
+在 `state/config.json` 的 `update.sources` 数组里配置，**按数组顺序依次尝试**，
+第一个可用的源为准：
+
+```json
+"update": {
+  "sources": [
+    {"name": "repobox", "type": "repobox",
+     "base_url": "https://your-repo.example.com",
+     "repo": "fnmedia-dl", "token": ""},
+    {"name": "github", "type": "github", "repo": "maglcal/fnmedia-dl"}
+  ],
+  "timeout": 15,
+  "retries": 2
+}
+```
+
+- `type=repobox`：自建仓库（your-repo.example.com）。raw 清单/资产**公开可读，无需
+  token**（`token` 仅同步写入时需要，见下「凭据安全」）；`base_url` 留空自动
+  跳过（即只用官方源）。
+- `type=github`：GitHub 官方 Releases 备用（自建源不可用时自动切换）。
+- 想只用自建源：删掉 github 条目即可。
+- 想把镜像换成别的地址：改 `base_url` 即可（需按 `latest.json` 清单协议提供）。
+- `timeout`（单请求超时秒）/`retries`（单源请求重试次数）按需调整。
+
+### 回退与重试策略
+
+- **检查更新**：逐源按序尝试，每源内部重试 `retries` 次（间隔递增）；单源失败
+  自动换下一个源，全部失败才报错（错误里含逐源原因）。
+- **下载安装包**：下载候选按「镜像源 → 官方源」排序，每个候选重试 2 次
+  （间隔递增）；候选内失败或**大小/SHA256 校验不符**自动换下一个候选，
+  全部失败才报错（含逐候选原因）。
+- **安装失败**：替换前整份备份到 `repo/.update-backup/`，任一步失败自动回滚
+  到更新前版本，不会把系统留在半更新状态。
+- **切换透明提示**：检查时若首选源不可用而使用备用源，结果里带 `notice`
+  说明（哪路源、什么原因、已切换到哪），界面黄字展示；下载换候选时进度
+  区同样提示「自动切换备用源继续下载」。更新流程自动继续，无需人工干预。
+
+### 凭据安全（防泄露约定）
+
+- **令牌不进源码/安装包**：自建仓库 raw 公开可读，检查/下载无需 token；
+  同步写入用的 `rbx_` 令牌只放环境变量（本地手动同步）或 GitHub Secrets
+  （Actions 自动同步），**不写进 `config.py`/默认配置/公开 fpk**。
+- **运行时凭据**（迅雷登录 password/access_token/refresh_token、aria2 secret、
+  各源 token）只存 `state/config.json`（chmod 600，`.gitignore` 排除
+  `state/`，不入版本控制）；对外 API 经 `redacted()` 统一掩码为 `******`。
+- **日志/错误文案脱敏**：URL 中 `token/secret/key/password/auth` 参数值在
+  错误与进度文案中自动掩码；`state/dispatch.log` 诊断日志不落凭据。
+- **迅雷客户端协议常量**（CLIENT_ID/CLIENT_SECRET/APP_KEY）提取自官方客户端，
+  为公共应用参数（所有第三方实现共用，非用户私有凭据），支持
+  `XL_CLIENT_ID`/`XL_CLIENT_SECRET`/`XL_APP_KEY` 环境变量覆盖。
+- **历史泄露处置**：令牌一旦出现在聊天/日志等渠道，应立即在服务端**重置
+  令牌**（旧令牌即作废），不要依赖事后删除记录。
+
+### 镜像自动同步（GitHub → RepoBox）
+
+仓库自带 `.github/workflows/mirror-repobox.yml`：release 发布时立即同步，
+每 6 小时兜底校验（幂等，已同步自动跳过），也可手动触发。配置 3 个
+Repository Secrets 即可启用：
+
+| Secret | 说明 |
+|---|---|
+| `REPOBOX_URL` | RepoBox 站点地址（如 `https://repo.example.com`） |
+| `REPOBOX_TOKEN` | API 令牌 `rbx_xxx`（RepoBox 网页「令牌」页创建） |
+| `REPOBOX_REPO` | 镜像仓库名（可省，默认 `fnmedia-dl`，不存在自动创建） |
+
+同步内容：发行资产（`.fpk`/`.sha256`）按 `releases/{tag}/` 布局上传（逐文件
+回读校验），并生成 `latest.json` 清单（version/tag/资产大小/SHA256），供插件
+多源检查消费。手动同步：
+
+```bash
+REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag main-vX.Y.Z] [--force]
+```
+
+### 发布命名规则（main-vX.Y.Z）
+
+从 `main-v0.1.35` 起，发布标识统一 **`main-vX.Y.Z`**（`main` 之后跟版本号，
+如 `main-v0.1.35`）：
+
+- **git tag / GitHub Release 标签**：`main-vX.Y.Z`；
+- **fpk 资产文件名**：`fnmedia-dl-main-vX.Y.Z.fpk`（配套 `.fpk.sha256`）；
+- **版本号本体**（VERSION 文件、manifest version 字段、更新比较）：`vX.Y.Z` /
+  纯 `X.Y.Z`，**不带 `main-` 前缀**——fnOS 升级比较与插件内版本比较只认数字三段。
+
+解析端（`app/updatesrc.py` 的 `strip_ver`，updater/同步脚本共用同一规则）剥
+`main-v`/`v` 前缀取纯版本，旧格式 `v0.1.x` tag 兼容可解析；历史 tag 为旧命名，
+不再新增。
+
+版本号**延续主线往后递增**（不独立编号、不重置、不跳号）：小修小补递增第三位
+（版本号 `v0.1.35` → `v0.1.36` → ……，发布标识对应 `main-v0.1.36`），
+大内容更新才升第二位（`v0.2.0`），首个正式大版 `v1.0.0`。
 
 ## 通道配置
 
@@ -164,14 +264,26 @@ services:
 隔离：任一迅雷通道失效时自动降级到 aria2，不影响基本可用性。ed2k 协议需要
 amule 等重型组件，暂不支持派发。
 
+**保存目录解析**：迅雷引擎建任务时必须给出下载根目录对应的
+`parent_folder_id`（缺省任务只会停在「排队中」不会开始下载）。插件会按
+`/device/config` 的下载路径 → 目录表 realPath 匹配 → 顶层唯一目录 → 首个
+顶层目录的顺序自动识别下载根。目录表查询按参数形状阶梯自动适配不同网关
+（云端 api-pan 只认标准形状，本地引擎认 扩展/空间形状，逐形状重试）；
+「保存目录」填根下的相对路径（如 `movies/2025`）即可，缺级目录会自动创建。
+目录解析或建目录失败时（目录在下载根之外、引擎账号对该目录无读写权等）
+不会报错，按阶梯降级保留下载根 id 并把目录路径原样交给引擎落盘；本地引擎
+在目录表彻底查不到时最后兜底回退直传形状（引擎按路径自行落盘）。诊断信息
+写入 `state/dispatch.log`。
+
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v    # 112 个用例，全程无网络
+python -m unittest discover -s tests -v    # 244 个用例，全程无网络
 ```
 
 覆盖：链接解析（magnet/thunder/ed2k/种子）、drive/v1 请求形状、云端登录链与
-签名链、令牌自动续期、aria2 JSON-RPC、派发降级、统一任务视图、API 层。
+签名链、令牌自动续期、下载目录/parent_folder 解析、aria2 JSON-RPC、派发降级、
+统一任务视图、API 层。
 
 ## License
 

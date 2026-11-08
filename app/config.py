@@ -39,6 +39,20 @@ DEFAULT_CONFIG: dict = {
         "refresh_token": "",
         "user_id": "",
     },
+    # 在线更新源：按序尝试，第一个可用为准；下载失败自动换下一个源。
+    # repobox = 自建仓库（your-repo.example.com，raw 公开可读无需 token；token 仅同步写入用，
+    #           勿写进公开配置——检查/下载是只读操作）
+    # github = 官方源（备用，自建源连不上/超时/报错时自动切换并提示）
+    "update": {
+        "sources": [
+            {"name": "repobox", "type": "repobox",
+             "base_url": "https://your-repo.example.com", "repo": "fnmedia-dl", "token": ""},
+            {"name": "github", "type": "github",
+             "repo": "maglcal/fnmedia-dl"},
+        ],
+        "timeout": 15,                  # 单次请求超时（秒）
+        "retries": 2,                   # 单个源的请求尝试次数
+    },
 }
 
 _lock = threading.Lock()
@@ -85,6 +99,9 @@ def redacted(cfg: dict) -> dict:
             tc[key] = "******"
     if out.get("aria2", {}).get("secret"):
         out["aria2"]["secret"] = "******"
+    for s in out.get("update", {}).get("sources", []) or []:
+        if isinstance(s, dict) and s.get("token"):
+            s["token"] = "******"
     return out
 
 

@@ -128,6 +128,56 @@ class TestParseText(unittest.TestCase):
         self.assertEqual(got[1].kind, "https")
         self.assertEqual(got[2].kind, "ed2k")
 
+    def test_no_split_on_comma_in_url(self):
+        """直链查询参数带逗号不得被拆断（回归）。"""
+        got = links.parse_text("https://example.com/dl/f.iso?name=a,b&x=1")
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].ok)
+        self.assertEqual(got[0].url, "https://example.com/dl/f.iso?name=a,b&x=1")
+
+    def test_no_split_on_dunhao_in_magnet_dn(self):
+        """磁力 dn 含裸顿号不得被拆断（回归）。"""
+        url = f"magnet:?xt=urn:btih:{self.HEX}&dn=电影、电视剧合集"
+        got = links.parse_text(url)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].ok)
+        self.assertEqual(got[0].url, url)
+        self.assertEqual(got[0].display, "电影、电视剧合集")
+
+    def test_split_multiple_schemes_in_one_line(self):
+        """一行挤多条：按协议前缀切，剥掉段尾分隔符。"""
+        got = links.parse_text(
+            f"https://example.com/a.iso,magnet:?xt=urn:btih:{self.HEX}")
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0].url, "https://example.com/a.iso")
+        self.assertEqual(got[1].kind, "magnet")
+
+    def test_split_strips_numbering_prefix(self):
+        """行首序号/说明前缀丢弃，保留协议段。"""
+        got = links.parse_text(f"1、magnet:?xt=urn:btih:{self.HEX}")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].url, f"magnet:?xt=urn:btih:{self.HEX}")
+
+    def test_split_fallback_without_scheme(self):
+        """无协议前缀的行仍按分隔符兜底拆。"""
+        got = links.parse_text("abc，def xyz")
+        self.assertEqual([g.url for g in got], ["abc", "def", "xyz"])
+
+    def test_bad_link_not_dispatchable(self):
+        """解析失败的链接不可派发（回归：残缺链接曾被照常派发）。"""
+        for bad in (f"magnet:?xt=urn:btih:{'z' * 40}",   # 哈希格式非法
+                    "magnet:?dn=x",                        # 缺哈希
+                    "foobar://x"):                         # 未知协议
+            infos = links.parse_text(bad)
+            self.assertEqual(len(infos), 1, bad)
+            self.assertFalse(infos[0].ok, bad)
+            self.assertFalse(infos[0].dispatchable, bad)
+
+    def test_ed2k_ok_but_not_dispatchable(self):
+        info = links.parse_line("ed2k://|file|d.mkv|1|aa|/")
+        self.assertTrue(info.ok)
+        self.assertFalse(info.dispatchable)
+
     def test_empty(self):
         self.assertEqual(links.parse_text("  \n "), [])
 

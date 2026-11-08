@@ -35,6 +35,11 @@ class LinkInfo:
     reason: str = ""          # 不可用原因
     meta: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # 解析不出结构的链接一律不可派发（防残缺/坏链接流到下载引擎）
+        if not self.ok:
+            self.dispatchable = False
+
     def to_dict(self) -> dict:
         return {
             "kind": self.kind,
@@ -83,6 +88,7 @@ def parse_magnet(url: str) -> LinkInfo:
             break
     if not infohash:
         info.ok = False
+        info.dispatchable = False
         info.reason = "磁力链接缺少有效的 xt=urn:btih 信息哈希"
         return info
 
@@ -92,6 +98,7 @@ def parse_magnet(url: str) -> LinkInfo:
         algo, digest = "base32", infohash.upper()
     else:
         info.ok = False
+        info.dispatchable = False
         info.reason = "信息哈希格式不正确（应为 40 位 hex 或 32 位 base32）"
         return info
 
@@ -278,11 +285,37 @@ def parse_line(line: str) -> LinkInfo:
                     reason="无法识别的链接协议（支持 magnet/thunder/http/ftp/ed2k/.torrent）")
 
 
-def parse_text(text: str) -> list[LinkInfo]:
-    """批量解析：按空白/逗号/分号/顿号拆分，逐条解析。"""
-    results: list[LinkInfo] = []
-    for chunk in re.split(r"[\s,;，；、]+", text or ""):
-        if not chunk.strip():
+_SCHEME_RE = re.compile(
+    r"(?:magnet:|thunder://|ed2k://|https?://|ftp://)", re.I)
+
+
+def split_links(text: str) -> list[str]:
+    """批量文本切条：协议感知，防止误拆合法 URL。
+
+    - 优先按行拆；行内出现多个协议前缀（多条挤一行）时按协议前缀切；
+    - 整行不含协议前缀时才按空白/逗号/分号/顿号兜底拆；
+    - 不再对逗号/顿号盲拆：它们是合法 URL 字符（查询参数、
+      未编码中文文件名），盲拆会把链接截残。"""
+    chunks: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
             continue
-        results.append(parse_line(chunk))
-    return results
+        marks = list(_SCHEME_RE.finditer(line))
+        if marks:
+            for i, m in enumerate(marks):
+                end = marks[i + 1].start() if i + 1 < len(marks) else len(line)
+                # 段尾剥离挤在两条之间的分隔符（如 "https://a，ed2k://b"）
+                seg = line[m.start():end].strip().rstrip(",;，；、").strip()
+                if seg:
+                    chunks.append(seg)
+        else:
+            for seg in re.split(r"[\s,;，；、]+", line):
+                if seg.strip():
+                    chunks.append(seg.strip())
+    return chunks
+
+
+def parse_text(text: str) -> list[LinkInfo]:
+    """批量解析：协议感知切条后逐条解析（见 split_links）。"""
+    return [parse_line(chunk) for chunk in split_links(text)]

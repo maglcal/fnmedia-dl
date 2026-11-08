@@ -158,5 +158,72 @@ class TestRelay(unittest.TestCase):
                             upstream.sent[:60])
 
 
+class TimeoutSocket(FakeSocket):
+    """上游读超时：recv 抛 TimeoutError（socket.timeout 的内置别名）。"""
+
+    def recv(self, n: int) -> bytes:
+        raise TimeoutError("timed out")
+
+
+class RefusedSocket(FakeSocket):
+    """上游连接被拒：connect 抛 OSError。"""
+
+    def connect(self, addr) -> None:
+        raise ConnectionRefusedError("connection refused")
+
+
+class SilentSocket(FakeSocket):
+    """上游连接即断：recv 立刻回空字节，一个响应字节都没有。"""
+
+    def recv(self, n: int) -> bytes:
+        return b""
+
+
+class TestExplicitErrors(unittest.TestCase):
+    """0.1.31：中继层错误显式回 502/504 JSON——原实现超时/断连时
+    静默关连接（except OSError: pass），桌面网关只能给浏览器回 502 白页，
+    用户只见「派发失败 提示502」无线索（0.1.31 确认的直接原因）。"""
+
+    def test_upstream_timeout_replies_504_json(self):
+        client = FakeSocket([_req("POST", PREFIX + "/api/tasks", b"{}")])
+        _run_handle(client, TimeoutSocket())
+        self.assertIn(b"HTTP/1.1 504", client.sent)
+        self.assertIn(b"application/json", client.sent)
+        self.assertIn("上游响应超时".encode("utf-8"), client.sent)
+
+    def test_connect_refused_replies_502_json(self):
+        client = FakeSocket([_req("GET", PREFIX + "/api/tasks")])
+        _run_handle(client, RefusedSocket())
+        self.assertIn(b"HTTP/1.1 502", client.sent)
+        self.assertIn(b"application/json", client.sent)
+        self.assertIn("上游服务未就绪".encode("utf-8"), client.sent)
+
+    def test_zero_byte_response_replies_502_json(self):
+        """上游连接即断（0 字节响应）也必须显式回 JSON，不许静默收尾。"""
+        client = FakeSocket([_req("GET", PREFIX + "/api/tasks")])
+        _run_handle(client, SilentSocket())
+        self.assertIn(b"HTTP/1.1 502", client.sent)
+        self.assertIn("上游未返回任何响应".encode("utf-8"), client.sent)
+
+    def test_partial_response_not_duplicated(self):
+        """已回传部分响应后超时：不能补第二份响应（会拼成非法报文）。"""
+        class PartialThenTimeout(FakeSocket):
+            def __init__(self):
+                super().__init__([b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nxx"])
+                self._n = 0
+
+            def recv(self, n: int) -> bytes:
+                self._n += 1
+                if self._n == 1:
+                    return self._chunks.pop(0)
+                raise TimeoutError("timed out")
+
+        client = FakeSocket([_req("GET", PREFIX + "/api/tasks")])
+        _run_handle(client, PartialThenTimeout())
+        self.assertIn(b"HTTP/1.1 200 OK", client.sent)
+        self.assertNotIn(b"504", client.sent)
+        self.assertEqual(client.sent.count(b"HTTP/1.1"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

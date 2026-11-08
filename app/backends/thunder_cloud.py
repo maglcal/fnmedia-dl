@@ -10,6 +10,7 @@
   换令牌   POST https://xluser-ssl.xunlei.com/v1/auth/signin/token
   刷令牌   POST https://xluser-ssl.xunlei.com/v1/auth/token
   业务 API https://api-pan.xunlei.com/drive/v1/*（与本地引擎同构）
+  设备专属 API GET /drive/v1/apps/INNER_API?space=<target> 发现中继域名，远程设备的目录表/建目录/设备配置走该域名（云端目录接口只服务云盘空间，设备空间走设备专属接口）
 签名：captcha_sign/devicesign 按约定的摘要算法计算。
 凭据仅保存在本机 state/config.json，不上传任何服务器。
 """
@@ -21,23 +22,28 @@ import os
 import re
 import time
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
 from .base import Backend, BackendError, ParsedResource, TaskView
-from .drive_core import DriveCore, task_to_view
+from .drive_core import (DriveCore, _agg_tries, _clip_timeout, _dbg,
+                         task_to_view)
 
 XLUSER_BASE = "https://xluser-ssl.xunlei.com"
 XLUSER_API = XLUSER_BASE + "/v1"
 DRIVE_API = "https://api-pan.xunlei.com/drive/v1"
 
-CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+# 迅雷开放平台客户端应用参数（协议常量，
+# 所有第三方实现共用同一组，非用户私有凭据；登录协议必需，无法移除）。
+# 防泄露审计通道：可用环境变量 XL_CLIENT_ID / XL_CLIENT_SECRET / XL_APP_KEY
+# 覆盖（默认值仅作协议兼容，泄露不直接危及用户账户）。
+CLIENT_ID = os.environ.get("XL_CLIENT_ID") or "Xp6vsxz_7IYVw2BB"
+CLIENT_SECRET = os.environ.get("XL_CLIENT_SECRET") or "Xp6vsy4tN9toTVdMSpomVdXpRmES"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APP_ID = "40"
-APP_KEY = "34a062aaa22f906fca4fefe9fb3a3021"
+APP_KEY = os.environ.get("XL_APP_KEY") or "34a062aaa22f906fca4fefe9fb3a3021"
 SIGN_PROVIDER = "access_end_point_token"
 REDIRECT_URI = "xlaccsdk01://xunlei.com/callback?state=harbor"
 
@@ -70,6 +76,12 @@ EMAIL_RE = re.compile(r"\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*")
 # 需要刷新令牌重试的错误码
 TOKEN_ERROR_CODES = {4122, 4121, 10, 16}
 CAPTCHA_ERROR_CODE = 9
+# 设备端调用超时（社区同报案例）：设备端插件调用超时，返回
+# {"error":"external_unknown_err","error_code":2,"error_description":"远程调用失败",
+#  "error_details":[{"detail":"Get \"http://k8s.xsl/drive-reverse-proxy/...\":
+#  net/http: request canceled (Client.Timeout exceeded while awaiting headers)"},…]}
+# ——设备端插件响应慢或未运行（瞬态居多）。
+DEVICE_TIMEOUT_CODE = 2
 
 
 def _md5_hex(s: str) -> str:
@@ -124,6 +136,43 @@ def _err_text(prefix: str, data: dict) -> str:
     return f"{prefix}：{detail}（error_code={code} · v{_pkg_version()}）"
 
 
+def _is_device_timeout(data: dict) -> bool:
+    """设备端调用超时类错误（error_code=2 / external_unknown_err / 远程调用失败）：
+    瞬态居多，GET 可安全重试。"""
+    if _err_code(data) == DEVICE_TIMEOUT_CODE:
+        return True
+    if (data.get("error") or "").strip() == "external_unknown_err":
+        return True
+    return "远程调用失败" in (data.get("errorDesc") or ""
+                             or data.get("error_description") or "")
+
+
+def _masked_hint(data: dict) -> str:
+    """error_details[].detail 证据摘要（脱敏）：含 uid/设备哈希/URL，
+    长十六进制与长数字段掩掉，只留链路形态给人看。
+    占位符用 [hash]/[id] 而非尖括号（0.1.34）——尖括号在 UI innerHTML
+    里会被当标签吞掉（0.1.33 实测显示成 proxy///），文本语境也更清晰。"""
+    for it in (data.get("error_details") or []):
+        if isinstance(it, dict) and (it.get("detail") or "").strip():
+            s = str(it["detail"])
+            s = re.sub(r"[0-9a-fA-F]{16,}", "[hash]", s)
+            s = re.sub(r"\d{6,}", "[id]", s)
+            return s[:200]
+    return ""
+
+
+def _device_timeout_text(data: dict) -> str:
+    """设备端调用超时的专用错误文案：说清是谁的问题、影响面、怎么办。"""
+    hint = _masked_hint(data)
+    return (
+        "迅雷接口错误：设备端响应超时（error_code=2 · v" + _pkg_version() + "）——"
+        "迅雷服务端调用目标设备超时：设备端迅雷远程插件响应慢或未运行"
+        "（设备高负载下载/网络链路差/插件未启用均会触发）。此错误只影响目录浏览与"
+        "路径解析，稍后重试常自动恢复；若持续出现，请检查目标设备上的迅雷远程插件"
+        "是否在运行，或在设置里换一台支持远程插件的设备"
+        + (f"。证据：{hint}" if hint else ""))
+
+
 def device_sign(device_id: str) -> str:
     base = f"{device_id}{PACKAGE_NAME}{APP_ID}{APP_KEY}"
     inner = hashlib.sha1(base.encode("utf-8")).hexdigest()
@@ -139,23 +188,37 @@ def captcha_sign(device_id: str) -> tuple[str, str]:
 
 
 class _CloudDrive(DriveCore):
-    """带错误码检测与令牌/人机令牌自动续期的 drive/v1 客户端。"""
+    """带错误码检测与令牌/人机令牌自动续期的 drive/v1 客户端。
+
+    远程设备的目录表/建目录走设备专属 API。"""
+
+    # 设备专属 API 发现缓存 TTL（
+    # 取 300s 减少发现请求；失效时自动重发现，见 _folders 的 refresh 轮）
+    _RELAY_TTL = 300
 
     def __init__(self, client: httpx.Client, backend: "ThunderCloud"):
         super().__init__(client, DRIVE_API, backend._auth_headers)
         self.backend = backend
+        self._device_apis: dict[str, dict] = {}
+        # 设备端超时 GET 重试次数（0.1.33 可治理）：默认 2（共 3 次尝试）保持
+        # 运行态瞬态自愈；诊断探针期设 0 让真实错误透出——0.1.32 实测 3 次
+        # 重试链（~3s×3+退避）撑爆诊断窗口，真实错误被「超时」文案掩盖。
+        self._device_timeout_retries = 2
 
-    def _request(self, method, path, *, params=None, json_body=None):
+    def _request(self, method, path, *, params=None, json_body=None,
+                 timeout=30, deadline=None):
         # 自行发请求（不走 DriveCore._request）：迅雷错误多以 200/4xx + error_code
         # 返回，必须先按错误码分流（令牌续期），不能只看 HTTP 状态码。
-        url = self.base_url + path
+        # path 以 http 开头时视为完整 URL（如 /device/config 同级接口）。
+        url = path if path.startswith("http") else self.base_url + path
         # 人机令牌刷新的 action 是完整 URL 路径（含 /drive/v1 前缀）
         action = method + ":" + urlsplit(url).path
         for attempt in range(3):
             try:
                 resp = self.client.request(method, url, params=params,
                                            json=json_body,
-                                           headers=self._headers(), timeout=30)
+                                           headers=self._headers(),
+                                           timeout=timeout)
             except httpx.HTTPError as exc:
                 raise BackendError(f"网络错误（请检查 NAS 出网/DNS/代理设置）：{exc}") from exc
             try:
@@ -176,6 +239,15 @@ class _CloudDrive(DriveCore):
                 self.backend._refresh_captcha_at_login(
                     action, self.backend.conf.get("user_id", ""))
                 continue
+            if (attempt < self._device_timeout_retries and method == "GET"
+                    and _is_device_timeout(data)
+                    and (deadline is None or time.monotonic() < deadline)):
+                # 设备端超时瞬态居多，GET 幂等可重试。
+                # 1s 退避给设备端插件喘息；POST 不重试（建目录非幂等）。
+                # deadline（0.1.33）：预算内才重试——重试链不得超出解析
+                # 总预算，否则撑爆诊断窗/响应窗（0.1.32）。
+                time.sleep(1)
+                continue
             if err_code == CAPTCHA_ERROR_CODE:
                 uid = self.backend.conf.get("user_id", "")
                 raise BackendError(
@@ -183,8 +255,192 @@ class _CloudDrive(DriveCore):
                     "这不是短信验证码输错；请点「重新登录」重试，"
                     "若仍失败请重新完成一次短信验证"
                     f"（v{_pkg_version()}，user_id={'已取到' if uid else '空'}）")
+            if _is_device_timeout(data):
+                raise BackendError(_device_timeout_text(data))
             raise BackendError(_err_text("迅雷接口错误", data))
         raise BackendError("迅雷接口错误：重试后仍失败")
+
+    # ------------------------------------------------ 设备专属 API（0.1.30）
+
+    def _relay_api(self, space: str, refresh: bool = False,
+                   deadline: float | None = None) -> dict:
+        """发现远程设备的专属 API 网关。
+
+        链路：
+          GET https://api-pan.xunlei.com/drive/v1/apps/INNER_API?space=<target>
+          （仅 Bearer 认证）→ {"link": "<url>", "links": [{"url": "<url>"}]}
+          url 形如 https://<relay-host>/<path>/?plugin_app_id=X&plugin_app_token=Y
+        ApiDomain = 去掉 query、保留路径、补尾斜杠，
+        后续请求 <ApiDomain>drive/v1/files?...&plugin_app_id=X&plugin_app_token=Y。"""
+        now = time.time()
+        ent = self._device_apis.get(space)
+        if ent and not refresh and now - ent.get("at", 0) < self._RELAY_TTL:
+            return ent
+        data = self._request("GET", DRIVE_API + "/apps/INNER_API",
+                             params={"space": space},
+                             timeout=_clip_timeout(deadline, 10),
+                             deadline=deadline)
+        url = (data.get("link") or "").strip()
+        if not url:
+            for it in (data.get("links") or []):
+                if isinstance(it, dict) and (it.get("url") or "").strip():
+                    url = it["url"].strip()
+                    break
+        if not url:
+            raise BackendError(
+                "设备专属 API 发现失败：INNER_API 响应缺少 link/links[].url")
+        parts = urlsplit(url)
+        base = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        if not base.endswith("/"):
+            base += "/"        # ApiDomain+相对路径 是字符串拼接，必须带尾斜杠
+        q = parse_qs(parts.query)
+        ent = {"base": base,
+               "plugin_app_id": (q.get("plugin_app_id") or [""])[0],
+               "plugin_app_token": (q.get("plugin_app_token") or [""])[0],
+               "at": now}
+        self._device_apis[space] = ent
+        _dbg(f"设备API发现: space={space[:12]} relay={parts.netloc}{parts.path} "
+             f"plugin凭据={'有' if ent['plugin_app_token'] else '无'}")
+        return ent
+
+    def _relay_params(self, api: dict, space: str) -> dict:
+        """设备 API 请求公共参数：space= 设备空间、
+        device_space= 空、plugin_app_id/plugin_app_token 发现凭据。"""
+        p = {"device_space": "", "space": space}
+        if api.get("plugin_app_id"):
+            p["plugin_app_id"] = api["plugin_app_id"]
+        if api.get("plugin_app_token"):
+            p["plugin_app_token"] = api["plugin_app_token"]
+        return p
+
+    def _relay_folder_shapes(self, api: dict, space: str,
+                             parent_id: str) -> list[tuple[str, dict]]:
+        """设备 API 目录表参数形状：
+        filters 三条件（trashed/phase/kind）、with_audit=true、order=TYPE_DESC、
+        page_token= 空、with=withCategoryDiskMountPath&withCategoryHistoryDownloadPath
+        （注意是 HistoryDownloadPath，扩展引擎形状的 withCategoryDownloadPath
+        不适用于设备 API）。第二形状 kind-only 兜底防扩展参数被严格校验。"""
+        filters_full = json.dumps({
+            "trashed": {"eq": False},
+            "phase": {"eq": "PHASE_TYPE_COMPLETE"},
+            "kind": {"eq": "drive#folder"}}, separators=(",", ":"))
+        filters_kind = json.dumps({"kind": {"eq": "drive#folder"}},
+                                  separators=(",", ":"))
+        base = self._relay_params(api, space)
+        full = dict(base, parent_id=parent_id or "", limit="200",
+                    with_audit="true", filters=filters_full, page_token="",
+                    order="TYPE_DESC",
+                    **{"with": ["withCategoryDiskMountPath",
+                                "withCategoryHistoryDownloadPath"]})
+        kind_only = dict(base, parent_id=parent_id or "", limit="200",
+                         filters=filters_kind)
+        return [("设备API完整形状", full), ("设备API极简形状", kind_only)]
+
+    def _folders(self, space: str, parent_id: str = "",
+                 deadline: float | None = None) -> list[dict]:
+        """目录表走设备专属 API（0.1.30 修复）。
+
+        0.1.31 回退策略收紧：只有**设备 API 发现失败**（INNER_API 不可达/
+        缺 link）才回退基类阶梯（api-pan 标准/极简形状，兼容万一 api-pan
+        开放设备空间的未来变化）；发现成功但 relay 形状全挂时直接抛聚合
+        错误——通用接口对设备空间不可用，回退阶梯只会浪费响应预算。deadline：解析总预算，超时即止损。"""
+        tries: list[str] = []
+        discovered = False
+        for refresh in (False, True):     # 第二轮强制重发现（凭据过期自愈）
+            if deadline is not None and time.monotonic() >= deadline:
+                tries.append("预算耗尽未及尝试")
+                break
+            try:
+                api = self._relay_api(space, refresh=refresh, deadline=deadline)
+            except BackendError as exc:
+                tries.append(f"设备API发现：{str(exc)[:100]}")
+                break
+            discovered = True
+            saw_ok = False
+            for label, params in self._relay_folder_shapes(api, space, parent_id):
+                if deadline is not None and time.monotonic() >= deadline:
+                    tries.append("预算耗尽未及尝试")
+                    break
+                try:
+                    data = self._request("GET", api["base"] + "drive/v1/files",
+                                         params=params,
+                                         timeout=_clip_timeout(deadline, 8),
+                                         deadline=deadline)
+                except BackendError as exc:
+                    tries.append(f"{label}：{str(exc)[:100]}")
+                    continue
+                saw_ok = True
+                files = [f for f in (data.get("files") or [])
+                         if isinstance(f, dict)
+                         and f.get("kind") in (None, "", "drive#folder")]
+                if files:
+                    return files
+                tries.append(f"{label}：空表")
+            if saw_ok:                    # 设备 API 可达但目录为空：如实返回
+                return []
+        if discovered:                    # relay 全挂 ≠ api-pan 能救，别空转
+            raise BackendError(
+                "云端目录表查询失败（设备API 各形状均失败，未回退 api-pan"
+                "——设备空间的 api-pan /files 只会 502）：" + _agg_tries(tries))
+        _dbg(f"设备API发现失败回退api-pan: {space[:12]} {str(tries)[:80]}")
+        try:
+            return super()._folders(space, parent_id, deadline=deadline)
+        except BackendError as exc:
+            # 0.1.34：基类异常带 .tries 明细时跨层合并同因（同一条错误只
+            # 展开一次、标签全保留，长指引不再重复刷屏）；拿不到明细才
+            # 退回截断文本。
+            inner = getattr(exc, "tries", None)
+            merged = (tries + list(inner) if inner else
+                      tries + ["api-pan 阶梯：" + str(exc)[:200]])
+            raise BackendError(
+                "云端目录表查询失败（设备API 与 api-pan 均失败）："
+                + _agg_tries(merged)) from exc
+
+    def _make_folder(self, space: str, parent_id: str, name: str,
+                     deadline: float | None = None) -> dict:
+        """建子目录走设备专属 API（带 plugin 凭据）。
+        0.1.31：仅发现失败才回退基类（api-pan）；发现成功但 relay POST
+        失败直接抛错（api-pan 对设备空间建目录同样 502，回退无意义）。"""
+        try:
+            api = self._relay_api(space, deadline=deadline)
+        except BackendError:
+            return super()._make_folder(space, parent_id, name,
+                                        deadline=deadline)
+        data = self._request("POST", api["base"] + "drive/v1/files",
+                             params=self._relay_params(api, space),
+                             json_body={"parent_id": parent_id, "name": name,
+                                        "space": space, "kind": "drive#folder"},
+                             timeout=_clip_timeout(deadline, 10),
+                             deadline=deadline)
+        fid = (data.get("file") or {}).get("id") or ""
+        if not fid:
+            raise BackendError(
+                f"创建下载子目录 {name} 失败（设备API）：响应缺少 file.id")
+        return {"id": fid, "name": name, "params": {"RealPath": ""}}
+
+    def _device_config(self, space: str = "",
+                       deadline: float | None = None) -> dict:
+        """设备配置（download_paths 下载根提示）优先走设备专属 API
+        （<ApiDomain>device/config，与 device/info/watch 同级），
+        失败回退基类（api-pan /device/config 通常不可达 → {} 静默）。"""
+        if space:
+            try:
+                api = self._relay_api(space, deadline=deadline)
+                return self._request("GET", api["base"] + "device/config",
+                                     params=self._relay_params(api, space),
+                                     timeout=_clip_timeout(deadline, 10),
+                                     deadline=deadline)
+            except BackendError:
+                pass
+        return super()._device_config(space, deadline=deadline)
+
+    def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
+        """api-pan 回退阶梯的形状顺序（0.1.31 起仅在设备 API 发现失败时用）：
+        裁剪为标准/极简 2 形状——扩展/空间引擎形状（with/device_space）
+        对 api-pan 直接 502，多试纯属浪费响应预算。"""
+        shapes = dict(super()._folder_shapes(space, parent_id))
+        order = ["标准形状", "极简形状"]
+        return [(k, shapes[k]) for k in order if k in shapes]
 
 
 class ThunderCloud(Backend):
@@ -694,15 +950,25 @@ class ThunderCloud(Backend):
     # ------------------------------------------------------------ 目标设备
 
     def _target_of(self) -> str:
-        if (self.conf.get("target") or "").strip():
-            return self.conf["target"].strip()
+        """目标设备空间：配置值优先（0.1.28 回退老行为）——0.1.26 加的
+        「不在在线列表就自动改发到 online[0]」在多设备/发现口径不一致的场景
+        会把任务发去别的设备空间（用户实测「派发成功但迅雷里面没有」）。
+        配置值疑似失效时 status() 会提示，但不擅自改道。未配置时才用
+        发现到的首个在线设备。"""
+        conf_t = (self.conf.get("target") or "").strip()
+        if conf_t:
+            return conf_t
         if self._target:
             return self._target
-        targets = self.core.device_targets()
-        if not targets:
-            raise BackendError("当前迅雷账号下未发现远程下载设备（请先在迅雷 App 中绑定远程设备）")
-        self._target = targets[0]["target"]
-        return self._target
+        try:
+            online = [t["target"] for t in self.core.device_targets()]
+        except BackendError:
+            online = []
+        if online:
+            self._target = online[0]
+            return self._target
+        raise BackendError("当前迅雷账号下未发现远程下载设备（请先在迅雷 App 中绑定远程设备，"
+                           "或在设置里填写「目标设备」）")
 
     # ------------------------------------------------------------ 接口
 
@@ -729,6 +995,11 @@ class ThunderCloud(Backend):
                         "detail": _err_text("登录态校验失败", data)}
             targets = self.core.device_targets()
             detail = f"已登录，远程设备 {len(targets)} 台"
+            conf_t = (self.conf.get("target") or "").strip()
+            online = [t["target"] for t in targets]
+            if conf_t and online and conf_t not in online:
+                detail += (f"；⚠ 配置的目标设备 {conf_t[:12]}… 已不在线，"
+                           f"任务将改发到 {online[0][:12]}…（可在设置里更新目标设备）")
             return {"configured": True, "reachable": bool(targets), "detail": detail}
         except BackendError as exc:
             return {"configured": True, "reachable": False, "detail": str(exc)}

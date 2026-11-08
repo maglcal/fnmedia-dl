@@ -1,0 +1,35 @@
+name: Sync releases to RepoBox mirror
+
+# 发布资产自动同步到自建 RepoBox 镜像（国内更新分发渠道）：
+#   - release 发布时立即同步
+#   - 每 6 小时兜底校验（漏发/同步失败自愈，幂等已同步自动跳过）
+#   - 可手动触发
+# 需配置 secrets：REPOBOX_URL（站点地址）、REPOBOX_TOKEN（API 令牌 rbx_xxx）、
+#                 REPOBOX_REPO（镜像仓库名，可省，默认 fnmedia-dl）
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync to RepoBox
+        env:
+          REPOBOX_URL: ${{ secrets.REPOBOX_URL }}
+          REPOBOX_TOKEN: ${{ secrets.REPOBOX_TOKEN }}
+          REPOBOX_REPO: ${{ secrets.REPOBOX_REPO }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 tools/sync_repobox.py ${RELEASE_TAG:+--tag "$RELEASE_TAG"}
