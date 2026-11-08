@@ -772,7 +772,9 @@ on("#diagBtn", "click", async () => {
     const r = await API.get("/api/diagnose");
     const rows = (r.steps || []).map((s) => {
       const mark = s.ok ? "✓" : "✗";
-      return `<div>${mark} ${s.step}（${s.ms}ms）：${s.detail || ""}</div>`;
+      // 0.1.34：detail 含上游错误原文（可能带 <…> 形态），必须转义——
+      // 否则被当 HTML 标签吞掉（0.1.33 实测 <hash>/<id> 占位符显示为空）
+      return `<div>${mark} ${esc(s.step)}（${s.ms}ms）：${esc(s.detail || "")}</div>`;
     });
     box.className = "dir-status" + (r.ok ? "" : " bad");
     box.innerHTML =

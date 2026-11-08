@@ -236,6 +236,20 @@ class TestDriveCore(unittest.TestCase):
             self.assertIn(label, msg)
         self.assertIn("502", msg)
 
+    def test_folders_aggregate_merges_same_cause(self):
+        """0.1.34 聚合同因合并：各形状同一错误只展开一次（标签全保留，
+        ×N 计数）——长指引逐形状重复会把诊断/派发输出淹掉。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+        core = self._mk(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("sp", "")
+        msg = str(ctx.exception)
+        self.assertIn("4 处同因", msg)
+        self.assertIn("扩展形状", msg)
+        self.assertIn("极简形状", msg)
+        self.assertEqual(msg.count("HTTP 502: bad gateway"), 1)
+
     def test_cloud_folder_shapes_standard_first(self):
         """云端通道（_CloudDrive）api-pan 回退阶梯裁剪为标准/极简 2 形状
         （0.1.31）：引擎形状（with/device_space）对 api-pan 直接 502，
@@ -1389,6 +1403,22 @@ class TestCloudDeviceApi(unittest.TestCase):
         for label in ("标准形状", "极简形状"):
             self.assertIn(label, msg)
 
+    def test_aggregate_merges_same_cause_across_layers(self):
+        """0.1.34 跨层同因合并：设备API 发现与 api-pan 回退阶梯（标准/极简
+        2 形状，0.1.31 裁剪）同一错误时只展开一次（各层标签全保留）。"""
+        def handler(request):
+            return httpx.Response(502, text="bad gateway")
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError) as ctx:
+            tc.core._folders("remote-1", "")
+        msg = str(ctx.exception)
+        self.assertIn("3 处同因", msg)
+        self.assertIn("设备API发现", msg)
+        self.assertIn("标准形状", msg)
+        self.assertIn("极简形状", msg)
+        self.assertEqual(msg.count("迅雷接口响应异常（HTTP 502）"), 1)
+
     def test_relay_shapes_all_fail_no_apipan_fallback(self):
         """0.1.31：设备 API 发现成功但 relay 形状全挂 → 直接抛聚合错误，
         不跑 api-pan 阶梯（api-pan 对设备空间不可用，回退纯属空耗预算）。"""
@@ -1650,7 +1680,9 @@ class TestDeviceTimeoutAndHarvest(unittest.TestCase):
         self.assertIn("error_code=2", msg)
 
     def test_device_timeout_message_guidance_and_masked_hint(self):
-        """错误文案含人读指引 + 脱敏证据（哈希/uid 掩码，链路形态保留）。"""
+        """错误文案含人读指引 + 脱敏证据（哈希/uid 掩码，链路形态保留）。
+        0.1.34：占位符改 [hash]/[id]——尖括号在 UI innerHTML 里会被当
+        标签吞掉（0.1.33 实测显示成 proxy///）。"""
         def handler(request):
             return httpx.Response(200, json=self.TIMEOUT_BODY)
 
@@ -1662,8 +1694,8 @@ class TestDeviceTimeoutAndHarvest(unittest.TestCase):
         self.assertIn("设备端响应超时", msg)
         self.assertIn("迅雷远程插件", msg)
         self.assertIn("证据", msg)
-        self.assertIn("<hash>", msg)
-        self.assertIn("<id>", msg)
+        self.assertIn("[hash]", msg)
+        self.assertIn("[id]", msg)
         self.assertNotIn("7abd3182d399f7bdda199550d8babede", msg)
         self.assertNotIn("584201392", msg)
 

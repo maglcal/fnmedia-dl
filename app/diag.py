@@ -152,8 +152,18 @@ def probe_devices_plugin(core, targets: list[dict],
                      "或各设备的迅雷远程插件均未运行")
     elif (active_target in results
           and not results.get(active_target, (True,))[0]):
-        parts.append("结论：仅目标设备不可达（其他设备正常）——目标设备单台"
-                     "插件问题，可在设置里换一台 ✓ 设备为目标")
+        # 0.1.34：按倒下比例措辞——1/10 可达时报「其他设备正常」是误导
+        # （0.1.33 实测 9/10 不可达却被误报为单台问题）
+        ups = "、".join(up)
+        if len(down) * 2 <= len(tgs):
+            parts.append(f"结论：仅 {len(down)}/{len(tgs)} 台不可达"
+                         f"（含派发目标）——目标设备单台插件问题，可在设置里"
+                         f"换 ✓ 设备（{ups}）为目标")
+        else:
+            parts.append(f"结论：{len(down)}/{len(tgs)} 台均不可达"
+                         f"（含派发目标）——多数设备的迅雷远程插件未运行或"
+                         f"链路不通，非单台问题；可达的仅 {ups}，建议换其中"
+                         f"一台为派发目标，或到目标设备上启动/更新迅雷远程插件")
     else:
         parts.append("结论：设备插件通道整体可用")
     return "；".join(parts)

@@ -27,7 +27,8 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 import httpx
 
 from .base import Backend, BackendError, ParsedResource, TaskView
-from .drive_core import DriveCore, _clip_timeout, _dbg, task_to_view
+from .drive_core import (DriveCore, _agg_tries, _clip_timeout, _dbg,
+                         task_to_view)
 
 XLUSER_BASE = "https://xluser-ssl.xunlei.com"
 XLUSER_API = XLUSER_BASE + "/v1"
@@ -144,13 +145,15 @@ def _is_device_timeout(data: dict) -> bool:
 
 def _masked_hint(data: dict) -> str:
     """error_details[].detail 证据摘要（脱敏）：含 uid/设备哈希/URL，
-    长十六进制与长数字段掩掉，只留链路形态给人看。"""
+    长十六进制与长数字段掩掉，只留链路形态给人看。
+    占位符用 [hash]/[id] 而非尖括号（0.1.34）——尖括号在 UI innerHTML
+    里会被当标签吞掉（0.1.33 实测显示成 proxy///），文本语境也更清晰。"""
     for it in (data.get("error_details") or []):
         if isinstance(it, dict) and (it.get("detail") or "").strip():
             s = str(it["detail"])
-            s = re.sub(r"[0-9a-fA-F]{16,}", "<hash>", s)
-            s = re.sub(r"\d{6,}", "<id>", s)
-            return s[:160]
+            s = re.sub(r"[0-9a-fA-F]{16,}", "[hash]", s)
+            s = re.sub(r"\d{6,}", "[id]", s)
+            return s[:200]
     return ""
 
 
@@ -374,14 +377,20 @@ class _CloudDrive(DriveCore):
         if discovered:                    # relay 全挂 ≠ api-pan 能救，别空转
             raise BackendError(
                 "云端目录表查询失败（设备API 各形状均失败，未回退 api-pan"
-                "——设备空间的 api-pan /files 只会 502）：" + "；".join(tries))
+                "——设备空间的 api-pan /files 只会 502）：" + _agg_tries(tries))
         _dbg(f"设备API发现失败回退api-pan: {space[:12]} {str(tries)[:80]}")
         try:
             return super()._folders(space, parent_id, deadline=deadline)
         except BackendError as exc:
+            # 0.1.34：基类异常带 .tries 明细时跨层合并同因（同一条错误只
+            # 展开一次、标签全保留，长指引不再重复刷屏）；拿不到明细才
+            # 退回截断文本。
+            inner = getattr(exc, "tries", None)
+            merged = (tries + list(inner) if inner else
+                      tries + ["api-pan 阶梯：" + str(exc)[:200]])
             raise BackendError(
                 "云端目录表查询失败（设备API 与 api-pan 均失败）："
-                + "；".join(tries + [str(exc)[:400]])) from exc
+                + _agg_tries(merged)) from exc
 
     def _make_folder(self, space: str, parent_id: str, name: str,
                      deadline: float | None = None) -> dict:

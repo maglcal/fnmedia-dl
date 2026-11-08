@@ -100,7 +100,28 @@ class TestPluginProbe(unittest.TestCase):
         self.assertIn("设备B✗", out)
         self.assertIn("派发目标（t-b", out)
         self.assertIn("✗", out.split("派发目标")[1])
-        self.assertIn("仅目标设备不可达", out)
+        self.assertIn("仅 1/3 台不可达", out)
+        self.assertIn("目标设备单台插件问题", out)
+
+    def test_probe_devices_plugin_majority_down(self):
+        """0.1.34 结论按倒下比例措辞：多数不可达时报「非单台问题」并列出
+        可达设备建议换目标（0.1.33 实测 1/10 可达被误报「其他设备正常」）。"""
+        core = _FakeCore({
+            "t-a": "ok",
+            "t-b": ("request", "设备端响应超时（error_code=2）"),
+            "t-c": ("request", "设备端响应超时（error_code=2）"),
+            "t-d": ("request", "网络错误：连接失败"),
+        })
+        targets = [{"target": "t-a", "name": "设备A"},
+                   {"target": "t-b", "name": "设备B"},
+                   {"target": "t-c", "name": "设备C"},
+                   {"target": "t-d", "name": "设备D"}]
+        out = diag.probe_devices_plugin(core, targets, "t-b")
+        self.assertIn("可达 1/4", out)
+        self.assertIn("3/4 台均不可达", out)
+        self.assertIn("非单台问题", out)
+        self.assertIn("建议换其中一台为派发目标", out)
+        self.assertIn("设备A✓", out)
 
     def test_probe_devices_plugin_all_down(self):
         core = _FakeCore({

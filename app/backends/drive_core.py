@@ -127,6 +127,33 @@ def _clip_timeout(deadline: float | None, per_call: float) -> float:
     return max(1.0, min(per_call, deadline - time.monotonic()))
 
 
+def _agg_tries(tries: list[str]) -> str:
+    """聚合各形状/各路错误（0.1.34 同因合并）：错误文案带指引后很长，
+    逐形状原样重复会把诊断/派发输出淹掉——同因条目（msg 相同）合并为
+    「label1、label2（N 处同因）：msg」只展开一次；无冒头条目原样保留。
+    tries 项形如「label：msg」（与 _folders 各处 append 形态一致）。"""
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    plain: list[str] = []
+    for item in tries:
+        label, sep, msg = item.partition("：")
+        if not sep:
+            plain.append(item)
+            continue
+        if msg not in groups:
+            groups[msg] = []
+            order.append(msg)
+        groups[msg].append(label)
+    parts = list(plain)
+    for msg in order:
+        labels = groups[msg]
+        head = "、".join(labels)
+        if len(labels) > 1:
+            head += f"（{len(labels)} 处同因）"
+        parts.append(f"{head}：{msg}")
+    return "；".join(parts)
+
+
 def _norm_dir(path: str) -> str:
     """目录路径归一：clean + 尾斜杠。"""
     p = (path or "").replace("\\", "/").strip()
@@ -281,8 +308,10 @@ class DriveCore:
             tries.append(f"{label}：空表")
         if saw_ok:
             return []
-        raise BackendError(
-            "引擎目录表查询失败（各形状均报错）：" + "；".join(tries))
+        err = BackendError(
+            "引擎目录表查询失败（各形状均报错）：" + _agg_tries(tries))
+        err.tries = tries        # 0.1.34：明细供上层跨层合并同因（_CloudDrive）
+        raise err
 
     def _make_folder(self, space: str, parent_id: str, name: str,
                      deadline: float | None = None) -> dict:
