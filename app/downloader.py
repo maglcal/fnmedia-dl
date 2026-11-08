@@ -28,6 +28,11 @@ import quota as quotamod
 
 RECORDS_PATH = STATE_DIR / "tasks.json"
 
+# 批量派发软预算（0.1.31）：网关中继响应预算 180s，同步派发链必须远小于它。
+# 超预算的尾部链接直接返回「预算耗尽」错误（信息可见），而不是继续同步派发
+# 把整个请求拖过中继超时（裸 502，用户什么都看不到）。
+DISPATCH_BUDGET = 50.0
+
 
 class DownloadManager:
     def __init__(self, cfg: dict, client: httpx.Client | None = None):
@@ -144,8 +149,23 @@ class DownloadManager:
 
     def dispatch_many(self, links, *, backend: str = "auto",
                       directory: str | None = None) -> list[dict]:
-        return [self.dispatch(link, backend=backend, directory=directory)
-                for link in links]
+        """批量派发（保持串行：records/quota 写盘无锁，并行会竞态）。
+        DISPATCH_BUDGET 软预算：超预算的尾部链接不再派发，返回明确错误。"""
+        links = list(links)
+        t0 = time.monotonic()
+        out: list[dict] = []
+        for i, link in enumerate(links):
+            if out and time.monotonic() - t0 > DISPATCH_BUDGET:
+                url = getattr(link, "url", None) or str(link)
+                out.append({
+                    "ok": False, "url": url,
+                    "error": (f"派发预算耗尽（{DISPATCH_BUDGET:.0f}s）："
+                              f"前 {len(out)} 条已处理，本条及后续"
+                              f"共 {len(links) - i} 条未派发，请分批重试"),
+                })
+                continue
+            out.append(self.dispatch(link, backend=backend, directory=directory))
+        return out
 
     # ------------------------------------------------------------ 任务视图
 

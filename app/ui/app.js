@@ -760,6 +760,33 @@ on("#updateCheckBtn", "click", async () => {
   }
 });
 
+/* ---------------- 自诊断（0.1.31：502 类问题逐层定位） ---------------- */
+on("#diagBtn", "click", async () => {
+  const btn = $("#diagBtn");
+  const box = $("#diagResult");
+  btn.disabled = true;
+  box.hidden = false;
+  box.className = "dir-status";
+  box.textContent = "正在逐层探测（约 10~30 秒）…";
+  try {
+    const r = await API.get("/api/diagnose");
+    const rows = (r.steps || []).map((s) => {
+      const mark = s.ok ? "✓" : "✗";
+      return `<div>${mark} ${s.step}（${s.ms}ms）：${s.detail || ""}</div>`;
+    });
+    box.className = "dir-status" + (r.ok ? "" : " bad");
+    box.innerHTML =
+      (r.ok ? "✓ 关键链路全部正常" : "✗ 存在异常步骤，请看下方定位") +
+      `<br>${rows.join("")}` +
+      (r.ok ? "" : "<br>第一个 ✗ 步骤即故障层；仍无法解决请带此结果反馈。");
+  } catch (e) {
+    box.className = "dir-status bad";
+    box.textContent = "✗ 自诊断失败：" + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 /* ---------------- 一键在线更新（下载 fpk → 替换 → 重启，带进度） ---------------- */
 const UPD = { url: "", target: "", timer: null };
 

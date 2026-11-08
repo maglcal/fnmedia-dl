@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -324,6 +325,52 @@ class TestQuotaDispatch(DispatchTestBase):
         with self.assertRaises(BackendError) as ctx:
             mgr.retry("thunder_engine", res0["id"])
         self.assertIn("配额已满", str(ctx.exception))
+
+
+class TestDispatchBudget(DispatchTestBase):
+    """0.1.31：批量派发软预算——超预算尾部链接返回明确错误，
+    而不是继续同步派发把请求拖过中继超时（裸 502 什么都看不到）。"""
+
+    def _slow_backend(self):
+        class Slow(FakeBackend):
+            def add(self, url, *, name=None, directory=None):
+                time.sleep(0.05)               # 模拟慢上游
+                return super().add(url, name=name, directory=directory)
+        return Slow("thunder_cloud", "云")
+
+    def test_budget_exhausted_tail_reports_clear_error(self):
+        good = self._slow_backend()
+        mgr = self.manager({"thunder_cloud": good})
+        orig = downloader.DISPATCH_BUDGET
+        downloader.DISPATCH_BUDGET = 0.02      # 首条 50ms 即超预算
+        try:
+            links = [f"https://x/{i}.iso" for i in range(5)]
+            res = mgr.dispatch_many(links)
+        finally:
+            downloader.DISPATCH_BUDGET = orig
+        self.assertEqual(len(res), 5)
+        self.assertTrue(res[0]["ok"])           # 首条必派
+        for r in res[1:]:                       # 尾部必带明确错误
+            self.assertFalse(r["ok"])
+            self.assertIn("派发预算耗尽", r["error"])
+            self.assertIn("未派发", r["error"])
+        self.assertEqual(len(good.added), 1)    # 不再空耗上游
+
+    def test_budget_not_hit_when_fast(self):
+        good = FakeBackend("thunder_cloud", "云")
+        mgr = self.manager({"thunder_cloud": good})
+        res = mgr.dispatch_many([f"https://x/{i}.iso" for i in range(3)])
+        self.assertTrue(all(r["ok"] for r in res))
+        self.assertEqual(len(good.added), 3)
+
+    def test_directory_passed_through_to_backend(self):
+        """目录参数穿透：dispatch_many 的 directory 必须传到每条 add。"""
+        good = FakeBackend("thunder_cloud", "云")
+        mgr = self.manager({"thunder_cloud": good})
+        mgr.dispatch_many(["https://x/1.iso", "https://x/2.iso"],
+                          directory="电影/2025")
+        self.assertEqual([d for _, _, d in good.added],
+                         ["电影/2025", "电影/2025"])
 
 
 if __name__ == "__main__":

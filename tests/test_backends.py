@@ -234,12 +234,13 @@ class TestDriveCore(unittest.TestCase):
         self.assertIn("502", msg)
 
     def test_cloud_folder_shapes_standard_first(self):
-        """云端通道（_CloudDrive）形状顺序：标准/极简优先——引擎形状会被
-        api-pan 网关 502（0.1.28 网关差异）。"""
+        """云端通道（_CloudDrive）api-pan 回退阶梯裁剪为标准/极简 2 形状
+        （0.1.31）：引擎形状（with/device_space）对 api-pan 直接 502，
+        多试纯属浪费响应预算。"""
         from backends.thunder_cloud import ThunderCloud
         tc = ThunderCloud(httpx.Client(), {}, None)
         labels = [label for label, _ in tc.core._folder_shapes("sp", "")]
-        self.assertEqual(labels, ["标准形状", "极简形状", "扩展形状", "空间形状"])
+        self.assertEqual(labels, ["标准形状", "极简形状"])
 
     def test_folders_kind_filter_client_side(self):
         """极简形状无服务端过滤：kind 非 drive#folder 的条目客户端兜底剔除。"""
@@ -1245,6 +1246,11 @@ class TestCloudDeviceApi(unittest.TestCase):
                 "access_token": "at-1", "target": "remote-1"}
         return ThunderCloud(_client(handler), conf)
 
+    def _mk(self, handler):
+        # 解析缓存是 DriveCore 基类机制，用基类实例直接验证
+        return DriveCore(_client(handler), "http://engine/drive/v1",
+                         lambda: {"h": "1"})
+
     def test_relay_full_shape_and_no_apipan(self):
         """目录表走设备 API 完整形状：plugin 凭据、
         device_space=、filters 三条件、with=…HistoryDownloadPath、with_audit、
@@ -1362,7 +1368,8 @@ class TestCloudDeviceApi(unittest.TestCase):
         self.assertEqual(seen[0]["space"], "remote-1")
 
     def test_relay_and_apipan_all_fail_aggregate_error(self):
-        """两路全挂 → 聚合错误：设备API 发现错误 + api-pan 各形状错误都保留。"""
+        """两路全挂 → 聚合错误：设备API 发现错误 + api-pan 各形状错误都保留。
+        0.1.31：api-pan 回退阶梯裁剪为标准/极简 2 形状。"""
         def handler(request):
             return httpx.Response(502, text="bad gateway")
 
@@ -1373,8 +1380,79 @@ class TestCloudDeviceApi(unittest.TestCase):
         self.assertIn("设备API发现", msg)
         self.assertIn("api-pan", msg)
         self.assertIn("502", msg)
-        for label in ("标准形状", "极简形状", "扩展形状", "空间形状"):
+        for label in ("标准形状", "极简形状"):
             self.assertIn(label, msg)
+
+    def test_relay_shapes_all_fail_no_apipan_fallback(self):
+        """0.1.31：设备 API 发现成功但 relay 形状全挂 → 直接抛聚合错误，
+        不跑 api-pan 阶梯（api-pan 对设备空间不可用，回退纯属空耗预算）。"""
+        apipan_hits = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if host == "relay.example" and path.endswith("/drive/v1/files"):
+                return httpx.Response(502, text="relay down")
+            if host == "api-pan.xunlei.com":
+                apipan_hits.append(path)
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError) as ctx:
+            tc.core._folders("remote-1", "")
+        self.assertIn("未回退 api-pan", str(ctx.exception))
+        self.assertIn("relay down", str(ctx.exception))
+        self.assertEqual(apipan_hits, [])        # api-pan 一次都没打
+
+    def test_resolve_cache_hits_within_ttl(self):
+        """0.1.31：同 (base_url, space, directory) 解析结果 120s 内缓存——
+        批量派发同目录只解析一次（此前每条链接重跑整条目录链）。"""
+        hits = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                hits.append(dict(request.url.params))
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if path.endswith("/files") and request.method == "POST":
+                return httpx.Response(200, json={"file": {"id": "made-x"}})
+            return httpx.Response(200, json={"task": {"id": "t-x"}})
+
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "电影"),
+                         ("made-x", "/downloads/电影/"))
+        n_first = len(hits)
+        # 第二次同参数解析：命中缓存，目录表不再被查
+        self.assertEqual(core.resolve_dest_folder("sp", "电影"),
+                         ("made-x", "/downloads/电影/"))
+        self.assertEqual(len(hits), n_first)
+
+    def test_resolve_cache_isolated_by_client(self):
+        """缓存按 client 身份隔离：每个请求新建 DownloadManager/client，
+        不同 client 不共享缓存（防跨请求串味）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "only", "name": "x", "params": {"RealPath": "/x/"}}]})
+            return httpx.Response(200, json={"task": {"id": "t-x"}})
+
+        core1 = self._mk(handler)
+        core2 = self._mk(handler)              # 不同 client
+        core1.resolve_dest_folder("sp", "")
+        core2.resolve_dest_folder("sp", "")    # 不该命中 core1 的缓存
+        self.assertIsNot(core1.client, core2.client)
 
     def test_resolve_end_to_end_via_relay_walk_and_create(self):
         """端到端：relay device/config 提示 + 目录表逐段解析 + 缺级 relay 自动
@@ -1420,8 +1498,9 @@ class TestCloudDeviceApi(unittest.TestCase):
         self.assertEqual(made[0]["params"]["plugin_app_id"], "pid")
         self.assertEqual(made[0]["params"]["plugin_app_token"], "ptok")
 
-    def test_make_folder_falls_back_apipan_when_relay_post_fails(self):
-        """relay 建目录失败 → 回退 api-pan 建目录（既有行为保留）。"""
+    def test_make_folder_relay_post_fails_raises_no_apipan(self):
+        """0.1.31：发现成功但 relay 建目录失败 → 直接抛错，不回退 api-pan
+        （api-pan 对设备空间建目录同样 502，回退纯属浪费响应预算）。"""
         seen = []
 
         def handler(request):
@@ -1433,6 +1512,24 @@ class TestCloudDeviceApi(unittest.TestCase):
             if host == "relay.example" and path.endswith("/drive/v1/files"):
                 return httpx.Response(200, json={"error_code": 403,
                                                  "error": "denied"})
+            if host == "api-pan.xunlei.com" and request.method == "POST":
+                seen.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "ap-1"}})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        with self.assertRaises(BackendError):
+            tc.core._make_folder("remote-1", "p1", "电影")
+        self.assertEqual(seen, [])           # api-pan 未被触碰
+
+    def test_make_folder_falls_back_apipan_when_discovery_fails(self):
+        """设备 API 发现失败（INNER_API 不可达）→ 建目录回退 api-pan。"""
+        seen = []
+
+        def handler(request):
+            path, host = request.url.path, request.url.host
+            if path.endswith("/apps/INNER_API"):
+                return httpx.Response(502, text="bad gateway")
             if host == "api-pan.xunlei.com" and request.method == "POST":
                 seen.append(json.loads(request.content))
                 return httpx.Response(200, json={"file": {"id": "ap-1"}})

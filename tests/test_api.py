@@ -79,6 +79,21 @@ class TestAPI(unittest.TestCase):
         r = self.client.get("/api/health")
         self.assertNotEqual(r.headers.get("cache-control"), "no-cache")
 
+    def test_diagnose_endpoint_shape(self):
+        """0.1.31：/api/diagnose 透传 diag.run 的分层结果（探针打桩）。"""
+        from unittest import mock
+        fake = {"ok": False, "version": "0.1.31", "steps": [
+            {"step": "服务版本", "ok": True, "ms": 1, "detail": "v0.1.31"},
+            {"step": "中继目录表", "ok": False, "ms": 5000,
+             "detail": "超时（>5s 无响应）"}]}
+        with mock.patch("diag.run", return_value=fake):
+            r = self.client.get("/api/diagnose")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(len(body["steps"]), 2)
+        self.assertEqual(body["steps"][1]["step"], "中继目录表")
+
     def test_update_check(self):
         """API 透传多源检查结果（多源逻辑见 test_updatesrc.py）。"""
         from unittest import mock

@@ -219,6 +219,14 @@ def backends_test(req: BackendTestReq):
     return {"backend": req.backend, **impl.status()}
 
 
+@app.get("/api/diagnose")
+def diagnose():
+    """分层自诊断（0.1.31）：服务端配置/代理转发/依赖服务连接三层逐层探活，
+    「提示502」类问题一键定位故障层。只读探测，不登录不建目录。"""
+    import diag as diagmod
+    return diagmod.run(VERSION)
+
+
 # ------------------------------------------------------------ Docker 版迅雷一键部署
 
 class XdDeployIn(BaseModel):

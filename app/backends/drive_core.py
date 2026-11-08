@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Callable
 
 import httpx
@@ -30,6 +31,15 @@ ACTIVE_PHASES = "PHASE_TYPE_PENDING,PHASE_TYPE_RUNNING"
 TASK_TYPES = "user#download,user#download-url"
 # 下载根目录常见名（无 /device/config 提示时的兜底匹配）
 DOWNLOAD_ROOT_NAMES = {"download", "downloads", "下载", "下载目录"}
+
+# 目录解析总预算（秒）：多形状阶梯+逐段建目录是同步链路，上游慢/挂起时
+# 无界累计会拖垮网关响应预算（0.1.31「提示502」原因链的一环）——超预算
+# 即止损降级/报明确错误，单次解析最长 ~18s。
+RESOLVE_BUDGET = 18.0
+# 解析结果复用窗口（秒）：批量派发同一目录只解析一次（0.1.31 提速关键）。
+# 按 client 身份隔离（每个请求新建 DownloadManager/client），不跨请求串味。
+RESOLVE_CACHE_TTL = 120.0
+_resolve_cache: dict[tuple, tuple[float, tuple[str, str], object]] = {}
 
 PHASE_STATE = {
     "PHASE_TYPE_PENDING": "waiting",
@@ -105,6 +115,13 @@ def _dbg(msg: str) -> None:
         pass
 
 
+def _clip_timeout(deadline: float | None, per_call: float) -> float:
+    """把单次请求超时裁到解析预算剩余时间内（预算外不限制）。"""
+    if deadline is None:
+        return per_call
+    return max(1.0, min(per_call, deadline - time.monotonic()))
+
+
 def _norm_dir(path: str) -> str:
     """目录路径归一：clean + 尾斜杠。"""
     p = (path or "").replace("\\", "/").strip()
@@ -146,7 +163,7 @@ class DriveCore:
         return h
 
     def _request(self, method: str, path: str, *, params: dict | None = None,
-                 json_body: dict | None = None, timeout: float = 30) -> dict:
+                 json_body: dict | None = None, timeout: float = 15) -> dict:
         # path 以 http 开头时视为完整 URL（如 drive/v1 的同级接口 /device/config）
         url = path if path.startswith("http") else self.base_url + path
         try:
@@ -172,7 +189,7 @@ class DriveCore:
     def device_targets(self) -> list[dict]:
         """runner 任务即设备空间：[{target, name}]。"""
         data = self._request("GET", "/tasks",
-                             params={"type": "user#runner"})
+                             params={"type": "user#runner"}, timeout=8)
         out = []
         for t in data.get("tasks", []):
             target = (t.get("params") or {}).get("target", "").strip()
@@ -231,15 +248,21 @@ class DriveCore:
         return [("扩展形状", shape_ext), ("空间形状", shape_space),
                 ("标准形状", standard), ("极简形状", minimal)]
 
-    def _folders(self, space: str, parent_id: str = "") -> list[dict]:
+    def _folders(self, space: str, parent_id: str = "",
+                 deadline: float | None = None) -> list[dict]:
         """目录表：按 _folder_shapes 阶梯逐形状重试，取第一个非空结果；
         只要有任一形状成功（哪怕空表）就不升级报错，全军覆没才抛聚合错误
         （每形状的错误都保留，502/超时这类网关差异一眼可辨）。
+        deadline（0.1.31）：解析总预算，超时即止损，防慢上游拖垮响应预算。
         kind 客户端兜底过滤：极简形状无服务端过滤时只信 drive#folder。"""
         saw_ok, tries = False, []
         for label, params in self._folder_shapes(space, parent_id):
+            if deadline is not None and time.monotonic() >= deadline:
+                tries.append(f"预算耗尽（{RESOLVE_BUDGET:.0f}s）未及尝试")
+                break
             try:
-                data = self._request("GET", "/files", params=params, timeout=15)
+                data = self._request("GET", "/files", params=params,
+                                     timeout=_clip_timeout(deadline, 8))
             except BackendError as exc:
                 tries.append(f"{label}：{str(exc)[:100]}")
                 continue
@@ -255,11 +278,13 @@ class DriveCore:
         raise BackendError(
             "引擎目录表查询失败（各形状均报错）：" + "；".join(tries))
 
-    def _make_folder(self, space: str, parent_id: str, name: str) -> dict:
+    def _make_folder(self, space: str, parent_id: str, name: str,
+                     deadline: float | None = None) -> dict:
         """建子目录：POST /drive/v1/files kind=drive#folder。"""
         data = self._request("POST", "/files", json_body={
             "parent_id": parent_id, "name": name,
-            "space": space, "kind": "drive#folder"})
+            "space": space, "kind": "drive#folder"},
+            timeout=_clip_timeout(deadline, 10))
         fid = (data.get("file") or {}).get("id") or ""
         if not fid:
             raise BackendError(f"创建下载子目录 {name} 失败：响应缺少 file.id")
@@ -276,8 +301,26 @@ class DriveCore:
           3. 名称/路径命中下载根常见名（downloads/下载/…）
           4. 启发式兜底：首个顶层目录的 parent_id 或 id
         directory 为根下子目录（相对路径，或根目录下的绝对路径），
-        中间层级缺失时自动创建（多级逐段建）。"""
-        folders = self._folders(space, "")
+        中间层级缺失时自动创建（多级逐段建）。
+
+        0.1.31：结果按 (base_url, space, directory) 缓存 120s——批量派发
+        同目录只解析一次（此前每条链接重跑整条目录链，是「批量必超时
+        →提示502」的放大器）；缓存按 client 身份隔离，不跨请求串味。"""
+        key = (self.base_url, space, (directory or "").strip())
+        hit = _resolve_cache.get(key)
+        if (hit and hit[2] is self.client
+                and time.monotonic() - hit[0] < RESOLVE_CACHE_TTL):
+            return hit[1]
+        result = self._resolve_uncached(space, directory,
+                                        time.monotonic() + RESOLVE_BUDGET)
+        if len(_resolve_cache) > 256:             # 简单封顶，防长期运行膨胀
+            _resolve_cache.clear()
+        _resolve_cache[key] = (time.monotonic(), result, self.client)
+        return result
+
+    def _resolve_uncached(self, space: str, directory: str,
+                          deadline: float) -> tuple[str, str]:
+        folders = self._folders(space, "", deadline=deadline)
         if not folders:
             raise BackendError(
                 "引擎目录表为空，无法解析下载根目录"
@@ -331,13 +374,13 @@ class DriveCore:
         try:
             for seg in [s for s in rel.split("/") if s]:
                 child = None
-                for f in self._folders(space, pid):
+                for f in self._folders(space, pid, deadline=deadline):
                     if ((f.get("name") or "").strip() == seg
                             or _folder_path(f) == ppath + seg + "/"):
                         child = f
                         break
                 if child is None:
-                    child = self._make_folder(space, pid, seg)
+                    child = self._make_folder(space, pid, seg, deadline=deadline)
                 pid = str(child.get("id"))
                 ppath = ppath + seg + "/"
         except BackendError:
@@ -419,12 +462,14 @@ class DriveCore:
         filters_s = json.dumps(filters, separators=(",", ":"))
         out: list[dict] = []
         page_token = ""
-        for _ in range(20):        # 安全上限，防异常响应导致死循环
+        # 0.1.31：翻页封顶 6 页（1200 条）+ 单页 8s——此前上限 20 页无超时
+        # 特化，慢上游下任务列表能把整个响应拖过中继超时（裸 502）。
+        for _ in range(6):
             params: dict = {"space": space, "filters": filters_s,
                             "limit": "200"}
             if page_token:
                 params["page_token"] = page_token
-            data = self._request("GET", "/tasks", params=params)
+            data = self._request("GET", "/tasks", params=params, timeout=8)
             out.extend(data.get("tasks", []))
             page_token = ((data.get("next_page_token")
                            or data.get("nextPageToken") or "").strip())
@@ -453,11 +498,11 @@ class DriveCore:
             pass                      # 设备发现失败不阻断主 space 的查找
         for sp in spaces:
             page_token = ""
-            for _ in range(20):
+            for _ in range(6):    # 0.1.31：封顶 6 页 + 单页 8s（同 list_tasks）
                 params: dict = {"space": sp, "filters": filters}
                 if page_token:
                     params["page_token"] = page_token
-                data = self._request("GET", "/tasks", params=params)
+                data = self._request("GET", "/tasks", params=params, timeout=8)
                 for t in data.get("tasks", []):
                     if str(t.get("id", "")) == str(task_id):
                         if not t.get("space"):

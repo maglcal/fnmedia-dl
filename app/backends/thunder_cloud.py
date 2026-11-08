@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 import httpx
 
 from .base import Backend, BackendError, ParsedResource, TaskView
-from .drive_core import DriveCore, _dbg, task_to_view
+from .drive_core import DriveCore, _clip_timeout, _dbg, task_to_view
 
 XLUSER_BASE = "https://xluser-ssl.xunlei.com"
 XLUSER_API = XLUSER_BASE + "/v1"
@@ -213,7 +213,7 @@ class _CloudDrive(DriveCore):
         if ent and not refresh and now - ent.get("at", 0) < self._RELAY_TTL:
             return ent
         data = self._request("GET", DRIVE_API + "/apps/INNER_API",
-                             params={"space": space}, timeout=15)
+                             params={"space": space}, timeout=10)
         url = (data.get("link") or "").strip()
         if not url:
             for it in (data.get("links") or []):
@@ -270,22 +270,35 @@ class _CloudDrive(DriveCore):
                          filters=filters_kind)
         return [("设备API完整形状", full), ("设备API极简形状", kind_only)]
 
-    def _folders(self, space: str, parent_id: str = "") -> list[dict]:
-        """目录表走设备专属 API（0.1.30 修复）；失败时回退基类阶梯
-        （api-pan 标准/极简形状，兼容万一 api-pan 开放设备空间的未来变化）。
-        两路全挂才抛聚合错误（设备API 与 api-pan 每一步的错误都保留）。"""
+    def _folders(self, space: str, parent_id: str = "",
+                 deadline: float | None = None) -> list[dict]:
+        """目录表走设备专属 API（0.1.30 修复）。
+
+        0.1.31 回退策略收紧：只有**设备 API 发现失败**（INNER_API 不可达/
+        缺 link）才回退基类阶梯（api-pan 标准/极简形状，兼容万一 api-pan
+        开放设备空间的未来变化）；发现成功但 relay 形状全挂时直接抛聚合
+        错误——通用接口对设备空间不可用，回退阶梯只会浪费响应预算。deadline：解析总预算，超时即止损。"""
         tries: list[str] = []
+        discovered = False
         for refresh in (False, True):     # 第二轮强制重发现（凭据过期自愈）
+            if deadline is not None and time.monotonic() >= deadline:
+                tries.append("预算耗尽未及尝试")
+                break
             try:
                 api = self._relay_api(space, refresh=refresh)
             except BackendError as exc:
                 tries.append(f"设备API发现：{str(exc)[:100]}")
                 break
+            discovered = True
             saw_ok = False
             for label, params in self._relay_folder_shapes(api, space, parent_id):
+                if deadline is not None and time.monotonic() >= deadline:
+                    tries.append("预算耗尽未及尝试")
+                    break
                 try:
                     data = self._request("GET", api["base"] + "drive/v1/files",
-                                         params=params, timeout=15)
+                                         params=params,
+                                         timeout=_clip_timeout(deadline, 8))
                 except BackendError as exc:
                     tries.append(f"{label}：{str(exc)[:100]}")
                     continue
@@ -298,29 +311,37 @@ class _CloudDrive(DriveCore):
                 tries.append(f"{label}：空表")
             if saw_ok:                    # 设备 API 可达但目录为空：如实返回
                 return []
-        _dbg(f"设备API目录表未果回退api-pan: {space[:12]} {str(tries)[:80]}")
+        if discovered:                    # relay 全挂 ≠ api-pan 能救，别空转
+            raise BackendError(
+                "云端目录表查询失败（设备API 各形状均失败，未回退 api-pan"
+                "——设备空间的 api-pan /files 只会 502）：" + "；".join(tries))
+        _dbg(f"设备API发现失败回退api-pan: {space[:12]} {str(tries)[:80]}")
         try:
-            return super()._folders(space, parent_id)
+            return super()._folders(space, parent_id, deadline=deadline)
         except BackendError as exc:
             raise BackendError(
                 "云端目录表查询失败（设备API 与 api-pan 均失败）："
                 + "；".join(tries + [str(exc)[:400]])) from exc
 
-    def _make_folder(self, space: str, parent_id: str, name: str) -> dict:
-        """建子目录走设备专属 API（带 plugin 凭据），
-        失败回退基类（api-pan）。"""
+    def _make_folder(self, space: str, parent_id: str, name: str,
+                     deadline: float | None = None) -> dict:
+        """建子目录走设备专属 API（带 plugin 凭据）。
+        0.1.31：仅发现失败才回退基类（api-pan）；发现成功但 relay POST
+        失败直接抛错（api-pan 对设备空间建目录同样 502，回退无意义）。"""
         try:
             api = self._relay_api(space)
-            data = self._request("POST", api["base"] + "drive/v1/files",
-                                 params=self._relay_params(api, space),
-                                 json_body={"parent_id": parent_id, "name": name,
-                                            "space": space, "kind": "drive#folder"},
-                                 timeout=15)
-            fid = (data.get("file") or {}).get("id") or ""
         except BackendError:
-            fid = ""
+            return super()._make_folder(space, parent_id, name,
+                                        deadline=deadline)
+        data = self._request("POST", api["base"] + "drive/v1/files",
+                             params=self._relay_params(api, space),
+                             json_body={"parent_id": parent_id, "name": name,
+                                        "space": space, "kind": "drive#folder"},
+                             timeout=_clip_timeout(deadline, 10))
+        fid = (data.get("file") or {}).get("id") or ""
         if not fid:
-            return super()._make_folder(space, parent_id, name)
+            raise BackendError(
+                f"创建下载子目录 {name} 失败（设备API）：响应缺少 file.id")
         return {"id": fid, "name": name, "params": {"RealPath": ""}}
 
     def _device_config(self, space: str = "") -> dict:
@@ -332,16 +353,17 @@ class _CloudDrive(DriveCore):
                 api = self._relay_api(space)
                 return self._request("GET", api["base"] + "device/config",
                                      params=self._relay_params(api, space),
-                                     timeout=15)
+                                     timeout=10)
             except BackendError:
                 pass
         return super()._device_config(space)
 
     def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
-        """api-pan 回退阶梯的形状顺序（0.1.30 起仅作设备 API 不可达时的回退）：
-        标准/极简优先——api-pan 对引擎形状（with/device_space）直接 502。"""
+        """api-pan 回退阶梯的形状顺序（0.1.31 起仅在设备 API 发现失败时用）：
+        裁剪为标准/极简 2 形状——扩展/空间引擎形状（with/device_space）
+        对 api-pan 直接 502，多试纯属浪费响应预算。"""
         shapes = dict(super()._folder_shapes(space, parent_id))
-        order = ["标准形状", "极简形状", "扩展形状", "空间形状"]
+        order = ["标准形状", "极简形状"]
         return [(k, shapes[k]) for k in order if k in shapes]
 
 

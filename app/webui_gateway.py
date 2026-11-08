@@ -15,6 +15,7 @@ ui/config 中的 gatewaySocket 连接应用根目录下的 fnmedia-dl.sock。
 """
 from __future__ import annotations
 
+import json
 import os
 import socket
 import sys
@@ -25,7 +26,11 @@ APP_PREFIX = "/app/fnmedia-dl"
 SOCK_NAME = "fnmedia-dl.sock"
 MAX_HEADER = 1 << 20
 MAX_BODY = 64 << 20  # 管理页提交数据很小；留出足够安全余量
-RELAY_TIMEOUT = 60
+# 上游响应等待上限。原 60s 是「派发失败 提示502」的直接原因（0.1.31 实测）：
+# 同步派发链被慢/挂起的迅雷接口拖过 60s 时，中继静默断连不回响应，
+# 桌面网关只能给浏览器回 502 白页。放宽到 180s 兜住慢批量，同时错误路径
+# 改为显式回 JSON（见 _reply_error），任何失败都带原因不再裸 502。
+RELAY_TIMEOUT = 180
 
 
 def gateway_socket_path(repo: Path) -> Path:
@@ -158,25 +163,47 @@ def _rewrite_request(head: bytes) -> bytes:
     return b"\r\n".join(rebuilt) + b"\r\n\r\n"
 
 
-def _pump(src: socket.socket, dst: socket.socket) -> None:
+def _reply_error(client: socket.socket, status: int, detail: str) -> None:
+    """中继层错误显式回 JSON 响应（0.1.31）。
+
+    原实现上游超时/断连时 `except OSError: pass` 静默关连接——桌面网关
+    收不到任何响应只能自己回 502 白页，用户只见「提示502」无线索。
+    显式回带原因的 JSON 后，UI 的 errText 直接显示失败层级与建议。"""
+    reason = "Gateway Timeout" if status == 504 else "Bad Gateway"
+    body = json.dumps({"detail": detail}, ensure_ascii=False).encode("utf-8")
+    head = (f"HTTP/1.1 {status} {reason}\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n").encode("latin-1")
+    try:
+        client.sendall(head + body)
+    except OSError:
+        pass
+
+
+def _pump(src: socket.socket, dst: socket.socket, sent: list) -> None:
+    """上游→客户端单向泵流。已回传字节数累加进 sent[0]（可变计数器：
+    超时异常抛出时调用方仍能读到部分进度，决定能否补错误响应）。"""
     try:
         while True:
             data = src.recv(65536)
             if not data:
                 break
             dst.sendall(data)
+            sent[0] += len(data)
+    except TimeoutError:
+        raise
     except OSError:
         pass
-    finally:
-        try:
-            dst.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
 
 
 def _handle(client: socket.socket, upstream_sock: Path) -> None:
-    """单请求单连接：读一条完整请求 → 剥前缀改写 → 转发 → 响应读到 EOF 回传。"""
+    """单请求单连接：读一条完整请求 → 剥前缀改写 → 转发 → 响应读到 EOF 回传。
+
+    上游连接失败/响应超时必须显式回 502/504 JSON（_reply_error）；
+    只有已回传部分响应后才允许静默收尾（不能发第二份响应）。"""
     remote: socket.socket | None = None
+    sent = [0]                     # 已回传响应字节数（跨异常可见）
     try:
         received = _recv_until_headers(client)
         if received is None:
@@ -193,12 +220,36 @@ def _handle(client: socket.socket, upstream_sock: Path) -> None:
 
         remote = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         remote.settimeout(RELAY_TIMEOUT)
-        remote.connect(str(upstream_sock))
-        remote.sendall(_rewrite_request(head) + body)
-
-        # 只回传响应；不再从 client 盲泵数据到上游——同连接后续请求
-        # 若被转发会绕过改写（404 事故原因），这里直接随连接关闭丢弃。
-        _pump(remote, client)
+        try:
+            remote.connect(str(upstream_sock))
+        except OSError as exc:
+            _reply_error(client, 502,
+                         f"上游服务未就绪：无法连接主服务 {upstream_sock.name}"
+                         f"（{exc}）——请在应用中心确认 fnmedia-dl 服务已启动，"
+                         "或在管理页点「自诊断」查看服务状态")
+            return
+        try:
+            remote.sendall(_rewrite_request(head) + body)
+            # 只回传响应；不再从 client 盲泵数据到上游——同连接后续请求
+            # 若被转发会绕过改写（404 事故原因），这里直接随连接关闭丢弃。
+            _pump(remote, client, sent)
+            if not sent[0]:
+                # 上游连接即断、一个字节都没回：桌面网关拿到空响应同样
+                # 只能回 502 白页——显式补 JSON 错误保住线索。
+                _reply_error(client, 502,
+                             "上游未返回任何响应（连接即断）：主服务可能正在"
+                             "重启或崩溃——请稍后重试，或在管理页点「自诊断」"
+                             "查看服务状态")
+        except TimeoutError:
+            if sent[0]:
+                return       # 已回传部分响应，不能补第二份响应
+            _reply_error(client, 504,
+                         f"上游响应超时（>{RELAY_TIMEOUT}s）：主服务处理时间过长"
+                         "——常见为迅雷接口慢/挂起拖长派发链；请在管理页点"
+                         "「自诊断」定位慢点，或减少单次批量条数后重试")
+        except OSError as exc:
+            if not sent[0]:
+                _reply_error(client, 502, f"上游传输中断：{exc}")
     except OSError:
         pass
     finally:
