@@ -8,6 +8,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 
@@ -397,6 +398,9 @@ class TestDriveCore(unittest.TestCase):
             path = request.url.path
             if path.endswith("/files") and request.method == "GET":
                 return httpx.Response(502, text="bad gateway")
+            if request.method == "GET" and path.endswith("/tasks"):
+                # 0.1.32 反查兜底会拉任务列表：无可反查条目 → 维持直传兜底
+                return httpx.Response(200, json={"tasks": []})
             captured.update(json.loads(request.content))
             return httpx.Response(200, json={"task": {"id": "t-5"}})
         core = self._mk(handler)
@@ -1572,6 +1576,151 @@ class TestCloudDeviceApi(unittest.TestCase):
         self.assertEqual(captured["path"], "/drive/v1/task")
         self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
         self.assertEqual(captured["params"]["parent_folder_path"], "/downloads/")
+
+
+class TestDeviceTimeoutAndHarvest(unittest.TestCase):
+    """0.1.32：error_code=2「远程调用失败」=迅雷服务端调用设备超时（社区同报案例）。GET 幂等重试、错误透明化（指引+脱敏证据）、
+    历史任务反查兜底保根 id。"""
+
+    TIMEOUT_BODY = {
+        "error": "external_unknown_err", "error_code": 2,
+        "error_description": "远程调用失败",
+        "error_details": [
+            {"@type": "type.googleapis.com/google.rpc.DebugInfo",
+             "detail": ('Get "http://k8s.xsl/drive-reverse-proxy/v1/proxy/'
+                        '584201392/7abd3182d399f7bdda199550d8babede/x": '
+                        'net/http: request canceled (Client.Timeout exceeded '
+                        'while awaiting headers)')},
+            {"@type": "type.googleapis.com/google.rpc.LocalizedMessage",
+             "locale": "zh-cn", "message": "远程调用失败"}]}
+
+    def _tc(self, handler):
+        conf = {"login_name": "u", "password": "p", "device_id": "c" * 32,
+                "access_token": "at-1", "target": "remote-1"}
+        return ThunderCloud(_client(handler), conf)
+
+    @staticmethod
+    def _core(handler):
+        return DriveCore(_client(handler), "http://engine/drive/v1",
+                         lambda: {"h": "1"})
+
+    def test_get_retries_on_device_timeout_then_succeeds(self):
+        """GET 幂等重试：前 2 次设备超时、第 3 次成功（瞬态自愈）。"""
+        calls = []
+
+        def handler(request):
+            if request.url.path.endswith("/apps/INNER_API"):
+                calls.append(1)
+                if len(calls) < 3:
+                    return httpx.Response(200, json=self.TIMEOUT_BODY)
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            return httpx.Response(200, json={})
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            api = tc.core._relay_api("remote-1")
+        self.assertEqual(api["base"], "https://relay.example/p/")
+        self.assertEqual(len(calls), 3)
+
+    def test_post_not_retried_on_device_timeout(self):
+        """POST（建目录）非幂等不重试；报错带可操作指引。"""
+        posts = []
+
+        def handler(request):
+            if request.url.path.endswith("/apps/INNER_API"):
+                return httpx.Response(200, json={
+                    "link": "https://relay.example/p/"
+                            "?plugin_app_id=i&plugin_app_token=t"})
+            if request.method == "POST":
+                posts.append(1)
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            return httpx.Response(200, json={"files": []})
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError) as ctx:
+                tc.core._make_folder("remote-1", "p0", "sub")
+        self.assertEqual(len(posts), 1)
+        msg = str(ctx.exception)
+        self.assertIn("设备端响应超时", msg)
+        self.assertIn("error_code=2", msg)
+
+    def test_device_timeout_message_guidance_and_masked_hint(self):
+        """错误文案含人读指引 + 脱敏证据（哈希/uid 掩码，链路形态保留）。"""
+        def handler(request):
+            return httpx.Response(200, json=self.TIMEOUT_BODY)
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError) as ctx:
+                tc.core._relay_api("remote-1", refresh=True)
+        msg = str(ctx.exception)
+        self.assertIn("设备端响应超时", msg)
+        self.assertIn("迅雷远程插件", msg)
+        self.assertIn("证据", msg)
+        self.assertIn("<hash>", msg)
+        self.assertIn("<id>", msg)
+        self.assertNotIn("7abd3182d399f7bdda199550d8babede", msg)
+        self.assertNotIn("584201392", msg)
+
+    def test_harvest_root_prefers_entry_with_path(self):
+        """历史任务反查：优先采用带 parent_folder_path 的条目。"""
+        def handler(request):
+            if request.url.path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t1", "params": {"parent_folder_id": "f-no-path"}},
+                    {"name": "t2", "params": {"parent_folder_id": "f-2",
+                                              "parent_folder_path": "/downloads/"}},
+                    {"name": "runner", "params": {"target": "remote-1"}}]})
+            return httpx.Response(200, json={})
+
+        self.assertEqual(self._core(handler)._harvest_root("remote-1"),
+                         ("f-2", "/downloads/"))
+
+    def test_harvest_root_none_without_params(self):
+        """无历史任务带 parent_folder_id → None（不误用 target 等杂参）。"""
+        def handler(request):
+            return httpx.Response(200, json={"tasks": [
+                {"name": "r", "params": {"target": "remote-1"}}]})
+
+        self.assertIsNone(self._core(handler)._harvest_root("remote-1"))
+
+    def test_resolve_uses_harvested_root_when_folders_unavailable(self):
+        """目录表全挂（错误体）时：下载根解析反查历史任务兜底，
+        空目录直接返回反查到的 (id, path)。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            if path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t", "params": {
+                        "parent_folder_id": "f-h",
+                        "parent_folder_path": "/downloads/"}}]})
+            return httpx.Response(200, json={})
+
+        self.assertEqual(self._core(handler).resolve_dest_folder("remote-1", ""),
+                         ("f-h", "/downloads/"))
+
+    def test_resolve_harvested_root_degrades_subdir_to_path(self):
+        """反查兜底下子目录仍不可解析（插件没恢复）→ 保留根 id + 完整目标
+        路径交引擎尽力落盘（阶梯降级铁律）。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            if path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t", "params": {
+                        "parent_folder_id": "f-h",
+                        "parent_folder_path": "/downloads/"}}]})
+            return httpx.Response(200, json={})
+
+        pid, path = self._core(handler).resolve_dest_folder("remote-1", "movies")
+        self.assertEqual(pid, "f-h")
+        self.assertEqual(path, "/downloads/movies/")
 
 
 if __name__ == "__main__":

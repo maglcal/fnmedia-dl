@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """分层自诊断（0.1.31）：一键定位「提示502」类问题的故障层。
 
-覆盖三层故障面（每步 {"step","ok","ms","detail"}，单探针 5s 硬超时）：
+覆盖三层故障面（每步 {"step","ok","ms","detail"}，单探针 5~8s 硬超时）：
   A 服务端配置面：服务版本 / 网关 socket / 上游 socket
-  B 依赖服务连接面：DNS / 迅雷登录态 / 设备发现 / 设备 API 发现
-  C 数据链路面：中继目录表 / 下载根解析 / api-pan 对照
+  B 依赖服务连接面：DNS / 迅雷登录态 / 设备发现（含目标名关联）/ 设备 API 发现
+  C 数据链路面：中继目录表 / 下载根解析 / 历史任务反查 / api-pan 对照（含错误体）
 
 设计原则：只读探测——不登录、不建目录、不建任务（下载根解析用空目录，
 只查表不建级）；任何一步异常都不阻断后续步骤（哪层断了一眼可见）。
@@ -26,8 +26,8 @@ STEP_TIMEOUT = 5.0          # 单步硬超时（秒）：线程 join 上限
 DNS_HOSTS = ["api-pan.xunlei.com", "xluser-ssl.xunlei.com"]
 
 
-def _probe(step: str, fn) -> dict:
-    """跑一个探测步骤：计时 + 异常捕获 + 线程硬超时。
+def _probe(step: str, fn, timeout: float = STEP_TIMEOUT) -> dict:
+    """跑一个探测步骤：计时 + 异常捕获 + 线程硬超时（timeout 可按步放大）。
     超时的线程是 daemon，留它自生自灭（探针只读，无副作用）。"""
     out: dict = {}
 
@@ -40,11 +40,11 @@ def _probe(step: str, fn) -> dict:
     t0 = time.monotonic()
     th = threading.Thread(target=run, daemon=True)
     th.start()
-    th.join(STEP_TIMEOUT)
+    th.join(timeout)
     ms = int((time.monotonic() - t0) * 1000)
     if th.is_alive():
         return {"step": step, "ok": False, "ms": ms,
-                "detail": f"超时（>{STEP_TIMEOUT:.0f}s 无响应，上游挂起或网络阻塞）"}
+                "detail": f"超时（>{timeout:.0f}s 无响应，上游挂起或网络阻塞）"}
     if "error" in out:
         return {"step": step, "ok": False, "ms": ms, "detail": out["error"]}
     return {"step": step, "ok": True, "ms": ms, "detail": out.get("detail", "")}
@@ -123,8 +123,13 @@ def run(version: str = "") -> dict:
                  for t in targets]
         if not target and targets:
             target = str(targets[0].get("target") or "")
+        # 目标名关联（0.1.32）：让「派发目标」可读——目标是哪台/什么类型
+        # 直接决定设备插件是否可用（电脑端常无插件 → error_code=2）
+        tname = next((str(t.get("name") or "?") for t in targets
+                      if str(t.get("target") or "") == target), "")
         return f"发现 {len(targets)} 台：" + ("、".join(names) or "无") \
-            + (f"；派发目标 {target[:10]}…" if target else "")
+            + (f"；派发目标「{tname or '未在在线列表'}」（{target[:10]}…）"
+               if target else "")
 
     steps.append(_probe("设备发现", probe_devices))
 
@@ -147,12 +152,13 @@ def run(version: str = "") -> dict:
     def probe_folders():
         if not target:
             raise RuntimeError("无目标设备（先过「设备发现」步）")
-        deadline = time.monotonic() + 10.0
+        # deadline 6s：让降级链在 8s 线程窗内收口，真实错误不被超时掩盖
+        deadline = time.monotonic() + 6.0
         files = _get_core()._folders(target, "", deadline=deadline)
         names = [str(f.get("name") or "?") for f in files[:5]]
         return f"顶层目录 {len(files)} 个：" + ("、".join(names) or "空表")
 
-    steps.append(_probe("中继目录表", probe_folders))
+    steps.append(_probe("中继目录表", probe_folders, timeout=8.0))
 
     def probe_root():
         if not target:
@@ -161,7 +167,25 @@ def run(version: str = "") -> dict:
         pid, path = _get_core().resolve_dest_folder(target, "")
         return f"下载根 id={str(pid)[:12]}… 路径={path or '（未提供）'}"
 
-    steps.append(_probe("下载根解析", probe_root))
+    steps.append(_probe("下载根解析", probe_root, timeout=8.0))
+
+    def probe_harvest():
+        if not target:
+            raise RuntimeError("无目标设备（先过「设备发现」步）")
+        core = _get_core()
+        tasks = core.list_tasks(target)
+        hv = core._harvest_root(target, tasks)
+        if hv:
+            res = f"反查可用：id={str(hv[0])[:12]}… 路径={hv[1] or '（无）'}"
+        else:
+            res = "反查不可用（无历史任务带 parent_folder_id）"
+        phases = [f"{str(t.get('name') or '?')[:14]}("
+                  f"{str(t.get('phase') or '?').replace('PHASE_TYPE_', '')})"
+                  for t in tasks[:3]]
+        return (f"{res}；设备任务 {len(tasks)} 条，最近："
+                + ("、".join(phases) or "无"))
+
+    steps.append(_probe("历史任务反查", probe_harvest, timeout=8.0))
 
     # ---- 信息性对照：api-pan 对设备空间的行为（0.1.30 复核点）
     def probe_apipan():
@@ -180,8 +204,19 @@ def run(version: str = "") -> dict:
             return (f"api-pan 不可达（{exc}）——目录表已走设备 API，"
                     f"此项仅作对照，不影响派发")
         if resp.status_code >= 400:
+            extra = ""
+            try:
+                d = resp.json() or {}
+                code = d.get("error_code") or d.get("errorCode") or "?"
+                desc = (d.get("error_description") or d.get("errorDesc")
+                        or d.get("error") or "")
+                extra = f"，响应体 error_code={code} {desc}"
+                if str(code) == "2" or "远程调用失败" in str(desc):
+                    extra += "（与「设备 API 发现」同因：设备端插件响应超时）"
+            except ValueError:
+                pass
             return (f"HTTP {resp.status_code}（符合预期：api-pan /files 不服务"
-                    f"设备空间，0.1.30——目录表须走设备 API）")
+                    f"设备空间，0.1.30——目录表须走设备 API）{extra}")
         try:
             n = len((resp.json() or {}).get("files") or [])
         except ValueError:
@@ -189,11 +224,11 @@ def run(version: str = "") -> dict:
         return (f"HTTP 200（files={n}）：api-pan 竟可服务该空间——"
                 f"设备 API 非必需，但当前实现优先走设备 API 不受影响")
 
-    steps.append(_probe("api-pan 对照", probe_apipan))
+    steps.append(_probe("api-pan 对照", probe_apipan, timeout=8.0))
 
-    # ok 只看关键步骤（最后一步 api-pan 对照为信息性）
-    critical = steps[:-1]
-    ok = all(s["ok"] for s in critical)
+    # ok 只看关键步骤（历史任务反查/api-pan 对照是信息性兜底与对照）
+    info_steps = {"历史任务反查", "api-pan 对照"}
+    ok = all(s["ok"] for s in steps if s["step"] not in info_steps)
     _dbg(f"自诊断: ok={ok} " + " ".join(f"{s['step']}={'✓' if s['ok'] else '✗'}"
                                        for s in steps))
     return {"ok": ok, "version": version, "steps": steps}

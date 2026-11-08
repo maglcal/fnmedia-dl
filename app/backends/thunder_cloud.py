@@ -71,6 +71,12 @@ EMAIL_RE = re.compile(r"\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*")
 # 需要刷新令牌重试的错误码
 TOKEN_ERROR_CODES = {4122, 4121, 10, 16}
 CAPTCHA_ERROR_CODE = 9
+# 设备端调用超时（社区同报案例）：设备端插件调用超时，返回
+# {"error":"external_unknown_err","error_code":2,"error_description":"远程调用失败",
+#  "error_details":[{"detail":"Get \"http://k8s.xsl/drive-reverse-proxy/...\":
+#  net/http: request canceled (Client.Timeout exceeded while awaiting headers)"},…]}
+# ——设备端插件响应慢或未运行（瞬态居多）。
+DEVICE_TIMEOUT_CODE = 2
 
 
 def _md5_hex(s: str) -> str:
@@ -123,6 +129,41 @@ def _err_text(prefix: str, data: dict) -> str:
               or data.get("error") or "未知错误")
     code = data.get("error_code") or data.get("errorCode") or 0
     return f"{prefix}：{detail}（error_code={code} · v{_pkg_version()}）"
+
+
+def _is_device_timeout(data: dict) -> bool:
+    """设备端调用超时类错误（error_code=2 / external_unknown_err / 远程调用失败）：
+    瞬态居多，GET 可安全重试。"""
+    if _err_code(data) == DEVICE_TIMEOUT_CODE:
+        return True
+    if (data.get("error") or "").strip() == "external_unknown_err":
+        return True
+    return "远程调用失败" in (data.get("errorDesc") or ""
+                             or data.get("error_description") or "")
+
+
+def _masked_hint(data: dict) -> str:
+    """error_details[].detail 证据摘要（脱敏）：含 uid/设备哈希/URL，
+    长十六进制与长数字段掩掉，只留链路形态给人看。"""
+    for it in (data.get("error_details") or []):
+        if isinstance(it, dict) and (it.get("detail") or "").strip():
+            s = str(it["detail"])
+            s = re.sub(r"[0-9a-fA-F]{16,}", "<hash>", s)
+            s = re.sub(r"\d{6,}", "<id>", s)
+            return s[:160]
+    return ""
+
+
+def _device_timeout_text(data: dict) -> str:
+    """设备端调用超时的专用错误文案：说清是谁的问题、影响面、怎么办。"""
+    hint = _masked_hint(data)
+    return (
+        "迅雷接口错误：设备端响应超时（error_code=2 · v" + _pkg_version() + "）——"
+        "迅雷服务端调用目标设备超时：设备端迅雷远程插件响应慢或未运行"
+        "（设备高负载下载/网络链路差/插件未启用均会触发）。此错误只影响目录浏览与"
+        "路径解析，稍后重试常自动恢复；若持续出现，请检查目标设备上的迅雷远程插件"
+        "是否在运行，或在设置里换一台支持远程插件的设备"
+        + (f"。证据：{hint}" if hint else ""))
 
 
 def device_sign(device_id: str) -> str:
@@ -187,6 +228,11 @@ class _CloudDrive(DriveCore):
                 self.backend._refresh_captcha_at_login(
                     action, self.backend.conf.get("user_id", ""))
                 continue
+            if attempt < 2 and method == "GET" and _is_device_timeout(data):
+                # 设备端超时瞬态居多，GET 幂等可重试。
+                # 1s 退避给设备端插件喘息；POST 不重试（建目录非幂等）。
+                time.sleep(1)
+                continue
             if err_code == CAPTCHA_ERROR_CODE:
                 uid = self.backend.conf.get("user_id", "")
                 raise BackendError(
@@ -194,6 +240,8 @@ class _CloudDrive(DriveCore):
                     "这不是短信验证码输错；请点「重新登录」重试，"
                     "若仍失败请重新完成一次短信验证"
                     f"（v{_pkg_version()}，user_id={'已取到' if uid else '空'}）")
+            if _is_device_timeout(data):
+                raise BackendError(_device_timeout_text(data))
             raise BackendError(_err_text("迅雷接口错误", data))
         raise BackendError("迅雷接口错误：重试后仍失败")
 

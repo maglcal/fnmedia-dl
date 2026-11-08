@@ -318,41 +318,79 @@ class DriveCore:
         _resolve_cache[key] = (time.monotonic(), result, self.client)
         return result
 
+    def _harvest_root(self, space: str,
+                      tasks: list[dict] | None = None) -> tuple[str, str] | None:
+        """目录表不可用时的兜底（0.1.32）：从历史任务反查 parent_folder_id/path。
+
+        建任务走 api-pan /task 不依赖设备插件（设备插件超时时下载仍正常），历史任务对象的 params 里带着真实可用的 parent_folder_id。设备插件超时时这是拿到真实根 id 的唯一通路。
+        tasks 可传入已取到的任务列表（诊断复用，免二次拉取）。
+        返回 (id, path) 或 None（无历史任务/反查失败）。"""
+        if tasks is None:
+            try:
+                tasks = self.list_tasks(space)
+            except BackendError as exc:
+                _dbg(f"历史任务反查失败: {str(exc)[:80]}")
+                return None
+        best: tuple[str, str] | None = None
+        for t in tasks:
+            p = t.get("params") if isinstance(t.get("params"), dict) else {}
+            pid = str(p.get("parent_folder_id") or "").strip()
+            if not pid:
+                continue
+            ppath = str(p.get("parent_folder_path") or "").strip()
+            if ppath:
+                return pid, ppath       # 带路径的最理想，直接采用
+            best = best or (pid, "")
+        return best
+
     def _resolve_uncached(self, space: str, directory: str,
                           deadline: float) -> tuple[str, str]:
-        folders = self._folders(space, "", deadline=deadline)
-        if not folders:
-            raise BackendError(
-                "引擎目录表为空，无法解析下载根目录"
-                "（parent_folder_id 缺失时任务不会开始下载）")
-        hint = ""
-        for p in (self._device_config(space).get("download_paths") or []):
-            if str(p).strip():
-                hint = _norm_dir(str(p))
-                break
+        folders: list[dict] | None
+        try:
+            folders = self._folders(space, "", deadline=deadline)
+            if not folders:
+                raise BackendError(
+                    "引擎目录表为空，无法解析下载根目录"
+                    "（parent_folder_id 缺失时任务不会开始下载）")
+        except BackendError:
+            # 0.1.32：目录表彻底不可用（设备插件超时 error_code=2 等）时先
+            # 历史任务反查再放弃——反查到的 (id, path) 作为根走下方降级阶梯。
+            harvested = self._harvest_root(space)
+            if harvested is None:
+                raise
+            _dbg(f"目录表不可用，历史任务反查兜底: space={space[:12]} "
+                 f"→ id={harvested[0][:16]} path={harvested[1][:32]}")
+            root_id, root_path = harvested
+            folders = None
+        if folders is not None:
+            hint = ""
+            for p in (self._device_config(space).get("download_paths") or []):
+                if str(p).strip():
+                    hint = _norm_dir(str(p))
+                    break
 
-        root_id, root_path = "", ""
-        if hint:                                  # 1) 配置提示精确匹配
-            for f in folders:
-                if _folder_path(f) == hint:
-                    root_id, root_path = str(f.get("id")), hint
-                    break
-        if not root_id and len(folders) == 1:     # 2) 唯一顶层目录
-            root_id = str(folders[0].get("id"))
-            root_path = _folder_path(folders[0]) or hint
-        if not root_id:                           # 3) 常见下载根名
-            for f in folders:
-                name = (f.get("name") or "").strip().lower()
-                if _folder_path(f) in ("/downloads/", "/") or name in DOWNLOAD_ROOT_NAMES:
-                    root_id = str(f.get("id"))
-                    root_path = _folder_path(f) or hint
-                    break
-        if not root_id:                           # 4) 启发式兜底
-            pid = str(folders[0].get("parent_id") or "").strip()
-            root_id = pid or str(folders[0].get("id"))
-            root_path = hint
-        if not root_id:
-            raise BackendError("无法识别引擎下载根目录（parent_folder_id 解析失败）")
+            root_id, root_path = "", ""
+            if hint:                              # 1) 配置提示精确匹配
+                for f in folders:
+                    if _folder_path(f) == hint:
+                        root_id, root_path = str(f.get("id")), hint
+                        break
+            if not root_id and len(folders) == 1:  # 2) 唯一顶层目录
+                root_id = str(folders[0].get("id"))
+                root_path = _folder_path(folders[0]) or hint
+            if not root_id:                       # 3) 常见下载根名
+                for f in folders:
+                    name = (f.get("name") or "").strip().lower()
+                    if _folder_path(f) in ("/downloads/", "/") or name in DOWNLOAD_ROOT_NAMES:
+                        root_id = str(f.get("id"))
+                        root_path = _folder_path(f) or hint
+                        break
+            if not root_id:                       # 4) 启发式兜底
+                pid = str(folders[0].get("parent_id") or "").strip()
+                root_id = pid or str(folders[0].get("id"))
+                root_path = hint
+            if not root_id:
+                raise BackendError("无法识别引擎下载根目录（parent_folder_id 解析失败）")
 
         dest = (directory or "").strip()
         if not dest:
