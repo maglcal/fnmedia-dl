@@ -40,6 +40,11 @@ RESOLVE_BUDGET = 18.0
 # 按 client 身份隔离（每个请求新建 DownloadManager/client），不跨请求串味。
 RESOLVE_CACHE_TTL = 120.0
 _resolve_cache: dict[tuple, tuple[float, tuple[str, str], object]] = {}
+# 解析失败负缓存（0.1.33）：失败记 30s 冷却——设备插件持续超时时批量派发
+# 每条都重烧整条失败链（预检+发现+形状×2+反查），响应预算瞬间耗尽；命中
+# 负缓存直接短路报错（带「稍后自动重试」提示），解析成功即清除。
+NEG_TTL = 30.0
+_resolve_neg: dict[tuple, tuple[float, str, object]] = {}
 
 PHASE_STATE = {
     "PHASE_TYPE_PENDING": "waiting",
@@ -218,10 +223,11 @@ class DriveCore:
 
     # ------------------------------------------------------------ 目录解析
 
-    def _device_config(self, space: str = "") -> dict:
+    def _device_config(self, space: str = "",
+                       deadline: float | None = None) -> dict:
         """GET /device/config（drive/v1 的同级接口，用于获取
-        download_paths）。space 仅设备专属 API 覆盖版（_CloudDrive）使用，
-        基类本地引擎不需要。云端网关不一定代理此接口——失败静默返回 {}，
+        download_paths）。space/deadline 仅设备专属 API 覆盖版（_CloudDrive）
+        使用，基类本地引擎不需要。云端网关不一定代理此接口——失败静默返回 {}，
         由 resolve_dest_folder 的兜底链继续。"""
         root = self.base_url[:-len("/drive/v1")] if self.base_url.endswith("/drive/v1") else self.base_url
         try:
@@ -305,14 +311,28 @@ class DriveCore:
 
         0.1.31：结果按 (base_url, space, directory) 缓存 120s——批量派发
         同目录只解析一次（此前每条链接重跑整条目录链，是「批量必超时
-        →提示502」的放大器）；缓存按 client 身份隔离，不跨请求串味。"""
+        →提示502」的放大器）；缓存按 client 身份隔离，不跨请求串味。
+        0.1.33：失败也进负缓存（30s 冷却）——设备插件持续超时时每条链接
+        重烧整条失败链会耗尽派发预算，命中负缓存直接短路报错。"""
         key = (self.base_url, space, (directory or "").strip())
         hit = _resolve_cache.get(key)
         if (hit and hit[2] is self.client
                 and time.monotonic() - hit[0] < RESOLVE_CACHE_TTL):
             return hit[1]
-        result = self._resolve_uncached(space, directory,
-                                        time.monotonic() + RESOLVE_BUDGET)
+        neg = _resolve_neg.get(key)
+        if (neg and neg[2] is self.client
+                and time.monotonic() - neg[0] < NEG_TTL):
+            raise BackendError(f"{neg[1]}（{int(NEG_TTL)}s 内已失败过，"
+                               f"稍后自动重试）")
+        try:
+            result = self._resolve_uncached(space, directory,
+                                            time.monotonic() + RESOLVE_BUDGET)
+        except BackendError as exc:
+            if len(_resolve_neg) > 256:           # 简单封顶，防长期运行膨胀
+                _resolve_neg.clear()
+            _resolve_neg[key] = (time.monotonic(), str(exc), self.client)
+            raise
+        _resolve_neg.pop(key, None)               # 成功即清除失败记录
         if len(_resolve_cache) > 256:             # 简单封顶，防长期运行膨胀
             _resolve_cache.clear()
         _resolve_cache[key] = (time.monotonic(), result, self.client)
@@ -352,19 +372,27 @@ class DriveCore:
                 raise BackendError(
                     "引擎目录表为空，无法解析下载根目录"
                     "（parent_folder_id 缺失时任务不会开始下载）")
-        except BackendError:
+        except BackendError as exc:
             # 0.1.32：目录表彻底不可用（设备插件超时 error_code=2 等）时先
             # 历史任务反查再放弃——反查到的 (id, path) 作为根走下方降级阶梯。
             harvested = self._harvest_root(space)
             if harvested is None:
-                raise
+                # 0.1.33：反查无米（设备任务 0 条/无 params）时给可操作指引
+                # ——官方 App 建一个任务即带上 parent_folder_id，反查即恢复。
+                raise BackendError(
+                    f"{exc}（历史任务反查也不可用：该设备没有带 "
+                    f"parent_folder_id 的历史任务。可先用官方迅雷 App 对该设备"
+                    f"建一个下载任务（选好下载目录），任务 params 会带上 "
+                    f"parent_folder_id，反查即恢复；或检查目标设备上的迅雷"
+                    f"远程插件是否在运行）") from exc
             _dbg(f"目录表不可用，历史任务反查兜底: space={space[:12]} "
                  f"→ id={harvested[0][:16]} path={harvested[1][:32]}")
             root_id, root_path = harvested
             folders = None
         if folders is not None:
             hint = ""
-            for p in (self._device_config(space).get("download_paths") or []):
+            for p in (self._device_config(space, deadline=deadline)
+                      .get("download_paths") or []):
                 if str(p).strip():
                     hint = _norm_dir(str(p))
                     break

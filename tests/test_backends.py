@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
+from backends import drive_core                       # noqa: E402
 from backends.aria2 import Aria2                      # noqa: E402
 from backends.base import BackendError, ParsedResource    # noqa: E402
 from backends.drive_core import DriveCore, task_to_view  # noqa: E402
@@ -1721,6 +1723,107 @@ class TestDeviceTimeoutAndHarvest(unittest.TestCase):
         pid, path = self._core(handler).resolve_dest_folder("remote-1", "movies")
         self.assertEqual(pid, "f-h")
         self.assertEqual(path, "/downloads/movies/")
+
+    # -------------------------------------------- 0.1.33 重试治理 / 负缓存
+
+    def test_retries_zero_single_shot_surfaces_error(self):
+        """重试次数可治理（0.1.33）：_device_timeout_retries=0 时单次即错
+        ——诊断探针期靠它让真实错误透出，不被重试链撑爆窗口。"""
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json=self.TIMEOUT_BODY)
+
+        tc = self._tc(handler)
+        tc.core._device_timeout_retries = 0
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError) as ctx:
+                tc.core._request("GET",
+                                 "https://api-pan.xunlei.com/drive/v1/x")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("设备端响应超时", str(ctx.exception))
+
+    def test_deadline_passed_blocks_retry(self):
+        """deadline（0.1.33）：预算耗尽后不再重试设备超时——重试链不得
+        超出解析总预算（0.1.32 诊断窗被撑爆的原因）。"""
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(200, json=self.TIMEOUT_BODY)
+
+        tc = self._tc(handler)
+        with mock.patch("time.sleep", lambda _s: None):
+            with self.assertRaises(BackendError):
+                tc.core._request("GET",
+                                 "https://api-pan.xunlei.com/drive/v1/x",
+                                 deadline=0)      # monotonic 恒 >0，预算已尽
+        self.assertEqual(len(calls), 1)
+
+    def test_resolve_negative_cache_short_circuits(self):
+        """负缓存（0.1.33）：30s 冷却内同键解析失败直接短路报错——
+        批量派发每条不再重烧整条失败链。"""
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            if request.url.path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            return httpx.Response(200, json={"tasks": []})
+
+        core = self._core(handler)
+        with self.assertRaises(BackendError):
+            core.resolve_dest_folder("remote-1", "")
+        n_first = len(calls)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("remote-1", "")
+        self.assertEqual(len(calls), n_first)      # 命中负缓存，未再打网络
+        self.assertIn("30s 内已失败过", str(ctx.exception))
+        self.assertIn("稍后自动重试", str(ctx.exception))
+
+    def test_resolve_negative_cache_recovers_after_ttl(self):
+        """负缓存成功即清除：冷却过期后解析成功，失败记录不再残留。"""
+        state = {"fail": True}
+
+        def handler(request):
+            if request.url.path.endswith("/files"):
+                if state["fail"]:
+                    return httpx.Response(200, json=self.TIMEOUT_BODY)
+                return httpx.Response(200, json={"files": [
+                    {"id": "d1", "name": "downloads", "kind": "drive#folder",
+                     "params": {"RealPath": "/downloads/"}}]})
+            return httpx.Response(200, json={"tasks": []})
+
+        core = self._core(handler)
+        with self.assertRaises(BackendError):
+            core.resolve_dest_folder("remote-1", "")
+        key = ("http://engine/drive/v1", "remote-1", "")
+        self.assertIn(key, drive_core._resolve_neg)
+        # 手动把负缓存记录改旧（模拟 30s 冷却过期），恢复成功路径
+        drive_core._resolve_neg[key] = (
+            time.monotonic() - 31, "旧错误", core.client)
+        state["fail"] = False
+        self.assertEqual(core.resolve_dest_folder("remote-1", ""),
+                         ("d1", "/downloads/"))
+        self.assertNotIn(key, drive_core._resolve_neg)
+
+    def test_resolve_harvest_none_error_includes_guidance(self):
+        """反查无米（0.1.33）：错误附可操作指引——官方 App 建一个任务即带
+        parent_folder_id，反查即恢复（0.1.32 实测设备任务 0 条无从反查）。"""
+        def handler(request):
+            if request.url.path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            return httpx.Response(200, json={"tasks": [
+                {"name": "r", "params": {"target": "remote-1"}}]})
+
+        core = self._core(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("remote-1", "")
+        msg = str(ctx.exception)
+        self.assertIn("历史任务反查", msg)
+        self.assertIn("迅雷 App", msg)
+        self.assertIn("parent_folder_id", msg)
 
 
 if __name__ == "__main__":

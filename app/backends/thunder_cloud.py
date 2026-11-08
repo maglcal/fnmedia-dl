@@ -193,9 +193,13 @@ class _CloudDrive(DriveCore):
         super().__init__(client, DRIVE_API, backend._auth_headers)
         self.backend = backend
         self._device_apis: dict[str, dict] = {}
+        # 设备端超时 GET 重试次数（0.1.33 可治理）：默认 2（共 3 次尝试）保持
+        # 运行态瞬态自愈；诊断探针期设 0 让真实错误透出——0.1.32 实测 3 次
+        # 重试链（~3s×3+退避）撑爆诊断窗口，真实错误被「超时」文案掩盖。
+        self._device_timeout_retries = 2
 
     def _request(self, method, path, *, params=None, json_body=None,
-                 timeout=30):
+                 timeout=30, deadline=None):
         # 自行发请求（不走 DriveCore._request）：迅雷错误多以 200/4xx + error_code
         # 返回，必须先按错误码分流（令牌续期），不能只看 HTTP 状态码。
         # path 以 http 开头时视为完整 URL（如 /device/config 同级接口）。
@@ -228,9 +232,13 @@ class _CloudDrive(DriveCore):
                 self.backend._refresh_captcha_at_login(
                     action, self.backend.conf.get("user_id", ""))
                 continue
-            if attempt < 2 and method == "GET" and _is_device_timeout(data):
+            if (attempt < self._device_timeout_retries and method == "GET"
+                    and _is_device_timeout(data)
+                    and (deadline is None or time.monotonic() < deadline)):
                 # 设备端超时瞬态居多，GET 幂等可重试。
                 # 1s 退避给设备端插件喘息；POST 不重试（建目录非幂等）。
+                # deadline（0.1.33）：预算内才重试——重试链不得超出解析
+                # 总预算，否则撑爆诊断窗/响应窗（0.1.32）。
                 time.sleep(1)
                 continue
             if err_code == CAPTCHA_ERROR_CODE:
@@ -247,7 +255,8 @@ class _CloudDrive(DriveCore):
 
     # ------------------------------------------------ 设备专属 API（0.1.30）
 
-    def _relay_api(self, space: str, refresh: bool = False) -> dict:
+    def _relay_api(self, space: str, refresh: bool = False,
+                   deadline: float | None = None) -> dict:
         """发现远程设备的专属 API 网关。
 
         链路：
@@ -261,7 +270,9 @@ class _CloudDrive(DriveCore):
         if ent and not refresh and now - ent.get("at", 0) < self._RELAY_TTL:
             return ent
         data = self._request("GET", DRIVE_API + "/apps/INNER_API",
-                             params={"space": space}, timeout=10)
+                             params={"space": space},
+                             timeout=_clip_timeout(deadline, 10),
+                             deadline=deadline)
         url = (data.get("link") or "").strip()
         if not url:
             for it in (data.get("links") or []):
@@ -333,7 +344,7 @@ class _CloudDrive(DriveCore):
                 tries.append("预算耗尽未及尝试")
                 break
             try:
-                api = self._relay_api(space, refresh=refresh)
+                api = self._relay_api(space, refresh=refresh, deadline=deadline)
             except BackendError as exc:
                 tries.append(f"设备API发现：{str(exc)[:100]}")
                 break
@@ -346,7 +357,8 @@ class _CloudDrive(DriveCore):
                 try:
                     data = self._request("GET", api["base"] + "drive/v1/files",
                                          params=params,
-                                         timeout=_clip_timeout(deadline, 8))
+                                         timeout=_clip_timeout(deadline, 8),
+                                         deadline=deadline)
                 except BackendError as exc:
                     tries.append(f"{label}：{str(exc)[:100]}")
                     continue
@@ -377,7 +389,7 @@ class _CloudDrive(DriveCore):
         0.1.31：仅发现失败才回退基类（api-pan）；发现成功但 relay POST
         失败直接抛错（api-pan 对设备空间建目录同样 502，回退无意义）。"""
         try:
-            api = self._relay_api(space)
+            api = self._relay_api(space, deadline=deadline)
         except BackendError:
             return super()._make_folder(space, parent_id, name,
                                         deadline=deadline)
@@ -385,26 +397,29 @@ class _CloudDrive(DriveCore):
                              params=self._relay_params(api, space),
                              json_body={"parent_id": parent_id, "name": name,
                                         "space": space, "kind": "drive#folder"},
-                             timeout=_clip_timeout(deadline, 10))
+                             timeout=_clip_timeout(deadline, 10),
+                             deadline=deadline)
         fid = (data.get("file") or {}).get("id") or ""
         if not fid:
             raise BackendError(
                 f"创建下载子目录 {name} 失败（设备API）：响应缺少 file.id")
         return {"id": fid, "name": name, "params": {"RealPath": ""}}
 
-    def _device_config(self, space: str = "") -> dict:
+    def _device_config(self, space: str = "",
+                       deadline: float | None = None) -> dict:
         """设备配置（download_paths 下载根提示）优先走设备专属 API
         （<ApiDomain>device/config，与 device/info/watch 同级），
         失败回退基类（api-pan /device/config 通常不可达 → {} 静默）。"""
         if space:
             try:
-                api = self._relay_api(space)
+                api = self._relay_api(space, deadline=deadline)
                 return self._request("GET", api["base"] + "device/config",
                                      params=self._relay_params(api, space),
-                                     timeout=10)
+                                     timeout=_clip_timeout(deadline, 10),
+                                     deadline=deadline)
             except BackendError:
                 pass
-        return super()._device_config(space)
+        return super()._device_config(space, deadline=deadline)
 
     def _folder_shapes(self, space: str, parent_id: str) -> list[tuple[str, dict]]:
         """api-pan 回退阶梯的形状顺序（0.1.31 起仅在设备 API 发现失败时用）：
