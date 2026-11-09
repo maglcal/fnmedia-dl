@@ -223,7 +223,10 @@ python -m unittest discover -s tests -v    # 244 个用例，全程无网络
 
 ## License
 
-MIT · Copyright (c) 2026 许诺
+个人非商业使用许可（Personal Non-Commercial License）· Copyright (c) 2026 许诺
+
+仅供个人、学习、研究等非商业用途；禁止商业使用，禁止将本软件或其实质性
+组成部分集成到功能相同或类似的竞争性产品/服务中。完整条款见 [LICENSE](LICENSE)。
 
 ---
 
