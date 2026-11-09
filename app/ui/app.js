@@ -515,11 +515,11 @@ on("#btnCheckDir", "click", async () => {
 /* ---------------- 目录选择器（弹窗浏览，设备/本机双来源） ----------------
    与手动输入并存：只把选定路径回填到目标输入框，不自动保存。
    设备来源 = 迅雷远程设备的下载目录树（只读浏览，不建目录）；
-   设备 API 不可达时给明确提示并引导切「本机目录」或手动填写。 */
+   设备 API 不可达时**自动降级**到「本机目录（已授权）」，不必手动切。 */
 const DP = {
   target: null, source: "device",
   root: "", path: "", crumbs: [], entries: [],
-  loading: false, retried: false,
+  loading: false, retried: false, fallbacked: false, _notice: "",
 };
 
 function dpStatus(text, cls) {
@@ -586,9 +586,14 @@ async function dpLoad() {
     DP.path = d.path || "";
     DP.crumbs = d.crumbs || [];
     DP.entries = d.entries || [];
-    dpStatus(DP.source === "device"
-      ? "浏览为只读，不会自动建目录；点目录进入，点面包屑返回上级。"
-      : "只显示应用共享目录与已授权目录之内的子目录。", "");
+    if (DP._notice) {
+      dpStatus(DP._notice, "");
+      DP._notice = "";
+    } else {
+      dpStatus(DP.source === "device"
+        ? "浏览为只读，不会自动建目录；点目录进入，点面包屑返回上级。"
+        : "只显示应用共享目录与已授权目录之内的子目录。", "");
+    }
     dpRender();
   } catch (e) {
     DP.loading = false;
@@ -598,13 +603,21 @@ async function dpLoad() {
       DP.path = "";
       return dpLoad();
     }
+    // 设备目录不可用 → 自动降级到「本机目录（已授权）」（0.1.37.3）；
+    // 用户已手动切过来源（fallbacked=true）则不再自动跳转
+    if (DP.source === "device" && !DP.fallbacked) {
+      DP.fallbacked = true;
+      DP.source = "local";
+      DP.path = "";
+      DP.retried = true;
+      DP._notice = "⚠ 设备目录不可用，已自动切换到「本机目录（已授权）」";
+      dpLoad();
+      return;
+    }
     DP.entries = [];
     DP.crumbs = [];
     dpRender();
-    dpStatus(DP.source === "device"
-      ? "✗ 设备目录读取失败：" + e.message +
-        "。可切到「本机目录」继续，或关闭后手动填写路径。"
-      : "✗ " + e.message, "bad");
+    dpStatus("✗ " + e.message, "bad");
   }
 }
 
@@ -615,6 +628,7 @@ function openDirPicker(inputId, source) {
   DP.source = source || "device";
   DP.path = (el.value || "").trim();
   DP.retried = false;
+  DP.fallbacked = false;
   const box = $("#dirPicker");
   if (box) box.hidden = false;
   dpLoad();
@@ -645,6 +659,7 @@ $$("#dirPicker .dp-src .btn").forEach((b) => {
     DP.source = b.dataset.dpsrc;
     DP.path = "";
     DP.retried = true;
+    DP.fallbacked = true;   // 用户显式选了来源，不再自动降级
     dpLoad();
   });
 });
