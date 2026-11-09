@@ -2,6 +2,7 @@
 """Docker 版迅雷一键部署测试（docker/网络全部打桩，全程无副作用）。"""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -359,6 +360,171 @@ class TestAPI(unittest.TestCase):
         with mock.patch.object(self.main.xdmod, "running", return_value=True):
             r = self.client.post("/api/xunlei_docker/deploy")
         self.assertEqual(r.status_code, 400)
+
+
+# ------------------------------------------------------- 目录映射校验（0.1.37.3）
+
+class TestMapEngineDir(unittest.TestCase):
+    """map_engine_dir 纯函数：宿主路径 ↔ 容器路径换算与拦截。"""
+
+    MOUNTS = [
+        {"Type": "bind", "Source": "/vol1/1000",
+         "Destination": "/xunlei/downloads"},
+        {"Type": "bind", "Source": "/vol1/2000",
+         "Destination": "/xunlei/other"},
+    ]
+
+    def test_none_mounts_passthrough(self):
+        mapped, note = xd.map_engine_dir("/vol1/1000/movie", None)
+        self.assertEqual(mapped, "/vol1/1000/movie")
+        self.assertEqual(note, "")
+
+    def test_empty_mounts_passthrough(self):
+        mapped, _ = xd.map_engine_dir("/vol1/1000/movie", [])
+        self.assertEqual(mapped, "/vol1/1000/movie")
+
+    def test_empty_dir_passthrough(self):
+        mapped, note = xd.map_engine_dir("", self.MOUNTS)
+        self.assertEqual(mapped, "")
+        self.assertEqual(note, "")
+
+    def test_relative_dir_passthrough(self):
+        mapped, _ = xd.map_engine_dir("movie/sub", self.MOUNTS)
+        self.assertEqual(mapped, "movie/sub")
+
+    def test_dest_match_passthrough(self):
+        mapped, note = xd.map_engine_dir("/xunlei/downloads/movie", self.MOUNTS)
+        self.assertEqual(mapped, "/xunlei/downloads/movie")
+        self.assertEqual(note, "")
+
+    def test_dest_exact_match(self):
+        mapped, _ = xd.map_engine_dir("/xunlei/downloads", self.MOUNTS)
+        self.assertEqual(mapped, "/xunlei/downloads")
+
+    def test_dest_prefix_trap(self):
+        """/xunlei/downloads2 不应匹配 /xunlei/downloads。"""
+        mapped, note = xd.map_engine_dir("/xunlei/downloads2", self.MOUNTS)
+        self.assertIsNone(mapped)
+
+    def test_src_converts_to_dest(self):
+        mapped, note = xd.map_engine_dir("/vol1/1000/movie", self.MOUNTS)
+        self.assertEqual(mapped, "/xunlei/downloads/movie")
+        self.assertIn("换算", note)
+        self.assertIn("/vol1/1000/movie", note)
+        self.assertIn("/xunlei/downloads/movie", note)
+
+    def test_src_exact_converts_to_dest(self):
+        mapped, _ = xd.map_engine_dir("/vol1/1000", self.MOUNTS)
+        self.assertEqual(mapped, "/xunlei/downloads")
+
+    def test_src_trailing_slash_normalized(self):
+        mapped, _ = xd.map_engine_dir("/vol1/1000/", self.MOUNTS)
+        self.assertEqual(mapped, "/xunlei/downloads")
+
+    def test_longest_prefix_wins(self):
+        mounts = [
+            {"Source": "/vol1", "Destination": "/xunlei/a"},
+            {"Source": "/vol1/1000", "Destination": "/xunlei/b"},
+        ]
+        mapped, _ = xd.map_engine_dir("/vol1/1000/movie", mounts)
+        self.assertEqual(mapped, "/xunlei/b/movie")
+
+    def test_prefix_trap_rejected(self):
+        """/vol1/1000 不应匹配 /vol1/10000（段前缀防误匹配）。"""
+        mapped, note = xd.map_engine_dir("/vol1/10000", self.MOUNTS)
+        self.assertIsNone(mapped)
+        self.assertIn("未映射", note)
+
+    def test_unmapped_returns_error_with_pairs(self):
+        mapped, note = xd.map_engine_dir("/vol1/other", self.MOUNTS)
+        self.assertIsNone(mapped)
+        self.assertIn("未映射进迅雷容器", note)
+        self.assertIn("/vol1/1000 → /xunlei/downloads", note)
+        self.assertIn("挂载进容器", note)
+
+    def test_root_source_ignored(self):
+        """Source=/ 是万能匹配陷阱，应忽略。"""
+        mounts = [{"Source": "/", "Destination": "/xunlei/root"}]
+        mapped, _ = xd.map_engine_dir("/vol1/1000", mounts)
+        self.assertIsNone(mapped)
+
+
+class TestContainerMounts(unittest.TestCase):
+    """container_mounts()：docker inspect Mounts + TTL 缓存 + 软跳过。"""
+
+    def setUp(self):
+        self._orig_cache = dict(xd._mounts_cache)
+        xd._mounts_cache["ts"] = 0.0
+        xd._mounts_cache["val"] = None
+
+    def tearDown(self):
+        xd._mounts_cache.clear()
+        xd._mounts_cache.update(self._orig_cache)
+
+    @staticmethod
+    def _patch_docker(result):
+        orig = xd._docker
+        xd._docker = lambda *a, **kw: result
+        return orig
+
+    def test_returns_none_without_docker(self):
+        orig = self._patch_docker((127, "docker 不存在"))
+        self.addCleanup(setattr, xd, "_docker", orig)
+        self.assertIsNone(xd.container_mounts())
+
+    def test_returns_none_on_container_absent(self):
+        orig = self._patch_docker((1, "no such container"))
+        self.addCleanup(setattr, xd, "_docker", orig)
+        self.assertIsNone(xd.container_mounts())
+
+    def test_parses_mounts_json(self):
+        mounts = [{"Source": "/vol1/1000", "Destination": "/xunlei/downloads"}]
+        orig = self._patch_docker((0, json.dumps(mounts)))
+        self.addCleanup(setattr, xd, "_docker", orig)
+        self.assertEqual(xd.container_mounts(), mounts)
+
+    def test_invalid_json_returns_none(self):
+        orig = self._patch_docker((0, "not json at all"))
+        self.addCleanup(setattr, xd, "_docker", orig)
+        self.assertIsNone(xd.container_mounts())
+
+    def test_non_list_json_returns_none(self):
+        orig = self._patch_docker((0, '{"foo": 1}'))
+        self.addCleanup(setattr, xd, "_docker", orig)
+        self.assertIsNone(xd.container_mounts())
+
+    def test_cache_hit_within_ttl(self):
+        calls = []
+
+        def fake(*a, **kw):
+            calls.append(a)
+            return (0, json.dumps([{"Source": "/a", "Destination": "/b"}]))
+
+        orig = xd._docker
+        xd._docker = fake
+        self.addCleanup(setattr, xd, "_docker", orig)
+        xd._mounts_cache["ts"] = 0.0  # 强制首次查询
+
+        r1 = xd.container_mounts(ttl=999)
+        r2 = xd.container_mounts(ttl=999)
+        self.assertEqual(r1, r2)
+        self.assertEqual(len(calls), 1)   # 第二次命中缓存
+
+    def test_cache_expires(self):
+        calls = []
+
+        def fake(*a, **kw):
+            calls.append(a)
+            return (0, json.dumps([]))
+
+        orig = xd._docker
+        xd._docker = fake
+        self.addCleanup(setattr, xd, "_docker", orig)
+        xd._mounts_cache["ts"] = 0.0
+
+        xd.container_mounts(ttl=0)   # ttl=0 → 立即过期
+        xd.container_mounts(ttl=0)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

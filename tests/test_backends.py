@@ -697,6 +697,101 @@ class TestThunderEngine(unittest.TestCase):
         eng = ThunderEngine(_client(handler), {"base_url": "http://nas:2345"})
         self.assertFalse(eng.status()["reachable"])
 
+    # ---- 目录映射校验（0.1.37.3）----
+
+    @staticmethod
+    def _map_handler():
+        """登录 + 设备空间发现 + 资源解析的最小 handler。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("index.cgi/"):
+                return httpx.Response(200, text=PANEL_HTML)
+            if path.endswith("/drive/v1/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"params": {"target": "dev-space"}}]})
+            if path.endswith("/drive/v1/resource/list"):
+                return httpx.Response(200, json={
+                    "list": {"resources": [{"name": "f", "file_size": 1}]}})
+            return httpx.Response(200, json={})
+        return handler
+
+    def test_add_blocks_unmapped_dir(self):
+        """映射外路径 → 明确报错，阻止无效下发（0.1.37.3）。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = lambda *a, **kw: captured.update(kw) or "t-1"
+        mounts = [{"Source": "/vol1/1000", "Destination": "/xunlei/downloads"}]
+        with mock.patch("xunlei_docker.container_mounts", return_value=mounts):
+            with self.assertRaises(BackendError) as ctx:
+                eng.add("magnet:?xt=urn:btih:aa", directory="/vol1/other")
+        msg = str(ctx.exception)
+        self.assertIn("阻止下发", msg)
+        self.assertIn("未映射进迅雷容器", msg)
+        self.assertIn("/vol1/1000 → /xunlei/downloads", msg)
+        self.assertNotIn("task", captured)  # 未走到 create_task
+
+    def test_add_converts_host_path_to_container(self):
+        """宿主路径自动换算为容器内路径再下发（0.1.37.3）。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = lambda *a, **kw: captured.update(kw) or "t-1"
+        mounts = [{"Source": "/vol1/1000", "Destination": "/xunlei/downloads"}]
+        with mock.patch("xunlei_docker.container_mounts", return_value=mounts):
+            tid = eng.add("magnet:?xt=urn:btih:aa",
+                          directory="/vol1/1000/movie")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "/xunlei/downloads/movie")
+
+    def test_add_container_path_passthrough(self):
+        """已是容器内路径 → 原样下发（0.1.37.3）。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = lambda *a, **kw: captured.update(kw) or "t-1"
+        mounts = [{"Source": "/vol1/1000", "Destination": "/xunlei/downloads"}]
+        with mock.patch("xunlei_docker.container_mounts", return_value=mounts):
+            tid = eng.add("magnet:?xt=urn:btih:aa",
+                          directory="/xunlei/downloads/movie")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "/xunlei/downloads/movie")
+
+    def test_add_skips_validation_without_mounts(self):
+        """查不到容器挂载 → 跳过校验、原样传递（群晖套件/自建容器）。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = lambda *a, **kw: captured.update(kw) or "t-1"
+        with mock.patch("xunlei_docker.container_mounts", return_value=None):
+            tid = eng.add("magnet:?xt=urn:btih:aa", directory="/vol1/other")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "/vol1/other")
+
+    def test_add_config_dir_also_validated(self):
+        """配置中的 self.dir 也走映射校验（不只 per-task 目录）。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345",
+                             "dir": "/vol1/other"})
+        eng.core.create_task = lambda *a, **kw: "t-1"
+        mounts = [{"Source": "/vol1/1000", "Destination": "/xunlei/downloads"}]
+        with mock.patch("xunlei_docker.container_mounts", return_value=mounts):
+            with self.assertRaises(BackendError) as ctx:
+                eng.add("magnet:?xt=urn:btih:aa")
+        self.assertIn("阻止下发", str(ctx.exception))
+
+    def test_add_relative_dir_skips_validation(self):
+        """相对路径走目录树解析，不在映射校验范围。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = lambda *a, **kw: captured.update(kw) or "t-1"
+        mounts = [{"Source": "/vol1/1000", "Destination": "/xunlei/downloads"}]
+        with mock.patch("xunlei_docker.container_mounts", return_value=mounts):
+            tid = eng.add("magnet:?xt=urn:btih:aa", directory="movie/sub")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "movie/sub")
+
 
 # ---------------------------------------------------------------- thunder cloud
 

@@ -15,6 +15,8 @@ import re
 
 import httpx
 
+import xunlei_docker
+
 from .base import Backend, BackendError, ParsedResource, TaskView
 from .drive_core import DriveCore, task_to_view
 
@@ -89,12 +91,23 @@ class ThunderEngine(Backend):
             raise
         if name:
             resource.name = name
+        d = (directory or self.dir or "").strip()
+        # 目录映射校验（0.1.37.3）：绝对路径先查容器挂载——
+        # 映射外 → 明确报错阻止无效下发（避免落盘容器可写层）；
+        # 宿主路径 → 自动换算为容器内路径；查不到容器 → 跳过校验靠目录表锚定。
+        if d.startswith("/"):
+            mapped, note = xunlei_docker.map_engine_dir(
+                d, xunlei_docker.container_mounts())
+            if mapped is None:
+                raise BackendError(f"保存目录 {d} 无效，已阻止下发。{note}")
+            if mapped != d:
+                d = mapped
         try:
             # on_unresolvable="direct"：目录表查询彻底失败时回退 0.1.22 直传
             # 形状（id 空 + 路径原样）——引擎按路径自行落盘（用户环境实测可用），
             # 本地引擎的最后兜底；云端不用（云端 id 空任务永不启动）。
             return self.core.create_task(url, resource, space,
-                                         directory=directory or self.dir,
+                                         directory=d,
                                          on_unresolvable="direct")
         except BackendError as exc:
             raise BackendError(f"创建任务失败：{exc}") from exc

@@ -137,6 +137,94 @@ def _container_image() -> str:
     return out.strip() if rc == 0 else ""
 
 
+# ------------------------------------------------------- 容器挂载 / 目录映射
+# 目录映射校验（0.1.37.3）：派发前把宿主机视角路径换算成容器内路径，
+# 或对映射外路径明确报错阻止无效下发，避免任务落盘到容器可写层（宿主不可见）。
+
+_mounts_cache: dict = {"ts": 0.0, "val": None}
+
+
+def container_mounts(ttl: float = 60.0) -> list[dict] | None:
+    """查自建容器的挂载列表（docker inspect Mounts）。TTL 缓存。
+
+    返回 [{"Source": "/宿主路径", "Destination": "/容器路径", ...}, ...]。
+    查不到容器 / 无 docker / 解析失败 → None（软跳过校验，调用方自行兜底，
+    覆盖群晖套件非 Docker、自建容器名不符等场景）。"""
+    now = time.monotonic()
+    if _mounts_cache["ts"] and now - _mounts_cache["ts"] < ttl:
+        return _mounts_cache["val"]
+    _mounts_cache["ts"] = now
+    rc, out = _docker("inspect", "-f", "{{json .Mounts}}", CONTAINER_NAME,
+                      timeout=15)
+    if rc != 0:
+        _mounts_cache["val"] = None
+        return None
+    try:
+        mounts = json.loads(out)
+        if isinstance(mounts, list):
+            _mounts_cache["val"] = mounts
+            return mounts
+    except ValueError:
+        pass
+    _mounts_cache["val"] = None
+    return None
+
+
+def _norm_path(p: str) -> str:
+    return (p or "").strip().rstrip("/") or "/"
+
+
+def _under(p: str, base: str) -> bool:
+    """段前缀匹配：p 是否在 base 之下（防 /vol1/1000 匹配 /vol1/10000）。"""
+    return p == base or p.startswith(base.rstrip("/") + "/")
+
+
+def map_engine_dir(directory: str,
+                   mounts: list[dict] | None) -> tuple[str | None, str]:
+    """把保存目录换算成容器内路径（目录映射校验 0.1.37.3）。
+
+    返回 (换算路径 | None, 提示信息)：
+      - mounts 空/None → (directory, "")，不校验（群晖套件/自建容器）；
+      - directory 在某挂载 Destination（容器路径）下 → 原样返回；
+      - directory 在某挂载 Source（宿主路径）下 → 换算为容器内路径
+        （最长前缀优先）；提示注明换算；
+      - 都不匹配 → (None, 明确错误提示含已映射对与三条指引)。"""
+    d = (directory or "").strip()
+    if not d or not mounts:
+        return d, ""
+    if not d.startswith("/"):
+        return d, ""       # 相对路径走目录树解析，不在映射校验范围
+    nd = _norm_path(d)
+
+    # 1) 已是容器视角路径（某挂载 Destination 之下）
+    for m in mounts:
+        dest = _norm_path(str(m.get("Destination") or ""))
+        if dest != "/" and _under(nd, dest):
+            return d, ""
+
+    # 2) 宿主视角路径（某挂载 Source 之下）→ 换算为 Destination 前缀
+    best: tuple[str, str] | None = None
+    for m in mounts:
+        src = _norm_path(str(m.get("Source") or ""))
+        dest = _norm_path(str(m.get("Destination") or ""))
+        if src and src != "/" and dest and _under(nd, src):
+            if best is None or len(src) > len(best[0]):
+                best = (src, dest)
+    if best:
+        src, dest = best
+        rel = nd[len(src):]
+        mapped = (dest + rel) if rel else dest
+        return mapped, f"已按容器挂载换算：{d} → {mapped}"
+
+    # 3) 映射外：明确报错，阻止无效下发
+    pairs = [f"{m.get('Source', '?')} → {m.get('Destination', '?')}"
+             for m in mounts if m.get("Source") or m.get("Destination")]
+    pair_text = "；".join(pairs) if pairs else "无"
+    return None, (f"该目录未映射进迅雷容器（已映射：{pair_text}）。"
+                  "请把该目录挂载进容器、或改用已映射目录下的路径、"
+                  "或留空使用下载根。")
+
+
 # ------------------------------------------------------------ 目录与配置
 
 def _safe_dir(raw: str, what: str) -> Path:
