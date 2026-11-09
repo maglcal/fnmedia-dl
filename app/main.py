@@ -34,6 +34,8 @@
 """
 from __future__ import annotations
 
+import datetime
+import json
 import os
 import re
 import subprocess
@@ -151,6 +153,97 @@ def update_check():
         return updatesrc.check(cfgmod.load(), VERSION)
     except updatesrc.SourceError as exc:
         raise HTTPException(502, str(exc))
+
+
+# ------------------------------------------- 每日自动更新检查（0.1.37.5）
+# state/update-check.json 记录状态，保证同一版本同一天内不重复弹窗：
+#   last_check_date   —— 今天是否已做过检查（每天最多查一次更新源）
+#   prompted_date     —— 最近一次弹「发现新版本」窗口的日期
+#   prompted_version  —— 最近一次弹窗对应的版本号
+# 逻辑：当天已查过 → skip；无更新 → none；有更新但今天已对此版本弹过 → skip；
+#       有更新且未弹过 → prompt（记录 prompted_* 后返回更新信息）。
+
+def _update_check_state_path() -> Path:
+    return Path(cfgmod.STATE_DIR) / "update-check.json"
+
+
+def _read_update_check_state() -> dict:
+    try:
+        data = json.loads(_update_check_state_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_update_check_state(state: dict) -> None:
+    try:
+        p = _update_check_state_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+@app.get("/api/update/daily-check")
+def update_daily_check():
+    """每日首次启动自动检查更新。前端 init() 调用，返回是否需要弹更新提示窗。
+
+    状态记录（state/update-check.json）：
+      last_check_date  = 今天日期 → 当天已查过，skip（每天最多一次）
+      prompted_date    = 今天日期 + prompted_version = 最新版本号
+                       → 今天已对此版本弹过窗，skip（同一版本同一天不重复弹）
+    返回 action：
+      "skip"  —— 今天已检查/已弹过，不处理
+      "none"  —— 无更新（或更新源不可用，当天不再重试）
+      "prompt" —— 发现新版本，携带版本号/更新日志/资产供弹窗展示
+    """
+    state = _read_update_check_state()
+    today = datetime.date.today().isoformat()
+
+    # 当天已做过检查 → 不再请求更新源
+    if state.get("last_check_date") == today:
+        return {"action": "skip"}
+
+    # 执行检查（失败也记录当天已查，避免反复请求坏源）
+    try:
+        result = updatesrc.check(cfgmod.load(), VERSION)
+    except Exception:
+        state["last_check_date"] = today
+        _save_update_check_state(state)
+        return {"action": "none"}
+
+    if not result.get("has_update"):
+        state["last_check_date"] = today
+        _save_update_check_state(state)
+        return {"action": "none"}
+
+    latest = result.get("latest", "")
+
+    # 今天已对此版本弹过窗 → 不再重复弹
+    if (state.get("prompted_date") == today
+            and state.get("prompted_version") == latest):
+        state["last_check_date"] = today
+        _save_update_check_state(state)
+        return {"action": "skip"}
+
+    # 记录弹窗状态（同一版本同一天不再弹）
+    state["last_check_date"] = today
+    state["prompted_date"] = today
+    state["prompted_version"] = latest
+    _save_update_check_state(state)
+
+    return {
+        "action": "prompt",
+        "current": result.get("current", VERSION),
+        "latest": latest,
+        "notes": result.get("notes", ""),
+        "url": result.get("url", ""),
+        "assets": result.get("assets", []),
+        "notice": result.get("notice", ""),
+    }
 
 
 class UpdateDownloadReq(BaseModel):

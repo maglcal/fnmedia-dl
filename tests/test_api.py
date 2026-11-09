@@ -429,5 +429,118 @@ class TestAdminGuard(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
 
+class TestDailyCheck(unittest.TestCase):
+    """每日自动更新检查（0.1.37.5）：state/update-check.json 状态记录。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        td = Path(self._td.name)
+        self._orig = cfgmod.STATE_DIR, cfgmod.CONFIG_PATH
+        cfgmod.STATE_DIR = td
+        cfgmod.CONFIG_PATH = td / "config.json"
+        self.client = TestClient(main.app)
+
+    def tearDown(self):
+        cfgmod.STATE_DIR, cfgmod.CONFIG_PATH = self._orig
+        self._td.cleanup()
+
+    @staticmethod
+    def _mock_result(has_update=True, latest="0.2.0", current="0.1.0"):
+        return {"ok": True, "current": current, "latest": latest,
+                "has_update": has_update, "url": "https://x", "notes": "changelog",
+                "source": "test", "notice": "",
+                "assets": [{"name": "fnmedia-dl.fpk", "url": "https://x/f.fpk",
+                            "size": 1, "sha256": "abc", "fallback_urls": []}],
+                "fetched_at": 0}
+
+    def _state_file(self):
+        return cfgmod.STATE_DIR / "update-check.json"
+
+    def test_first_check_prompts(self):
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               return_value=self._mock_result()):
+            r = self.client.get("/api/update/daily-check")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["action"], "prompt")
+        self.assertEqual(body["latest"], "0.2.0")
+        self.assertEqual(body["notes"], "changelog")
+        # 状态落盘
+        import json
+        st = json.loads(self._state_file().read_text())
+        self.assertIn("last_check_date", st)
+        self.assertEqual(st["prompted_version"], "0.2.0")
+
+    def test_same_day_skips(self):
+        """当天已检查过 → skip，不再请求更新源。"""
+        import datetime, json
+        today = datetime.date.today().isoformat()
+        self._state_file().write_text(json.dumps(
+            {"last_check_date": today}), encoding="utf-8")
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check") as mc:
+            r = self.client.get("/api/update/daily-check")
+        self.assertEqual(r.json()["action"], "skip")
+        mc.assert_not_called()
+
+    def test_no_update(self):
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               return_value=self._mock_result(
+                                   has_update=False, latest="0.1.0")):
+            r = self.client.get("/api/update/daily-check")
+        self.assertEqual(r.json()["action"], "none")
+
+    def test_same_version_same_day_no_repeat(self):
+        """同一版本同一天只弹一次窗。"""
+        import datetime, json
+        today = datetime.date.today().isoformat()
+        self._state_file().write_text(json.dumps(
+            {"last_check_date": today, "prompted_date": today,
+             "prompted_version": "0.2.0"}), encoding="utf-8")
+        r = self.client.get("/api/update/daily-check")
+        self.assertEqual(r.json()["action"], "skip")
+
+    def test_new_version_same_day_prompts_again(self):
+        """同一天但发现更新版本 → 允许弹窗。"""
+        import datetime, json
+        today = datetime.date.today().isoformat()
+        self._state_file().write_text(json.dumps(
+            {"last_check_date": "2026-01-01",  # 昨天
+             "prompted_date": today, "prompted_version": "0.2.0"}),
+            encoding="utf-8")
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               return_value=self._mock_result(
+                                   latest="0.3.0")):
+            r = self.client.get("/api/update/daily-check")
+        self.assertEqual(r.json()["action"], "prompt")
+        self.assertEqual(r.json()["latest"], "0.3.0")
+
+    def test_source_error_saves_check_date(self):
+        """更新源不可用也记 last_check_date（当天不反复请求坏源）。"""
+        import datetime, json
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               side_effect=Exception("network")):
+            r = self.client.get("/api/update/daily-check")
+        self.assertEqual(r.json()["action"], "none")
+        st = json.loads(self._state_file().read_text())
+        self.assertEqual(st["last_check_date"],
+                         datetime.date.today().isoformat())
+
+    def test_state_file_written_atomically(self):
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               return_value=self._mock_result()):
+            self.client.get("/api/update/daily-check")
+        self.assertTrue(self._state_file().is_file())
+        # 无残留 tmp 文件
+        import json
+        st = json.loads(self._state_file().read_text(encoding="utf-8"))
+        self.assertEqual(st["prompted_version"], "0.2.0")
+
+
 if __name__ == "__main__":
     unittest.main()

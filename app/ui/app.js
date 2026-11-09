@@ -1268,6 +1268,135 @@ on("#btnQueueSave", "click", async () => {
   }
 });
 
+/* ---------------- 每日自动更新检查（0.1.37.5） ----------------
+   每天首次启动调用 /api/update/daily-check，发现新版本弹提示窗。
+   状态记录在 state/update-check.json（后端维护）：
+     last_check_date  当天已查过 → skip（每天最多一次）
+     prompted_date + prompted_version 今天对此版本弹过 → skip（不重复弹）
+   「立即更新」→ 复用一键更新流程（POST /api/update/download + 进度轮询）；
+   「稍后更新」→ 关弹窗，当天同版本不再弹。 */
+
+function _renderNotes(md) {
+  // 极简 markdown → HTML：先转义防 XSS，再转换常见标记
+  let s = esc(md || "");
+  s = s.replace(/^### (.+)$/gm, "<h4>$1</h4>")
+       .replace(/^## (.+)$/gm, "<h4>$1</h4>")
+       .replace(/^# (.+)$/gm, "<h4>$1</h4>")
+       .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+       .replace(/^[-*] (.+)$/gm, "<li>$1</li>")
+       .replace(/(<li>.*<\/li>)(\n(?!<li>))/gs, "$1<br>")
+       .replace(/\n\n/g, "<br><br>")
+       .replace(/\n/g, "<br>");
+  return s;
+}
+
+function dailyCheck() {
+  API.get("/api/update/daily-check").then((r) => {
+    if (r.action !== "prompt") return;
+    // 填充弹窗
+    const verEl = $("#upVer");
+    if (verEl) verEl.textContent = "v" + r.latest;
+    const notesEl = $("#upNotes");
+    if (notesEl) {
+      notesEl.innerHTML = `<p>当前版本 <b>v${esc(r.current)}</b> → 新版本 <b>v${esc(r.latest)}</b></p>`
+        + (r.notes ? _renderNotes(r.notes) : "<p>（本次更新无详细日志）</p>");
+    }
+    const noticeEl = $("#upNotice");
+    if (noticeEl) {
+      noticeEl.hidden = !r.notice;
+      noticeEl.textContent = r.notice || "";
+    }
+    // 记住 fpk 资产地址（供「立即更新」使用）
+    const fpk = (r.assets || []).find((a) => (a.name || "").endsWith(".fpk"));
+    UPD.url = fpk ? fpk.url : "";
+    UPD.target = r.latest;
+    UPD.fallback_urls = fpk ? (fpk.fallback_urls || []) : [];
+    UPD.sha256 = fpk ? (fpk.sha256 || "") : "";
+    UPD.size = fpk ? (fpk.size || 0) : 0;
+    // 显示弹窗
+    const box = $("#updatePrompt");
+    if (box) box.hidden = false;
+    $("#upProgressBox").hidden = true;
+    $("#upActions").hidden = false;
+  }).catch(() => { /* 检查失败不影响主功能 */ });
+}
+
+on("#upClose", "click", () => { const b = $("#updatePrompt"); if (b) b.hidden = true; });
+on("#upLaterBtn", "click", () => {
+  const b = $("#updatePrompt");
+  if (b) b.hidden = true;
+  toast("已推迟更新，当天不会再弹出提示");
+});
+on("#updatePrompt", "click", (e) => {
+  if (e.target && e.target.id === "updatePrompt") e.target.hidden = true;
+});
+
+on("#upNowBtn", "click", async () => {
+  if (!UPD.url) { toast("没有可用的更新包地址"); return; }
+  const bar = $("#upProgressBar");
+  const stageEl = $("#upProgressStage");
+  const pctEl = null;
+  $("#upNowBtn").disabled = true;
+  $("#upLaterBtn").disabled = true;
+  $("#upActions").hidden = true;
+  $("#upProgressBox").hidden = false;
+  bar.style.width = "2%";
+  stageEl.textContent = "准备下载…";
+  try {
+    await API.send("/api/update/download", "POST",
+      { url: UPD.url, version: UPD.target });
+  } catch (e) {
+    stageEl.textContent = "✗ 启动更新失败：" + e.message;
+    $("#upActions").hidden = false;
+    $("#upNowBtn").disabled = false;
+    $("#upLaterBtn").disabled = false;
+    return;
+  }
+  clearInterval(UPD.timer);
+  UPD.timer = setInterval(async () => {
+    let p = null;
+    try {
+      p = await API.get("/api/update/progress");
+    } catch { /* 服务重启中 */ }
+    if (p) {
+      const pct = Math.max(0, Math.min(100, p.percent || 0));
+      bar.style.width = pct + "%";
+      stageEl.textContent = (p.detail || p.stage || "") + "  " + pct + "%";
+    }
+    if (p && p.done) {
+      clearInterval(UPD.timer);
+      if (p.stage === "error") {
+        stageEl.textContent = "✗ " + (p.detail || "更新失败");
+        $("#upActions").hidden = false;
+        $("#upNowBtn").disabled = false;
+        $("#upLaterBtn").disabled = false;
+        return;
+      }
+      bar.style.width = "100%";
+      stageEl.textContent = "更新完成，服务重启中…";
+      const oldVer = (p.from_version || "").replace(/^(main-)?v/i, "");
+      const deadline = Date.now() + 90000;
+      const ht = setInterval(async () => {
+        try {
+          const h = await API.get("/api/health");
+          const v = (h.version || "").replace(/^(main-)?v/i, "");
+          if (v && v !== oldVer) {
+            clearInterval(ht);
+            stageEl.textContent = `✓ 已更新到 v${v}，页面即将刷新…`;
+            toast(`✓ 已更新到 v${v}`);
+            loadVersion();
+            setTimeout(() => location.reload(), 1800);
+          }
+        } catch { /* 还没起来 */ }
+        if (Date.now() > deadline) {
+          clearInterval(ht);
+          stageEl.textContent = "⚠ 文件已替换，但服务未在预期时间内恢复，请到应用中心重启";
+        }
+      }, 2000);
+    }
+  }, 1000);
+});
+
 /* ---------------- init ----------------
    顶层执行到这说明脚本未被中途异常带崩；给页面看门狗一个就绪信号。
    看门狗见 index.html 尾部（脚本没跑起来时给用户明确提示而不是静默残废）。 */
@@ -1275,6 +1404,7 @@ try {
   loadChips();
   loadVersion();
   loadQueue();
+  dailyCheck();
   scheduleAutoRefresh();
   window.__fnmediaReady = true;
 } catch (e) {
