@@ -115,51 +115,6 @@ cd app && python serve.py --http 127.0.0.1:8787
 - **历史泄露处置**：令牌一旦出现在聊天/日志等渠道，应立即在服务端**重置
   令牌**（旧令牌即作废），不要依赖事后删除记录。
 
-### 镜像自动同步（GitHub → RepoBox）
-
-仓库自带 `.github/workflows/mirror-repobox.yml`：release 发布时立即同步，
-每 6 小时兜底校验（幂等，已同步自动跳过），也可手动触发。配置 3 个
-Repository Secrets 即可启用：
-
-| Secret | 说明 |
-|---|---|
-| `REPOBOX_URL` | RepoBox 站点地址（如 `https://repo.example.com`） |
-| `REPOBOX_TOKEN` | API 令牌 `rbx_xxx`（RepoBox 网页「令牌」页创建） |
-| `REPOBOX_REPO` | 镜像仓库名（可省，默认 `fnmedia-dl`，不存在自动创建） |
-
-同步内容：发行资产（`.fpk`/`.sha256`）按 `releases/{tag}/` 布局上传（逐文件
-回读校验），并生成 `latest.json` 清单（version/tag/资产大小/SHA256），供插件
-多源检查消费。手动同步：
-
-```bash
-REPOBOX_URL=... REPOBOX_TOKEN=... python3 tools/sync_repobox.py [--tag main-vX.Y.Z] [--force]
-```
-
-### 发布命名规则（main-vX.Y.Z / 分支测试 vX.Y.Z.x）
-
-从 `main-v0.1.35` 起，发布标识统一 **`main-vX.Y.Z`**（`main` 之后跟版本号，
-如 `main-v0.1.35`）：
-
-- **git tag / GitHub Release 标签**：`main-vX.Y.Z`；
-- **fpk 资产文件名**：`fnmedia-dl-main-vX.Y.Z.fpk`（配套 `.fpk.sha256`）；
-- **版本号本体**（VERSION 文件、manifest version 字段、更新比较）：`vX.Y.Z` /
-  纯 `X.Y.Z`，**不带 `main-` 前缀**。
-
-**分支测试版本号（`vX.Y.Z.x`）**：分支测试时以当前主版本号为基础，末尾追加一位
-递增的分支序号标识分支版本（主版本号 `v0.1.36` → 分支版本 `v0.1.36.1`、
-`v0.1.36.2` ……），分支测试包名 `fnmedia-dl-vX.Y.Z.x.fpk`（不带 `main-` 前缀）。
-分支测试通过并合并回 main 时，主版本号末位递增一位（`v0.1.36` → `v0.1.37`），
-再按 `main-vX.Y.Z` 正式发布。分支四段号与主线三段号统一规则比较
-（`0.1.36` < `0.1.36.1` < `0.1.37`）。
-
-解析端（`app/updatesrc.py` 的 `strip_ver`，updater/同步脚本共用同一规则）剥
-`main-v`/`v` 前缀取纯版本，旧格式 `v0.1.x` tag 兼容可解析；历史 tag 为旧命名，
-不再新增。
-
-版本号**延续主线往后递增**（不独立编号、不重置、不跳号）：小修小补递增第三位
-（版本号 `v0.1.35` → `v0.1.36` → ……，发布标识对应 `main-v0.1.36`），
-大内容更新才升第二位（`v0.2.0`），首个正式大版 `v1.0.0`。
-
 ## 通道配置
 
 管理页「通道设置」里配置，要点：
