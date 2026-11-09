@@ -179,18 +179,33 @@ class DownloadManager:
     # ------------------------------------------------------------ 任务视图
 
     def unified_tasks(self) -> tuple[list[dict], dict]:
-        """合并各通道实时任务 + 本地记录（补 URL/时间；通道查不到的标注 gone）。"""
+        """合并各通道实时任务 + 本地记录（补 URL/时间；通道查不到的标注 gone）。
+
+        0.1.37.2 两条合并规则（NAS 实测反馈「1 条链接出现 2 条同样的任务」）：
+        - 隐藏通道（disabled_backends）不参与视图——通道管理的语义是
+          「界面只保留启用的通道」，任务列表同样遵守；
+        - 同一底层任务被多个通道各列一行时（同一迅雷实例从远程通道与
+          本地直连面板都能看到；删一条另一条也消失，确认是同一任务），
+          按 (id, url) 合并为一行，本地记录所在通道优先作为归属。"""
         pool = self.backends()
+        disabled = self._disabled()
         live: dict[tuple[str, str], dict] = {}
         errors: dict[str, str] = {}
         for key, impl in pool.items():
+            if key in disabled:
+                continue
             try:
                 for tv in impl.list_tasks():
-                    live[(key, tv.id)] = tv.to_dict()
+                    live[(key, str(tv.id))] = tv.to_dict()
             except BackendError as exc:
                 errors[key] = str(exc)
 
+        def _ident(item: dict) -> tuple[str, str]:
+            return (str(item.get("id", "")), item.get("url") or "")
+
+        live_idents = {_ident(item) for item in live.values()}
         seen: set[tuple[str, str]] = set()
+        emitted: set[tuple[str, str]] = set()
         out: list[dict] = []
         for rec in reversed(self.records):
             k = (rec.get("backend"), str(rec.get("id")))
@@ -206,10 +221,22 @@ class DownloadManager:
                         "size": None, "url": rec.get("url", ""),
                         "message": "任务已不在引擎列表中（可能已完成清理）",
                         "created_at": rec.get("created_at")}
+                if _ident(item) in live_idents:
+                    # 同任务在其它通道仍有实时行：不再补一条「已清理」幽灵行
+                    continue
+            ident = _ident(item)
+            if ident in emitted:
+                # 同一任务（同 id 同链接）跨通道/重复记录只出一行
+                continue
+            emitted.add(ident)
             out.append(item)
         # 通道里存在但本地无记录的（别处创建的任务），也纳入统一视图
         for k, item in live.items():
             if k not in seen:
+                ident = _ident(item)
+                if ident in emitted:
+                    continue
+                emitted.add(ident)
                 item["created_at"] = None
                 out.append(item)
         return out, errors

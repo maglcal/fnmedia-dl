@@ -143,6 +143,89 @@ class TestUnifiedTasks(DispatchTestBase):
         _, errors = mgr.unified_tasks()
         self.assertIn("aria2", errors)
 
+    def test_same_task_on_two_backends_single_row(self):
+        """同一底层任务被两个通道各列一行时合并为一行（回归）。
+
+        同一迅雷实例从远程通道与本地直连面板都能看到同一任务，
+        删一条另一条也跟着消失——确认是同一任务，不得出两行。
+        归属取有本地记录的通道。"""
+        tv = TaskView(backend="thunder_cloud", id="t1", name="a.mkv",
+                      state="running", progress=10, url="https://x/a.mkv")
+        tv2 = TaskView(backend="thunder_engine", id="t1", name="a.mkv",
+                       state="running", progress=10, url="https://x/a.mkv")
+        cloud = FakeBackend("thunder_cloud", "cloud", tasks=[tv])
+        engine = FakeBackend("thunder_engine", "engine", tasks=[tv2])
+        mgr = self.manager({"thunder_cloud": cloud, "thunder_engine": engine})
+        mgr._record("thunder_cloud", "t1", "https://x/a.mkv", "a.mkv", "")
+        tasks, errors = mgr.unified_tasks()
+        self.assertEqual(errors, {})
+        self.assertEqual(len(tasks), 1, tasks)
+        self.assertEqual(tasks[0]["backend"], "thunder_cloud")
+
+    def test_same_task_two_backends_without_record_first_wins(self):
+        """无本地记录时同任务跨通道也只出一行（按通道顺序归属）。"""
+        tv = TaskView(backend="thunder_cloud", id="t1", name="a.mkv",
+                      state="running", progress=10, url="https://x/a.mkv")
+        tv2 = TaskView(backend="thunder_engine", id="t1", name="a.mkv",
+                       state="running", progress=10, url="https://x/a.mkv")
+        cloud = FakeBackend("thunder_cloud", "cloud", tasks=[tv])
+        engine = FakeBackend("thunder_engine", "engine", tasks=[tv2])
+        mgr = self.manager({"thunder_cloud": cloud, "thunder_engine": engine})
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(len(tasks), 1, tasks)
+
+    def test_different_ids_same_url_not_merged(self):
+        """不同引擎的两条同名同链接任务（不同 id）是两条真实下载，不合并。"""
+        tv = TaskView(backend="thunder_cloud", id="c1", name="a.mkv",
+                      state="running", progress=10, url="https://x/a.mkv")
+        tv2 = TaskView(backend="aria2", id="g1", name="a.mkv",
+                       state="running", progress=10, url="https://x/a.mkv")
+        cloud = FakeBackend("thunder_cloud", "cloud", tasks=[tv])
+        aria = FakeBackend("aria2", "aria2", tasks=[tv2])
+        mgr = self.manager({"thunder_cloud": cloud, "aria2": aria})
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(len(tasks), 2, tasks)
+
+    def test_hidden_backend_tasks_not_listed(self):
+        """隐藏通道不参与任务列表（通道管理：界面只保留启用通道）。"""
+        tv = TaskView(backend="aria2", id="g1", name="live.bin",
+                      state="running", progress=10, url="https://x/live.bin")
+        hidden = FakeBackend("aria2", "aria2", tasks=[tv])
+        hidden.list_tasks = lambda: (_ for _ in ()).throw(
+            AssertionError("隐藏通道不应被查询"))
+        cloud = FakeBackend("thunder_cloud", "cloud")
+        mgr = self.manager({"thunder_cloud": cloud, "aria2": hidden},
+                           {"engine_order": ["thunder_cloud", "aria2"],
+                            "disabled_backends": ["aria2"]})
+        tasks, errors = mgr.unified_tasks()
+        self.assertEqual(tasks, [])
+        self.assertEqual(errors, {})
+
+    def test_duplicate_records_single_row(self):
+        """同一 (通道, id) 落了两条记录也只出一行（防重复行回归）。"""
+        live = [TaskView(backend="aria2", id="g1", name="live.bin",
+                         state="running", progress=10, url="https://x/live.bin")]
+        good = FakeBackend("aria2", "aria2", tasks=live)
+        mgr = self.manager({"aria2": good})
+        mgr._record("aria2", "g1", "https://x/live.bin", "live.bin", "")
+        mgr._record("aria2", "g1", "https://x/live.bin", "live.bin", "")
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(len(tasks), 1, tasks)
+
+    def test_gone_record_suppressed_when_live_on_other_backend(self):
+        """记录所在通道查不到、但其它通道有同任务实时行：只出实时行，
+        不再补「已清理」幽灵行。"""
+        tv = TaskView(backend="thunder_engine", id="t1", name="a.mkv",
+                      state="running", progress=10, url="https://x/a.mkv")
+        cloud = FakeBackend("thunder_cloud", "cloud")
+        engine = FakeBackend("thunder_engine", "engine", tasks=[tv])
+        mgr = self.manager({"thunder_cloud": cloud, "thunder_engine": engine})
+        mgr._record("thunder_cloud", "t1", "https://x/a.mkv", "a.mkv", "")
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(len(tasks), 1, tasks)
+        self.assertEqual(tasks[0]["state"], "running")
+        self.assertEqual(tasks[0]["backend"], "thunder_engine")
+
     def test_delete_removes_record(self):
         good = FakeBackend("aria2", "aria2")
         mgr = self.manager({"aria2": good})

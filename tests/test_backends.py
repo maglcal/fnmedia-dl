@@ -293,14 +293,156 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(made, [{"parent_id": "sub-1", "name": "2025",
                                  "space": "sp", "kind": "drive#folder"}])
 
-    def test_resolve_outside_root_keeps_root_id(self):
-        """根外绝对目录不再报错（0.1.26 硬拒是回归）：保留根 id 让任务能
-        开始下载，路径原样给引擎尽力落盘。"""
+    def test_resolve_outside_root_anchored_by_realpath(self):
+        """根外绝对路径按目录表 realPath 锚定真实落点（0.1.37.2 修复：
+        保存目录填 /vol1/1000/movie 却下到下载根——引擎只认
+        parent_folder_id，此前「根 id + 原样路径」等于没设目录）。"""
+        made = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "dir-1", "name": "downloads",
+                         "params": {"RealPath": "/downloads/"}},
+                        {"id": "s-1000", "name": "1000",
+                         "params": {"RealPath": "/vol1/1000/"}}]})
+                return httpx.Response(200, json={"files": []})
+            if path.endswith("/files") and request.method == "POST":
+                made.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "made-1"}})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "/vol1/1000/movie"),
+                         ("made-1", "/vol1/1000/movie/"))
+        self.assertEqual(made, [{"parent_id": "s-1000", "name": "movie",
+                                 "space": "sp", "kind": "drive#folder"}])
+
+    def test_resolve_outside_root_exact_mount_no_create(self):
+        """根外绝对路径恰好等于某顶层挂载 → 直接用其 id，不建任何目录。"""
         core = self._mk(self._folder_handler(
             config={"download_paths": ["/downloads"]},
-            files=[{"id": "dir-1", "name": "downloads", "params": {"RealPath": "/downloads/"}}]))
+            files=[{"id": "dir-1", "name": "downloads",
+                    "params": {"RealPath": "/downloads/"}},
+                   {"id": "s-1000", "name": "1000",
+                    "params": {"RealPath": "/vol1/1000/"}}]))
+        self.assertEqual(core.resolve_dest_folder("sp", "/vol1/1000/"),
+                         ("s-1000", "/vol1/1000/"))
+
+    def test_resolve_outside_root_longest_prefix_wins(self):
+        """多个挂载前缀命中时取最长 realPath（/vol1/1000/ 优先于 /vol1/）。"""
+        made = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "dir-1", "name": "downloads",
+                         "params": {"RealPath": "/downloads/"}},
+                        {"id": "s-vol1", "name": "vol1",
+                         "params": {"RealPath": "/vol1/"}},
+                        {"id": "s-1000", "name": "1000",
+                         "params": {"RealPath": "/vol1/1000/"}}]})
+                return httpx.Response(200, json={"files": []})
+            if path.endswith("/files") and request.method == "POST":
+                made.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "made-1"}})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "/vol1/1000/movie"),
+                         ("made-1", "/vol1/1000/movie/"))
+        self.assertEqual(made[0]["parent_id"], "s-1000")
+
+    def test_resolve_outside_root_unreachable_explicit_error(self):
+        """可达性可判定（目录项带 realPath）但锚不到 → 显式报错，
+        绝不静默回落下载根——静默下错位置就是本次修复的 bug 本身。"""
+        made = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            if path.endswith("/files") and request.method == "POST":
+                made.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "made-1"}})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        with self.assertRaises(BackendError) as ctx:
+            core.resolve_dest_folder("sp", "/vol1/1000/movie")
+        self.assertIn("不在引擎可达", str(ctx.exception))
+        self.assertEqual(made, [])          # 没有偷偷建目录/建任务
+
+    def test_resolve_outside_root_no_path_info_keeps_root_id(self):
+        """目录项无任何路径信息（极简形状等）→ 无从判定可达性，保留
+        0.1.27 语义降级：根 id + 原样路径尽力落盘（0.1.26 硬报错是回归）。"""
+        core = self._mk(self._folder_handler(
+            files=[{"id": "a", "name": "aaa", "parent_id": "root-9"},
+                   {"id": "b", "name": "bbb", "parent_id": "root-9"}]))
         self.assertEqual(core.resolve_dest_folder("sp", "/vol1/other"),
-                         ("dir-1", "/vol1/other"))
+                         ("root-9", "/vol1/other"))
+
+    def test_resolve_outside_root_name_anchor_without_realpath(self):
+        """目录项无 realPath 时按名称段锚定（取段位最靠前的同名顶层目录），
+        剩余段逐段解析/缺级自动建。"""
+        made = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={})
+            if path.endswith("/files") and request.method == "GET":
+                pid = request.url.params.get("parent_id", "")
+                if pid == "":
+                    return httpx.Response(200, json={"files": [
+                        {"id": "s-1", "name": "other"}]})
+                return httpx.Response(200, json={"files": []})
+            if path.endswith("/files") and request.method == "POST":
+                made.append(json.loads(request.content))
+                return httpx.Response(200, json={"file": {"id": "made-1"}})
+            return httpx.Response(200, json={})
+        core = self._mk(handler)
+        self.assertEqual(core.resolve_dest_folder("sp", "/vol1/other/movie"),
+                         ("made-1", "/vol1/other/movie/"))
+        self.assertEqual(made, [{"parent_id": "s-1", "name": "movie",
+                                 "space": "sp", "kind": "drive#folder"}])
+
+    def test_create_task_unreachable_direct_fallback(self):
+        """不可达绝对路径：默认（云端）显式报错不建死任务；
+        on_unresolvable="direct"（本地引擎）回退空 id + 原样路径直传。"""
+        captured = {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/device/config"):
+                return httpx.Response(200, json={"download_paths": ["/downloads"]})
+            if path.endswith("/files") and request.method == "GET":
+                return httpx.Response(200, json={"files": [
+                    {"id": "dir-1", "name": "downloads",
+                     "params": {"RealPath": "/downloads/"}}]})
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"task": {"id": "t-1"}})
+        core = self._mk(handler)
+        with self.assertRaises(BackendError):
+            core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                             "sp", directory="/vol1/1000/movie")
+        core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                         "sp", directory="/vol1/1000/movie",
+                         on_unresolvable="direct")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
+        self.assertEqual(captured["params"]["parent_folder_path"],
+                         "/vol1/1000/movie")
 
     def test_create_task_resolves_parent_folder(self):
         """未显式给 parent_folder_id 时自动解析——这是任务开始下载的必要字段。"""
@@ -353,7 +495,9 @@ class TestDriveCore(unittest.TestCase):
                          "/downloads/电影/2025/")
 
     def test_create_task_keeps_root_for_dir_outside_root(self):
-        """根外绝对目录：保留根 id + 路径原样（不报错也不丢 id）。"""
+        """根外绝对目录（0.1.37.2 语义变更）：可达性可判定但锚不到时
+        默认显式报错（静默下到根就是要修的 bug）；on_unresolvable="direct"
+        （本地引擎）保留 0.1.22 直传——空 id + 路径原样，不丢任务。"""
         captured = {}
 
         def handler(request):
@@ -367,10 +511,14 @@ class TestDriveCore(unittest.TestCase):
             captured.update(json.loads(request.content))
             return httpx.Response(200, json={"task": {"id": "t-2"}})
         core = self._mk(handler)
+        with self.assertRaises(BackendError):
+            core.create_task("https://x/a", ParsedResource(name="a", size=1),
+                             "sp", directory="/vol1/media/剧集")
         tid = core.create_task("https://x/a", ParsedResource(name="a", size=1),
-                               "sp", directory="/vol1/media/剧集")
+                               "sp", directory="/vol1/media/剧集",
+                               on_unresolvable="direct")
         self.assertEqual(tid, "t-2")
-        self.assertEqual(captured["params"]["parent_folder_id"], "dir-1")
+        self.assertEqual(captured["params"]["parent_folder_id"], "")
         self.assertEqual(captured["params"]["parent_folder_path"],
                          "/vol1/media/剧集")
 
@@ -1755,6 +1903,25 @@ class TestDeviceTimeoutAndHarvest(unittest.TestCase):
         pid, path = self._core(handler).resolve_dest_folder("remote-1", "movies")
         self.assertEqual(pid, "f-h")
         self.assertEqual(path, "/downloads/movies/")
+
+    def test_resolve_harvested_root_abs_path_keeps_root_id(self):
+        """目录表全挂 + 根外绝对路径：可达性无从判定（锚定要用的目录表
+        本身不可用），保留 0.1.27 语义——根 id + 原样路径尽力落盘，
+        任务至少能开始下载，不回归 0.1.26 硬报错。"""
+        def handler(request):
+            path = request.url.path
+            if path.endswith("/files"):
+                return httpx.Response(200, json=self.TIMEOUT_BODY)
+            if path.endswith("/tasks"):
+                return httpx.Response(200, json={"tasks": [
+                    {"name": "t", "params": {
+                        "parent_folder_id": "f-h",
+                        "parent_folder_path": "/downloads/"}}]})
+            return httpx.Response(200, json={})
+
+        self.assertEqual(
+            self._core(handler).resolve_dest_folder("remote-1", "/vol1/1000/movie"),
+            ("f-h", "/vol1/1000/movie"))
 
     # -------------------------------------------- 0.1.33 重试治理 / 负缓存
 

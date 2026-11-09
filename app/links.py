@@ -287,12 +287,17 @@ def parse_line(line: str) -> LinkInfo:
 
 _SCHEME_RE = re.compile(
     r"(?:magnet:|thunder://|ed2k://|https?://|ftp://)", re.I)
+# 新链接只在行首或分隔符后起段：协议前缀出现在 URL 参数值里
+# （磁力 &tr=https://…、跳转 ?redirect=https://…）不是新链接，
+# 无脑按协议前缀切会把 1 条磁力拆成「截残磁力 + tracker 直链」两条任务。
+_SCHEME_SEPS = " \t\r\n,;，；、"
 
 
 def split_links(text: str) -> list[str]:
     """批量文本切条：协议感知，防止误拆合法 URL。
 
-    - 优先按行拆；行内出现多个协议前缀（多条挤一行）时按协议前缀切；
+    - 优先按行拆；行内协议前缀只有挤在分隔符后才算新链接（多条挤一行）；
+      出现在查询参数值里的协议前缀（磁力 &tr=https://… 等）不切；
     - 整行不含协议前缀时才按空白/逗号/分号/顿号兜底拆；
     - 不再对逗号/顿号盲拆：它们是合法 URL 字符（查询参数、
       未编码中文文件名），盲拆会把链接截残。"""
@@ -301,12 +306,13 @@ def split_links(text: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        marks = list(_SCHEME_RE.finditer(line))
-        if marks:
-            for i, m in enumerate(marks):
-                end = marks[i + 1].start() if i + 1 < len(marks) else len(line)
+        starts = [m.start() for m in _SCHEME_RE.finditer(line)
+                  if m.start() == 0 or line[m.start() - 1] in _SCHEME_SEPS]
+        if starts:
+            for i, s in enumerate(starts):
+                end = starts[i + 1] if i + 1 < len(starts) else len(line)
                 # 段尾剥离挤在两条之间的分隔符（如 "https://a，ed2k://b"）
-                seg = line[m.start():end].strip().rstrip(",;，；、").strip()
+                seg = line[s:end].strip().rstrip(",;，；、").strip()
                 if seg:
                     chunks.append(seg)
         else:

@@ -152,6 +152,53 @@ class TestParseText(unittest.TestCase):
         self.assertEqual(got[0].url, "https://example.com/a.iso")
         self.assertEqual(got[1].kind, "magnet")
 
+    def test_no_split_on_unencoded_magnet_tracker(self):
+        """磁力 &tr= 带未编码 https tracker 不得被拆成两条（回归）。
+
+        此前按协议前缀无脑切，1 条磁力被拆成「截残磁力 + tracker 直链」
+        两条派发，任务列表凭空多出一条任务且磁力丢光 tracker。"""
+        url = (f"magnet:?xt=urn:btih:{self.HEX}&dn=Test"
+               "&tr=https://tracker.example.com/announce")
+        got = links.parse_text(url)
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].ok)
+        self.assertEqual(got[0].url, url)
+
+    def test_no_split_on_multiple_unencoded_trackers(self):
+        """多个未编码 https tracker + udp tracker 整条不拆。"""
+        url = (f"magnet:?xt=urn:btih:{self.HEX}"
+               "&tr=https://t1.example.com/a&tr=https://t2.example.com/b"
+               "&tr=udp://open.demonii.com:1337/announce")
+        got = links.parse_text(url)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].url, url)
+
+    def test_no_split_on_redirect_param_in_direct_url(self):
+        """直链查询参数值里的 https:// 不是新链接（回归）。"""
+        url = "https://proxy.example.com/f?src=https://origin.example.com/x.zip"
+        got = links.parse_text(url)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].url, url)
+
+    def test_split_still_parts_after_tracker_on_separator(self):
+        """磁力带 tracker 后，分隔符后的第二条链接照常切开。"""
+        url = (f"magnet:?xt=urn:btih:{self.HEX}&tr=https://t.example.com/a，"
+               f"magnet:?xt=urn:btih:{self.HEX}")
+        got = links.parse_text(url)
+        self.assertEqual(len(got), 2)
+        self.assertTrue(got[0].url.endswith("&tr=https://t.example.com/a"))
+        self.assertEqual(got[1].kind, "magnet")
+
+    def test_split_magnet_tracker_then_space_direct(self):
+        """磁力（含未编码 tracker）与空格后的直链切成两条，磁力不截残。"""
+        url = (f"magnet:?xt=urn:btih:{self.HEX}&tr=https://t.example.com/a"
+               " https://dl.example.com/f.zip")
+        got = links.parse_text(url)
+        self.assertEqual(len(got), 2)
+        self.assertTrue(got[0].url.startswith("magnet:"))
+        self.assertIn("&tr=https://t.example.com/a", got[0].url)
+        self.assertEqual(got[1].url, "https://dl.example.com/f.zip")
+
     def test_split_strips_numbering_prefix(self):
         """行首序号/说明前缀丢弃，保留协议段。"""
         got = links.parse_text(f"1、magnet:?xt=urn:btih:{self.HEX}")

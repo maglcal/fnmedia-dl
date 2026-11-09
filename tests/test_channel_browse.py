@@ -283,12 +283,16 @@ class FakeCore(DriveCore):
 
     TREE = {
         "": [{"id": "root", "name": "downloads",
-              "params": {"RealPath": "/downloads/"}}],
+              "params": {"RealPath": "/downloads/"}},
+             {"id": "s1000", "name": "1000",
+              "params": {"RealPath": "/vol1/1000/"}}],
         "root": [{"id": "m1", "name": "movies", "params": {"RealPath": "/downloads/movies/"}},
                  {"id": "m2", "name": "music", "params": {"RealPath": "/downloads/music/"}}],
         "m1": [{"id": "m11", "name": "2026", "params": {"RealPath": "/downloads/movies/2026/"}}],
         "m2": [],
         "m11": [],
+        "s1000": [{"id": "e1", "name": "movie", "params": {"RealPath": "/vol1/1000/movie/"}}],
+        "e1": [],
     }
 
     def __init__(self):
@@ -336,6 +340,25 @@ class TestDriveCoreBrowse(unittest.TestCase):
     def test_deep_missing_segment_raises(self):
         with self.assertRaises(BackendError):
             self.core.browse("sp", "nope/nope2")
+        self.assertEqual(self.core.made, [])
+
+    def test_navigate_by_absolute_path_outside_root_anchored(self):
+        """根外绝对路径按 realPath 锚定真实落点后浏览（与派发同一套落点
+        规则，选择器回填的路径派发时解析到同一处）；只读不建目录。"""
+        d = self.core.browse("sp", "/vol1/1000/movie")
+        self.assertEqual(d["root"], "/vol1/1000/")
+        self.assertEqual(d["path"], "/vol1/1000/movie/")
+        self.assertEqual(self.core.made, [])
+
+    def test_outside_root_missing_segment_raises_readonly(self):
+        with self.assertRaises(BackendError):
+            self.core.browse("sp", "/vol1/1000/nope")
+        self.assertEqual(self.core.made, [])
+
+    def test_outside_root_unanchorable_falls_back_missing(self):
+        """锚不到的根外路径沿用根下相对解释 → 缺级报「目录不存在」，只读。"""
+        with self.assertRaises(BackendError):
+            self.core.browse("sp", "/vol1/nope/x")
         self.assertEqual(self.core.made, [])
 
 

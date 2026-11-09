@@ -337,6 +337,10 @@ class DriveCore:
           4. 启发式兜底：首个顶层目录的 parent_id 或 id
         directory 为根下子目录（相对路径，或根目录下的绝对路径），
         中间层级缺失时自动创建（多级逐段建）。
+        根外绝对路径按 _anchor_abs 在目录表顶层锚定真实落点后解析；
+        锚不到且目录项带路径信息时显式报错（0.1.37.2——静默回落下载根
+        会让文件下错位置），目录表不可用/无路径信息时才降级根 id +
+        原样路径尽力落盘。
 
         0.1.31：结果按 (base_url, space, directory) 缓存 120s——批量派发
         同目录只解析一次（此前每条链接重跑整条目录链，是「批量必超时
@@ -455,6 +459,34 @@ class DriveCore:
             raise BackendError("无法识别引擎下载根目录（parent_folder_id 解析失败）")
         return root_id, root_path
 
+    def _anchor_abs(self, tops: list[dict],
+                    nd: str) -> tuple[str, str, str] | None:
+        """根外绝对路径在目录表顶层找锚点（0.1.37.2）→ (id, 锚定路径, 剩余段)。
+
+        优先 realPath 最长前缀（同挂载/同路径树，语义最准）；目录项不带
+        params 路径时退化为「名称段匹配」——取段位最靠前的同名顶层目录，
+        剩余段交由逐段走树解析（走树按 name/realPath 双条件匹配，能纠偏）。
+        只读：不查子级、不建目录。找不到返回 None，由调用方决定报错或降级
+        ——绝不再静默回落下载根（0.1.37.1 用户实测：保存目录填了
+        /vol1/1000/movie，文件却下到下载根，静默下错位置比报错更糟）。"""
+        segs = [s for s in nd.split("/") if s]
+        best: tuple[int, str, str, str] | None = None
+        for f in tops:
+            fp = _folder_path(f)
+            if fp and (nd == fp or nd.startswith(fp)):
+                cand = (len(fp), str(f.get("id")), fp, nd[len(fp):])
+                if best is None or cand[0] > best[0]:
+                    best = cand
+        if best:
+            return best[1], best[2], best[3]
+        for i, seg in enumerate(segs):
+            for f in tops:
+                if (f.get("name") or "").strip() == seg:
+                    fp = (_folder_path(f)
+                          or _norm_dir("/".join(segs[:i + 1])))
+                    return str(f.get("id")), fp, "/".join(segs[i + 1:])
+        return None
+
     def _resolve_uncached(self, space: str, directory: str,
                           deadline: float) -> tuple[str, str]:
         root_id, root_path = self._root_folder(space, deadline)
@@ -467,15 +499,45 @@ class DriveCore:
             return root_id, root_path
         if root_path and nd.startswith(root_path):
             rel = nd[len(root_path):]             # 根下绝对路径 → 相对段
+            pid, ppath = root_id, root_path
         elif dest.startswith("/"):
-            # 根外/根未知的绝对路径：不硬拒（0.1.26 硬报错是回归）——
-            # 保留根 id 让任务能开始下载，路径原样给引擎尽力落盘
-            return root_id, dest
+            # 根外/根未知的绝对路径（0.1.37.2 重做）：先在目录表顶层按
+            # realPath/名称锚定真实落点再逐段解析。此前直接「根 id +
+            # 原样路径」交引擎，而引擎只认 parent_folder_id 会静默下到
+            # 根目录——用户实测保存目录整个被无视的原因。
+            try:
+                tops = self._folders(space, "", deadline=deadline)
+            except BackendError:
+                # 目录表彻底不可用（0.1.32 反查兜底场景）：可达性无从判断，
+                # 保留 0.1.27 语义——根 id + 原样路径让引擎尽力落盘，
+                # 任务至少能开始下载。
+                _dbg(f"根外路径锚定跳过（目录表不可用）: {nd[:60]}")
+                return root_id, dest
+            anchor = self._anchor_abs(tops, nd)
+            if anchor is None:
+                if any(_folder_path(f) for f in tops):
+                    # 可达性已判定（目录项带路径信息但无一命中）：
+                    # 显式报错——静默下到根目录就是本次要修的 bug。
+                    names = "、".join(
+                        (f.get("name") or "").strip()
+                        for f in tops if (f.get("name") or "").strip())
+                    raise BackendError(
+                        f"保存目录 {dest} 不在引擎可达的下载目录树内"
+                        f"（下载根 {root_path or '未知'}，顶层目录 "
+                        f"{names or '无'}），已停止派发以免文件下错位置。"
+                        "可改用「选择目录」的设备目录树、或填下载根下的"
+                        "相对路径；确需该目录请先在迅雷面板把它加入下载"
+                        "目录（Docker 引擎需把该路径挂载进容器）后重试。")
+                # 目录项无任何路径信息（极简形状等）：无从判定可达性，
+                # 保留 0.1.27 语义降级（根 id + 原样路径尽力落盘）。
+                _dbg(f"根外路径锚定跳过（目录项无路径信息）: {nd[:60]}")
+                return root_id, dest
+            pid, ppath, rel = anchor
         else:
             rel = nd.lstrip("/")                  # 相对路径
+            pid, ppath = root_id, root_path
 
-        target = _norm_dir((root_path or "") + rel)
-        pid, ppath = root_id, root_path
+        target = _norm_dir((ppath or "") + rel)
         try:
             for seg in [s for s in rel.split("/") if s]:
                 child = None
@@ -499,8 +561,10 @@ class DriveCore:
                deadline: float | None = None) -> dict:
         """只读浏览下载目录树（0.1.38 目录选择器数据源）。
 
-        path 为下载根下的相对路径（或根下的绝对路径），空 = 下载根本身。
-        返回 {root_id, root_path, root, path, parent, crumbs, entries}；
+        path 为下载根下的相对路径（或根下的绝对路径），空 = 下载根本身；
+        根外绝对路径按 _anchor_abs 锚定到真实落点后浏览（与派发同一套
+        落点规则，选择器回填的路径派发时能解析到同一处）。
+        返回 {root_id, root, path, entries}；
         entries 只含子目录，path 值可直接回填给 create_task 的 directory。
 
         **只读不建目录**：路径缺级直接报「目录不存在」，由用户挑已存在的
@@ -508,14 +572,28 @@ class DriveCore:
         dl = deadline if deadline is not None else time.monotonic() + RESOLVE_BUDGET
         root_id, root_path = self._root_folder(space, dl)
         nd = _norm_dir((path or "").strip())
-        # 归一到「根下相对段」：根下绝对路径去根前缀，其余去首尾斜杠
+        # 归一到「走树起点 + 相对段」：根下绝对路径去根前缀；根外绝对路径
+        # 与派发同一套 _anchor_abs 锚定（只读），其余按根下相对段处理
+        base = root_path or "/"
+        pid, ppath = root_id, root_path
         if root_path and nd == root_path:
             rel = ""
         elif root_path and nd.startswith(root_path):
             rel = nd[len(root_path):]
+        elif (path or "").strip().startswith("/"):
+            anchor = None
+            try:
+                anchor = self._anchor_abs(
+                    self._folders(space, "", deadline=dl), nd)
+            except BackendError:
+                anchor = None         # 目录表不可用 → 沿用根下相对解释
+            if anchor:
+                pid, ppath, rel = anchor
+                base = ppath
+            else:
+                rel = nd.lstrip("/")
         else:
             rel = nd.lstrip("/")
-        pid, ppath = root_id, root_path
         for seg in [s for s in rel.split("/") if s]:
             child = None
             for f in self._folders(space, pid, deadline=dl):
@@ -535,7 +613,7 @@ class DriveCore:
             entries.append({"id": str(f.get("id")), "name": name,
                             "path": ppath + name + "/"})
         entries.sort(key=lambda e: e["name"])
-        return {"root_id": root_id, "root": root_path or "/",
+        return {"root_id": root_id, "root": base or "/",
                 "path": ppath, "entries": entries}
 
     # ------------------------------------------------------------ 建任务
@@ -548,7 +626,8 @@ class DriveCore:
         这是任务真正开始下载的必要字段（缺省任务永远停在排队中）。
 
         解析是阶梯式尽力而为（0.1.28）：完整解析 → 子目录失败降级用根 id +
-        目标路径 → 根外绝对路径保留根 id + 原样路径。
+        目标路径 → 根外绝对路径锚定目录表落点解析（0.1.37.2），锚不到且
+        可达性可判定时显式报错，无从判定才根 id + 原样路径。
 
         on_unresolvable（0.1.29）：目录解析彻底失败（目录表查询全挂/空表）时——
         "raise"（默认，云端）：显式报错，云端 id 空的任务永不启动，静默建
