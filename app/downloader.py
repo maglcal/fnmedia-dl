@@ -98,6 +98,9 @@ class DownloadManager:
         pool = self.backends()
         order = self._order(backend, pool)
         if not order:
+            if backend and backend != "auto" and backend in self._disabled():
+                return {"ok": False, "url": url,
+                        "error": "该下载通道已隐藏（在「通道设置」里可重新启用）"}
             return {"ok": False, "url": url, "error": "没有可用的下载通道"}
         # 派发前的下载历史（不含本次新建记录）：命中时结果带重复提示
         prior = self.history_check(url)
@@ -138,12 +141,18 @@ class DownloadManager:
         return {"ok": False, "url": url,
                 "error": "；".join(errors) or "全部通道派发失败"}
 
+    def _disabled(self) -> set[str]:
+        """用户在通道设置里隐藏的下载通道 key 集合（隐藏≠删除，可随时恢复）。"""
+        return set(self.cfg.get("disabled_backends") or [])
+
     def _order(self, backend: str, pool: dict[str, Backend]) -> list[str]:
+        disabled = self._disabled()
         if backend and backend != "auto":
-            return [backend] if backend in pool else []
-        order = [b for b in self.cfg.get("engine_order", []) if b in pool]
-        for b in pool:                       # 兜底补全未配置顺序
-            if b not in order:
+            return [backend] if backend in pool and backend not in disabled else []
+        order = [b for b in self.cfg.get("engine_order", [])
+                 if b in pool and b not in disabled]
+        for b in pool:                       # 兜底补全未配置顺序（跳过已隐藏）
+            if b not in order and b not in disabled:
                 order.append(b)
         return order
 

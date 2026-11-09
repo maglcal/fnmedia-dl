@@ -87,7 +87,9 @@ async function loadChips() {
     const data = await API.get("/api/backends");
     const box = $("#backendChips");
     box.innerHTML = "";
+    const hidden = new Set();
     for (const [key, st] of Object.entries(data)) {
+      if (st.disabled) { hidden.add(key); continue; }   // 隐藏的通道不上状态条
       const div = document.createElement("div");
       const cls = !st.configured ? "idle" : st.reachable ? "ok" : "bad";
       div.className = `chip ${cls}`;
@@ -95,6 +97,9 @@ async function loadChips() {
       div.textContent = st.label || key;
       box.appendChild(div);
     }
+    // 服务端是隐藏状态的真源：同步本地并刷新「下载通道」下拉
+    currentHidden = hidden;
+    syncBackendSelect();
     // 引擎今日配额行（通道设置页「迅雷下载引擎」卡）
     const q = data.thunder_engine && data.thunder_engine.quota;
     const qEl = $("#teQuota");
@@ -318,36 +323,114 @@ function scheduleAutoRefresh() {
   }, 5000);
 }
 
-/* ---------------- 设置 ---------------- */
+/* ---------------- 设置：通道管理（显示/隐藏 + 优先级） ----------------
+   取消勾选「显示」= 隐藏该通道（下拉/状态栏不再出现，auto 派发跳过），
+   不是删除配置，随时勾回即恢复。改动即时保存（PUT 只带 engine_order 与
+   disabled_backends 两个键，config 分段合并不动其它配置），无需点「保存全部设置」。 */
 const ORDER_KEYS = ["thunder_cloud", "thunder_engine", "aria2"];
 const ORDER_LABELS = {
   thunder_cloud: "迅雷远程通道",
   thunder_engine: "迅雷下载引擎",
   aria2: "aria2",
 };
+const SELECT_LABELS = {
+  thunder_cloud: "迅雷远程通道（P2SP 加速）",
+  thunder_engine: "迅雷下载引擎（本地直连）",
+  aria2: "aria2",
+};
 let currentOrder = [...ORDER_KEYS];
+let currentHidden = new Set();   // 隐藏的通道 key（disabled_backends）
+
+/* 全量 key（按优先级排序，兜底补上配置里缺的通道，与后端 _order 一致） */
+function allKeysOrdered() {
+  return [...currentOrder, ...ORDER_KEYS.filter((k) => !currentOrder.includes(k))];
+}
+
+/* 「下载通道」下拉只保留未隐藏通道；自动项文案跟着实际降级顺序走 */
+function syncBackendSelect() {
+  const sel = $("#backendSelect");
+  if (!sel) return;
+  const prev = sel.value || "auto";
+  const enabled = allKeysOrdered().filter((k) => !currentHidden.has(k) && SELECT_LABELS[k]);
+  sel.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "auto";
+  auto.textContent = enabled.length
+    ? `自动（${enabled.map((k) => ORDER_LABELS[k] || k).join(" → ")}）`
+    : "自动";
+  sel.appendChild(auto);
+  for (const k of enabled) {
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = SELECT_LABELS[k];
+    sel.appendChild(o);
+  }
+  sel.value = (prev === "auto" || enabled.includes(prev)) ? prev : "auto";
+}
+
+/* 只提交通道管理两个键，其余配置原样保留 */
+async function persistChannelCfg() {
+  await API.send("/api/config", "PUT", {
+    config: { engine_order: currentOrder, disabled_backends: [...currentHidden] },
+  });
+}
 
 function renderOrder() {
   const box = $("#orderBox");
   box.innerHTML = "";
-  currentOrder.forEach((key, i) => {
+  allKeysOrdered().forEach((key, i, all) => {
+    const off = currentHidden.has(key);
     const div = document.createElement("div");
-    div.className = "order-item";
+    div.className = "order-item" + (off ? " off" : "");
     div.innerHTML = `
       <span class="idx">${i + 1}</span>
-      <span class="name">${ORDER_LABELS[key] || key}</span>
+      <span class="name">${ORDER_LABELS[key] || key}${off ? ' <span class="tag">已隐藏</span>' : ""}</span>
+      <label class="check"><input type="checkbox" data-vis="${key}" ${off ? "" : "checked"}><span>显示</span></label>
       <button class="btn ghost" data-move="up" data-key="${key}" ${i === 0 ? "disabled" : ""}>上移</button>
-      <button class="btn ghost" data-move="down" data-key="${key}" ${i === currentOrder.length - 1 ? "disabled" : ""}>下移</button>
+      <button class="btn ghost" data-move="down" data-key="${key}" ${i === all.length - 1 ? "disabled" : ""}>下移</button>
     `;
     box.appendChild(div);
   });
+  box.querySelectorAll("input[data-vis]").forEach((cb) => {
+    cb.addEventListener("change", async () => {
+      const key = cb.dataset.vis;
+      const label = ORDER_LABELS[key] || key;
+      if (cb.checked) {
+        currentHidden.delete(key);
+      } else {
+        const visible = allKeysOrdered().filter((k) => !currentHidden.has(k)).length;
+        if (visible <= 1) {
+          cb.checked = true;
+          return toast("至少保留一个下载通道");
+        }
+        currentHidden.add(key);
+      }
+      renderOrder();
+      syncBackendSelect();
+      try {
+        await persistChannelCfg();
+        toast(cb.checked ? `✓ 已启用「${label}」` : `✓ 已隐藏「${label}」`);
+        loadChips();   // 顶部状态条同步（隐藏项随之消失）
+      } catch (e) {
+        toast("保存失败：" + e.message);
+        loadConfig();  // 回滚到服务端状态
+      }
+    });
+  });
   box.querySelectorAll("button[data-move]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const idx = currentOrder.indexOf(btn.dataset.key);
       const to = btn.dataset.move === "up" ? idx - 1 : idx + 1;
       if (to < 0 || to >= currentOrder.length) return;
       [currentOrder[idx], currentOrder[to]] = [currentOrder[to], currentOrder[idx]];
       renderOrder();
+      syncBackendSelect();
+      try {
+        await persistChannelCfg();
+      } catch (e) {
+        toast("保存失败：" + e.message);
+        loadConfig();
+      }
     });
   });
 }
@@ -356,7 +439,9 @@ async function loadConfig() {
   try {
     const cfg = await API.get("/api/config");
     currentOrder = (cfg.engine_order || ORDER_KEYS).slice();
+    currentHidden = new Set(cfg.disabled_backends || []);
     renderOrder();
+    syncBackendSelect();
     $("#defaultDir").value = cfg.default_dir || "";
     const tc = cfg.thunder_cloud || {};
     $("#tcLogin").value = tc.login_name || "";
@@ -427,9 +512,156 @@ on("#btnCheckDir", "click", async () => {
   }
 });
 
+/* ---------------- 目录选择器（弹窗浏览，设备/本机双来源） ----------------
+   与手动输入并存：只把选定路径回填到目标输入框，不自动保存。
+   设备来源 = 迅雷远程设备的下载目录树（只读浏览，不建目录）；
+   设备 API 不可达时给明确提示并引导切「本机目录」或手动填写。 */
+const DP = {
+  target: null, source: "device",
+  root: "", path: "", crumbs: [], entries: [],
+  loading: false, retried: false,
+};
+
+function dpStatus(text, cls) {
+  const el = $("#dpStatus");
+  if (!el) return;
+  el.hidden = !text;
+  el.className = "dir-status" + (cls ? " " + cls : "");
+  el.textContent = text || "";
+}
+
+function dpRender() {
+  $$("#dirPicker .dp-src .btn").forEach((b) =>
+    b.classList.toggle("active", b.dataset.dpsrc === DP.source));
+  const cb = $("#dpCrumbs");
+  if (cb) {
+    cb.innerHTML = "";
+    if (!DP.crumbs.length) {
+      cb.innerHTML = `<span class="sep">${DP.source === "device"
+        ? "远程设备下载目录" : "本机授权目录"}</span>`;
+    }
+    DP.crumbs.forEach((c, i) => {
+      if (i) {
+        const s = document.createElement("span");
+        s.className = "sep";
+        s.textContent = "›";
+        cb.appendChild(s);
+      }
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = c.name;
+      b.addEventListener("click", () => { DP.path = c.path; DP.retried = true; dpLoad(); });
+      cb.appendChild(b);
+    });
+  }
+  const ul = $("#dpList");
+  if (ul) {
+    ul.innerHTML = "";
+    if (!DP.entries.length) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.textContent = "（此目录下没有子目录，可直接「选用当前目录」）";
+      ul.appendChild(li);
+    }
+    for (const e of DP.entries) {
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="ico">📁</span><span class="grow">${esc(e.name)}</span>`;
+      li.addEventListener("click", () => { DP.path = e.path; DP.retried = true; dpLoad(); });
+      ul.appendChild(li);
+    }
+  }
+  const use = $("#dpUse");
+  if (use) use.disabled = !DP.path || DP.loading;
+}
+
+async function dpLoad() {
+  DP.loading = true;
+  dpStatus("读取目录中…", "");
+  dpRender();
+  try {
+    const d = await API.get("/api/fs/browse?source=" + DP.source +
+      "&path=" + encodeURIComponent(DP.path || ""));
+    DP.loading = false;
+    DP.root = d.root || "";
+    DP.path = d.path || "";
+    DP.crumbs = d.crumbs || [];
+    DP.entries = d.entries || [];
+    dpStatus(DP.source === "device"
+      ? "浏览为只读，不会自动建目录；点目录进入，点面包屑返回上级。"
+      : "只显示应用共享目录与已授权目录之内的子目录。", "");
+    dpRender();
+  } catch (e) {
+    DP.loading = false;
+    // 打开时带入的旧路径可能已不存在/不可解析 → 回退到根再试一次
+    if (DP.path && !DP.retried) {
+      DP.retried = true;
+      DP.path = "";
+      return dpLoad();
+    }
+    DP.entries = [];
+    DP.crumbs = [];
+    dpRender();
+    dpStatus(DP.source === "device"
+      ? "✗ 设备目录读取失败：" + e.message +
+        "。可切到「本机目录」继续，或关闭后手动填写路径。"
+      : "✗ " + e.message, "bad");
+  }
+}
+
+function openDirPicker(inputId, source) {
+  const el = $(`#${inputId}`);
+  if (!el) return;
+  DP.target = el;
+  DP.source = source || "device";
+  DP.path = (el.value || "").trim();
+  DP.retried = false;
+  const box = $("#dirPicker");
+  if (box) box.hidden = false;
+  dpLoad();
+}
+
+function dpClose() {
+  const box = $("#dirPicker");
+  if (box) box.hidden = true;
+  DP.target = null;
+}
+
+on("#dpUse", "click", () => {
+  if (!DP.target || !DP.path) return;
+  DP.target.value = DP.path;
+  const id = DP.target.id;
+  dpClose();
+  toast(id === "dirInput"
+    ? "✓ 已填入保存目录，可直接点「开始下载」"
+    : "✓ 已填入目录，记得点「保存全部设置」");
+});
+on("#dpCancel", "click", dpClose);
+on("#dpClose", "click", dpClose);
+on("#dirPicker", "click", (e) => {
+  if (e.target && e.target.id === "dirPicker") dpClose();
+});
+$$("#dirPicker .dp-src .btn").forEach((b) => {
+  b.addEventListener("click", () => {
+    DP.source = b.dataset.dpsrc;
+    DP.path = "";
+    DP.retried = true;
+    dpLoad();
+  });
+});
+
+/* 「选择目录」按钮：目标输入框 id 与默认来源由 data-pick / data-src 指定 */
+$$("button.dir-pick").forEach((btn) => {
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();       // 按钮在 <label> 内，阻断 label 的点击转发
+    e.stopPropagation();
+    openDirPicker(btn.dataset.pick, btn.dataset.src || "device");
+  });
+});
+
 async function saveConfig() {
   const cfg = {
     engine_order: currentOrder,
+    disabled_backends: [...currentHidden],
     default_dir: $("#defaultDir").value.trim(),
     thunder_cloud: {
       login_name: $("#tcLogin").value.trim(),

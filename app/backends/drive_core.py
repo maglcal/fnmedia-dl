@@ -392,9 +392,15 @@ class DriveCore:
             best = best or (pid, "")
         return best
 
-    def _resolve_uncached(self, space: str, directory: str,
-                          deadline: float) -> tuple[str, str]:
-        folders: list[dict] | None
+    def _root_folder(self, space: str, deadline: float) -> tuple[str, str]:
+        """只读识别下载根目录 → (root_id, root_path)。识别阶梯：
+          1. /device/config download_paths[0] 与目录表 realPath/aliasPath 匹配
+          2. 顶层只有一个目录 → 即根
+          3. 名称/路径命中下载根常见名（downloads/下载/…）
+          4. 启发式兜底：首个顶层目录的 parent_id 或 id
+        目录表彻底不可用（设备插件超时 error_code=2 等）时历史任务反查兜底。
+        **不创建任何目录**——建目录只发生在 _resolve_uncached 的子目录解析里，
+        因此本方法可安全复用于目录浏览选择器。"""
         try:
             folders = self._folders(space, "", deadline=deadline)
             if not folders:
@@ -402,8 +408,8 @@ class DriveCore:
                     "引擎目录表为空，无法解析下载根目录"
                     "（parent_folder_id 缺失时任务不会开始下载）")
         except BackendError as exc:
-            # 0.1.32：目录表彻底不可用（设备插件超时 error_code=2 等）时先
-            # 历史任务反查再放弃——反查到的 (id, path) 作为根走下方降级阶梯。
+            # 0.1.32：目录表彻底不可用时先历史任务反查再放弃——反查到的
+            # (id, path) 即根（设备插件超时时这是拿到真实根 id 的唯一通路）。
             harvested = self._harvest_root(space)
             if harvested is None:
                 # 0.1.33：反查无米（设备任务 0 条/无 params）时给可操作指引
@@ -416,38 +422,42 @@ class DriveCore:
                     f"远程插件是否在运行）") from exc
             _dbg(f"目录表不可用，历史任务反查兜底: space={space[:12]} "
                  f"→ id={harvested[0][:16]} path={harvested[1][:32]}")
-            root_id, root_path = harvested
-            folders = None
-        if folders is not None:
-            hint = ""
-            for p in (self._device_config(space, deadline=deadline)
-                      .get("download_paths") or []):
-                if str(p).strip():
-                    hint = _norm_dir(str(p))
-                    break
+            return harvested
 
-            root_id, root_path = "", ""
-            if hint:                              # 1) 配置提示精确匹配
-                for f in folders:
-                    if _folder_path(f) == hint:
-                        root_id, root_path = str(f.get("id")), hint
-                        break
-            if not root_id and len(folders) == 1:  # 2) 唯一顶层目录
-                root_id = str(folders[0].get("id"))
-                root_path = _folder_path(folders[0]) or hint
-            if not root_id:                       # 3) 常见下载根名
-                for f in folders:
-                    name = (f.get("name") or "").strip().lower()
-                    if _folder_path(f) in ("/downloads/", "/") or name in DOWNLOAD_ROOT_NAMES:
-                        root_id = str(f.get("id"))
-                        root_path = _folder_path(f) or hint
-                        break
-            if not root_id:                       # 4) 启发式兜底
-                pid = str(folders[0].get("parent_id") or "").strip()
-                root_id = pid or str(folders[0].get("id"))
-                root_path = hint
-            if not root_id:
-                raise BackendError("无法识别引擎下载根目录（parent_folder_id 解析失败）")
+        hint = ""
+        for p in (self._device_config(space, deadline=deadline)
+                  .get("download_paths") or []):
+            if str(p).strip():
+                hint = _norm_dir(str(p))
+                break
+
+        root_id, root_path = "", ""
+        if hint:                              # 1) 配置提示精确匹配
+            for f in folders:
+                if _folder_path(f) == hint:
+                    root_id, root_path = str(f.get("id")), hint
+                    break
+        if not root_id and len(folders) == 1:  # 2) 唯一顶层目录
+            root_id = str(folders[0].get("id"))
+            root_path = _folder_path(folders[0]) or hint
+        if not root_id:                       # 3) 常见下载根名
+            for f in folders:
+                name = (f.get("name") or "").strip().lower()
+                if _folder_path(f) in ("/downloads/", "/") or name in DOWNLOAD_ROOT_NAMES:
+                    root_id = str(f.get("id"))
+                    root_path = _folder_path(f) or hint
+                    break
+        if not root_id:                       # 4) 启发式兜底
+            pid = str(folders[0].get("parent_id") or "").strip()
+            root_id = pid or str(folders[0].get("id"))
+            root_path = hint
+        if not root_id:
+            raise BackendError("无法识别引擎下载根目录（parent_folder_id 解析失败）")
+        return root_id, root_path
+
+    def _resolve_uncached(self, space: str, directory: str,
+                          deadline: float) -> tuple[str, str]:
+        root_id, root_path = self._root_folder(space, deadline)
 
         dest = (directory or "").strip()
         if not dest:
@@ -484,6 +494,49 @@ class DriveCore:
             _dbg(f"子目录解析降级: space={space} 目标={target} → 用 {pid}")
             return pid, target
         return pid, ppath
+
+    def browse(self, space: str, path: str = "",
+               deadline: float | None = None) -> dict:
+        """只读浏览下载目录树（0.1.38 目录选择器数据源）。
+
+        path 为下载根下的相对路径（或根下的绝对路径），空 = 下载根本身。
+        返回 {root_id, root_path, root, path, parent, crumbs, entries}；
+        entries 只含子目录，path 值可直接回填给 create_task 的 directory。
+
+        **只读不建目录**：路径缺级直接报「目录不存在」，由用户挑已存在的
+        目录——选择器语义是「浏览并选定」，不该有隐藏的写副作用。"""
+        dl = deadline if deadline is not None else time.monotonic() + RESOLVE_BUDGET
+        root_id, root_path = self._root_folder(space, dl)
+        nd = _norm_dir((path or "").strip())
+        # 归一到「根下相对段」：根下绝对路径去根前缀，其余去首尾斜杠
+        if root_path and nd == root_path:
+            rel = ""
+        elif root_path and nd.startswith(root_path):
+            rel = nd[len(root_path):]
+        else:
+            rel = nd.lstrip("/")
+        pid, ppath = root_id, root_path
+        for seg in [s for s in rel.split("/") if s]:
+            child = None
+            for f in self._folders(space, pid, deadline=dl):
+                if ((f.get("name") or "").strip() == seg
+                        or _folder_path(f) == ppath + seg + "/"):
+                    child = f
+                    break
+            if child is None:
+                raise BackendError(f"目录不存在：{seg}（浏览为只读，不会自动创建）")
+            pid = str(child.get("id"))
+            ppath = ppath + seg + "/"
+        entries = []
+        for f in self._folders(space, pid, deadline=dl):
+            name = (f.get("name") or "").strip()
+            if not name:
+                continue
+            entries.append({"id": str(f.get("id")), "name": name,
+                            "path": ppath + name + "/"})
+        entries.sort(key=lambda e: e["name"])
+        return {"root_id": root_id, "root": root_path or "/",
+                "path": ppath, "entries": entries}
 
     # ------------------------------------------------------------ 建任务
 

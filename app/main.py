@@ -200,9 +200,10 @@ class BackendTestReq(BaseModel):
 @app.get("/api/backends")
 def backends_status():
     mgr = _manager()
+    disabled = set(mgr.cfg.get("disabled_backends") or [])
     out = {}
     for key, impl in mgr.backends().items():
-        out[key] = {"label": impl.label, **impl.status()}
+        out[key] = {"label": impl.label, "disabled": key in disabled, **impl.status()}
     if "thunder_engine" in out:
         # 今日配额用量（非会员每日创建次数有限），UI 引擎卡展示
         out["thunder_engine"]["quota"] = mgr.quota.snapshot()
@@ -399,6 +400,91 @@ def fs_check(path: str):
         "share_dir": cfgmod.share_dir(),
         "hint": "" if (exists and writable) else AUTH_HINT,
     }
+
+
+# ------------------------------------------------------------ 目录浏览（下载目录选择器）
+
+def _within(child: str, parent: str) -> bool:
+    """child 是否位于 parent 之内（含 parent 自身）。realpath 归一后再比，
+    防止符号链接把浏览引出授权目录之外。"""
+    c = os.path.normpath(os.path.realpath(child))
+    p = os.path.normpath(os.path.realpath(parent))
+    return c == p or c.startswith(p + os.sep)
+
+
+def _crumbs(root: str, path: str) -> list[dict]:
+    """面包屑：根 → … → 当前目录（首项是根本身）。"""
+    out = [{"name": root.rstrip("/") or root, "path": root}]
+    rel = path[len(root):] if root and path.startswith(root) else path
+    acc = root.rstrip("/")
+    for seg in [s for s in rel.replace("\\", "/").split("/") if s]:
+        acc = f"{acc}/{seg}"
+        out.append({"name": seg, "path": acc})
+    return out
+
+
+def _browse_payload(source: str, root: str, path: str, entries: list[dict],
+                    roots: list[str] | None = None, **extra) -> dict:
+    crumbs = _crumbs(root, path) if root else [{"name": "本机授权目录", "path": ""}]
+    return {"source": source, "root": root, "path": path,
+            "parent": crumbs[-2]["path"] if len(crumbs) > 1 else "",
+            "roots": roots or [], "crumbs": crumbs, "entries": entries,
+            "error": "", **extra}
+
+
+def _browse_local(path: str) -> dict:
+    """本机目录浏览：仅限 应用共享目录 + 已授权目录 之内，越界一律拒绝。"""
+    roots: list[str] = []
+    for p in [cfgmod.share_dir(), *cfgmod.accessible_paths()]:
+        p = (p or "").strip()
+        if p and p not in roots:
+            roots.append(p)
+    if not path.strip():
+        return _browse_payload("local", "", "",
+                               [{"name": r, "path": r} for r in roots], roots)
+    target = os.path.abspath(os.path.expanduser(path.strip()))
+    root = next((r for r in roots if _within(target, r)), "")
+    if not root:
+        raise HTTPException(403, "该目录不在本应用授权范围内。" + AUTH_HINT)
+    if not os.path.isdir(target):
+        raise HTTPException(404, f"目录不存在：{path}")
+    entries: list[dict] = []
+    try:
+        for e in sorted(os.scandir(target), key=lambda x: x.name.lower()):
+            if not e.is_dir():
+                continue
+            if not _within(e.path, root):
+                continue      # 软链/挂载点指向授权范围外的不展示
+            entries.append({"name": e.name, "path": e.path})
+    except PermissionError as exc:
+        raise HTTPException(403, f"无权读取该目录。{AUTH_HINT}") from exc
+    return _browse_payload("local", root, target, entries, roots)
+
+
+def _browse_device(path: str) -> dict:
+    """迅雷远程设备下载目录树浏览（只读；设备 API 不可用时前端降级手动输入）。"""
+    impl = _manager().backends().get("thunder_cloud")
+    if impl is None:
+        raise HTTPException(404, "迅雷远程通道不可用")
+    try:
+        d = impl.browse_dirs(path)
+    except BackendError as exc:
+        raise HTTPException(502, f"远程设备目录读取失败：{exc}") from exc
+    return _browse_payload("device", d.get("root") or "/", d.get("path") or "",
+                           d.get("entries") or [],
+                           root_id=d.get("root_id", ""))
+
+
+@app.get("/api/fs/browse")
+def fs_browse(source: str = "local", path: str = ""):
+    """下载目录选择器数据源。**只读**：不建目录、不改配置。
+    source=local  本机目录（限应用共享目录 + 已授权目录）
+    source=device 远程设备下载目录树（path 为下载根下的相对路径）"""
+    if source == "local":
+        return _browse_local(path)
+    if source == "device":
+        return _browse_device(path)
+    raise HTTPException(400, f"未知目录来源：{source}")
 
 
 # ------------------------------------------------------------ 解析/派发

@@ -17,6 +17,7 @@ DEFAULT_CONFIG: dict = {
     "engine_order": ["thunder_cloud", "thunder_engine", "aria2"],
     "default_backend": "auto",          # auto | thunder_cloud | thunder_engine | aria2
     "default_dir": "",                  # 全局默认保存目录（空 = 各引擎默认）
+    "disabled_backends": [],            # 隐藏的下载通道 key（thunder_cloud/thunder_engine/aria2）；空 = 全部显示
     "aria2": {
         "rpc_url": "http://127.0.0.1:6800/jsonrpc",
         "secret": "",

@@ -85,7 +85,11 @@
           </select>
         </label>
         <label>保存目录<span class="opt">留空用各引擎默认</span>
-          <input id="dirInput" type="text" placeholder="/vol1/downloads">
+          <span class="dir-pick-row">
+            <input id="dirInput" type="text" placeholder="/vol1/downloads">
+            <button type="button" class="btn ghost dir-pick"
+                    data-pick="dirInput" data-src="device">📁 选择目录</button>
+          </span>
         </label>
       </div>
     </div>
@@ -152,12 +156,19 @@
   <section id="tab-settings" class="panel">
     <div class="card">
       <div class="card-head">
-        <h2>通道优先级</h2>
-        <span class="hint">auto 派发的降级顺序</span>
+        <h2>通道管理</h2>
+        <span class="hint">只用迅雷就把其余通道取消勾选隐藏，随时可恢复</span>
       </div>
       <div id="orderBox" class="order-box"></div>
+      <p class="hint">取消勾选「显示」即隐藏该通道：不出现在「下载通道」下拉与顶部状态栏，
+        自动派发也会跳过它（配置与已建任务不受影响，重新勾选即恢复）。
+        上移 / 下移调整自动派发的降级顺序。改动即时生效，无需再点「保存全部设置」。</p>
       <label class="block">默认保存目录
-        <input id="defaultDir" type="text" placeholder="留空则用各引擎默认">
+        <span class="dir-pick-row">
+          <input id="defaultDir" type="text" placeholder="留空则用各引擎默认">
+          <button type="button" class="btn ghost dir-pick"
+                  data-pick="defaultDir" data-src="device">📁 选择目录</button>
+        </span>
       </label>
       <div class="row-inline dir-tools">
         <button id="btnFillShare" class="btn ghost">填入应用共享目录</button>
@@ -192,7 +203,11 @@
           <input id="tcTarget" type="text">
         </label>
         <label>保存目录
-          <input id="tcDir" type="text">
+          <span class="dir-pick-row">
+            <input id="tcDir" type="text">
+            <button type="button" class="btn ghost dir-pick"
+                    data-pick="tcDir" data-src="device">📁 选择</button>
+          </span>
         </label>
       </div>
       <div id="tcReviewBox" class="auth-box" hidden>
@@ -285,7 +300,11 @@
           <input id="teUrl" type="text" placeholder="http://127.0.0.1:2345">
         </label>
         <label>保存目录
-          <input id="teDir" type="text">
+          <span class="dir-pick-row">
+            <input id="teDir" type="text">
+            <button type="button" class="btn ghost dir-pick"
+                    data-pick="teDir" data-src="local">📁 选择</button>
+          </span>
         </label>
       </div>
       <div class="actions">
@@ -307,7 +326,11 @@
           <input id="a2Secret" type="text" autocomplete="off">
         </label>
         <label>保存目录
-          <input id="a2Dir" type="text">
+          <span class="dir-pick-row">
+            <input id="a2Dir" type="text">
+            <button type="button" class="btn ghost dir-pick"
+                    data-pick="a2Dir" data-src="local">📁 选择</button>
+          </span>
         </label>
       </div>
       <div class="actions">
@@ -358,6 +381,26 @@
     </div>
   </section>
 </main>
+
+<div id="dirPicker" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-label="选择保存目录">
+    <div class="modal-head">
+      <h3>📁 选择保存目录</h3>
+      <button type="button" id="dpClose" class="btn ghost">关闭</button>
+    </div>
+    <div class="dp-src">
+      <button type="button" class="btn ghost" data-dpsrc="device">设备目录（迅雷远程下载目录）</button>
+      <button type="button" class="btn ghost" data-dpsrc="local">本机目录（已授权）</button>
+    </div>
+    <div id="dpCrumbs" class="dp-crumbs"></div>
+    <ul id="dpList" class="dp-list"></ul>
+    <div id="dpStatus" class="dir-status" hidden></div>
+    <div class="actions">
+      <button type="button" id="dpUse" class="btn primary">选用当前目录</button>
+      <button type="button" id="dpCancel" class="btn ghost">取消（保留手动输入）</button>
+    </div>
+  </div>
+</div>
 
 <div id="toast" class="toast" hidden></div>
 <script src="static/app.js?v=@VERSION@"></script>

@@ -1018,6 +1018,12 @@ class ThunderCloud(Backend):
         return self.core.create_task(url, resource, target,
                                      directory=directory or (self.conf.get("dir") or ""))
 
+    def browse_dirs(self, path: str = "") -> dict:
+        """只读浏览远程设备下载目录树（下载目录选择器数据源）。
+        复用 core.browse → _root_folder（不建目录），path 为下载根下相对路径。"""
+        self._require_token()
+        return self.core.browse(self._target_of(), path)
+
     def list_tasks(self) -> list[TaskView]:
         self._require_token()
         target = self._target_of()
