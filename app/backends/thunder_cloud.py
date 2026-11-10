@@ -315,26 +315,39 @@ class _CloudDrive(DriveCore):
 
     def _relay_folder_shapes(self, api: dict, space: str,
                              parent_id: str) -> list[tuple[str, dict]]:
-        """设备 API 目录表参数形状：
-        filters 三条件（trashed/phase/kind）、with_audit=true、order=TYPE_DESC、
-        page_token= 空、with=withCategoryDiskMountPath&withCategoryHistoryDownloadPath
+        """设备 API 目录表参数形状阶梯。
+
+        0.1.38.2 修复「选择迅雷文件夹看不到所有子文件夹」：第一形状改为
+        「目录形状」——kind-only 过滤（**不带** trashed/phase 条件）+ 全
+        扩展参数（带路径信息）。原「完整形状」的 filters 带
+        phase=PHASE_TYPE_COMPLETE + trashed=false，文件夹项缺这些字段时
+        会被服务端一并滤掉；而 _folders 逐形状取**第一个非空结果**即返回，
+        部分滤掉时后面的 kind-only 形状永远轮不到，用户就只能看到部分
+        子文件夹。目录形状拿到的是全集（kind-only 过滤不丢文件夹），
+        非空即完整；空表才降级试完整形状（保留兼容），极简形状兜底防
+        扩展参数被严格校验。
+        with=withCategoryDiskMountPath&withCategoryHistoryDownloadPath
         （注意是 HistoryDownloadPath，扩展引擎形状的 withCategoryDownloadPath
-        不适用于设备 API）。第二形状 kind-only 兜底防扩展参数被严格校验。"""
+        不适用于设备 API）。"""
+        filters_kind = json.dumps({"kind": {"eq": "drive#folder"}},
+                                  separators=(",", ":"))
         filters_full = json.dumps({
             "trashed": {"eq": False},
             "phase": {"eq": "PHASE_TYPE_COMPLETE"},
             "kind": {"eq": "drive#folder"}}, separators=(",", ":"))
-        filters_kind = json.dumps({"kind": {"eq": "drive#folder"}},
-                                  separators=(",", ":"))
         base = self._relay_params(api, space)
-        full = dict(base, parent_id=parent_id or "", limit="200",
-                    with_audit="true", filters=filters_full, page_token="",
-                    order="TYPE_DESC",
-                    **{"with": ["withCategoryDiskMountPath",
-                                "withCategoryHistoryDownloadPath"]})
+        ext = {"limit": "200", "with_audit": "true", "page_token": "",
+               "order": "TYPE_DESC",
+               **{"with": ["withCategoryDiskMountPath",
+                           "withCategoryHistoryDownloadPath"]}}
+        kind_full = dict(base, parent_id=parent_id or "",
+                         filters=filters_kind, **ext)
+        full = dict(base, parent_id=parent_id or "",
+                    filters=filters_full, **ext)
         kind_only = dict(base, parent_id=parent_id or "", limit="200",
                          filters=filters_kind)
-        return [("设备API完整形状", full), ("设备API极简形状", kind_only)]
+        return [("设备API目录形状", kind_full), ("设备API完整形状", full),
+                ("设备API极简形状", kind_only)]
 
     def _folders(self, space: str, parent_id: str = "",
                  deadline: float | None = None) -> list[dict]:

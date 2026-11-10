@@ -38,6 +38,7 @@ import datetime
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -462,6 +463,16 @@ AUTH_HINT = ("到 应用中心 → 飞牛下载助手 → 应用设置 → 授�
              "（fnOS 系统机制）。下载文件由引擎写入，若引擎报目录不可写，"
              "还需在对应引擎（迅雷插件 / aria2）自身的设置里确认该目录可写。")
 
+# 0.1.38.2：授权范围**内**但系统文件权限不足（子目录未继承授权）的指引，
+# 与 AUTH_HINT（授权范围外→去授权）严格区分——此前混用同一提示，
+# 用户以为「子目录未被授予访问权限」，实际是子目录文件权限未继承。
+PERM_HINT = ("该路径已在授权范围内，但其系统文件权限不允许应用用户读取。"
+             "fnOS 的目录授权作用于所选目录本身，其他用户/应用创建的子目录"
+             "若未继承权限（属主不同、755/700 等），应用仍无法读写。"
+             "请在 文件管理器（右键 → 属性 → 权限）或 SSH 中把该子目录"
+             "及其内容的读写权限开放给应用用户（chown/chmod），"
+             "或改在应用共享目录下重建该目录。")
+
 
 @app.get("/api/fs/paths")
 def fs_paths():
@@ -473,11 +484,21 @@ def fs_paths():
 
 @app.get("/api/fs/check")
 def fs_check(path: str):
-    """目录可用性检测：是否存在、本应用是否可写（实际写探针，不靠 os.access）。"""
+    """目录可用性检测：是否存在、本应用是否可写（实际写探针，不靠 os.access）。
+
+    0.1.38.2：区分「目录不存在」与「目录存在但应用用户无权读」（stat 被拒）
+    ——后者按存在+不可写返回并给 PERM_HINT（子目录权限未继承的处置指引），
+    不再误报「目录不存在」。"""
     target = Path(path).expanduser()
-    exists = target.is_dir()
+    exists, denied = False, False
+    try:
+        exists = stat.S_ISDIR(os.stat(target).st_mode)
+    except PermissionError:
+        exists, denied = True, True   # 存在但应用用户 stat 不动（权限不足）
+    except OSError:
+        exists = False
     writable = False
-    if exists:
+    if exists and not denied:
         try:
             fd, tmp = tempfile.mkstemp(prefix=".fndl-check-", dir=str(target))
             os.close(fd)
@@ -485,13 +506,20 @@ def fs_check(path: str):
             writable = True
         except OSError:
             writable = False
+    if denied:
+        hint = PERM_HINT
+    elif exists and writable:
+        hint = ""
+    else:
+        hint = AUTH_HINT
     return {
         "path": path,
         "exists": exists,
         "writable": writable,
         "ok": exists and writable,
+        "denied": denied,
         "share_dir": cfgmod.share_dir(),
-        "hint": "" if (exists and writable) else AUTH_HINT,
+        "hint": hint,
     }
 
 
@@ -539,18 +567,29 @@ def _browse_local(path: str) -> dict:
     root = next((r for r in roots if _within(target, r)), "")
     if not root:
         raise HTTPException(403, "该目录不在本应用授权范围内。" + AUTH_HINT)
-    if not os.path.isdir(target):
+    # 0.1.38.2：stat 区分「不存在」与「存在但无权读」——无权子目录此前
+    # 被 os.path.isdir 吞成 404「目录不存在」，用户误以为子目录没被授权。
+    try:
+        is_dir = stat.S_ISDIR(os.stat(target).st_mode)
+    except PermissionError as exc:
+        raise HTTPException(403, f"无权访问该目录。{PERM_HINT}") from exc
+    except OSError as exc:
+        raise HTTPException(404, f"目录不存在：{path}") from exc
+    if not is_dir:
         raise HTTPException(404, f"目录不存在：{path}")
     entries: list[dict] = []
     try:
         for e in sorted(os.scandir(target), key=lambda x: x.name.lower()):
             if not e.is_dir():
                 continue
-            if not _within(e.path, root):
-                continue      # 软链/挂载点指向授权范围外的不展示
+            # 全 roots 并集判定（0.1.38.2）：软链/挂载点指向**任一**授权
+            # 目录之内都展示；此前只对当前 root 判定，指向其他授权根的
+            # 子目录被隐藏，表现为「子文件夹不显示」。范围外的仍不展示。
+            if not any(_within(e.path, r) for r in roots):
+                continue
             entries.append({"name": e.name, "path": e.path})
     except PermissionError as exc:
-        raise HTTPException(403, f"无权读取该目录。{AUTH_HINT}") from exc
+        raise HTTPException(403, f"无权读取该目录。{PERM_HINT}") from exc
     return _browse_payload("local", root, target, entries, roots)
 
 

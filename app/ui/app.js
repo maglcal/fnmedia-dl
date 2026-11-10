@@ -515,11 +515,15 @@ on("#btnCheckDir", "click", async () => {
 /* ---------------- 目录选择器（弹窗浏览，设备/本机双来源） ----------------
    与手动输入并存：只把选定路径回填到目标输入框，不自动保存。
    设备来源 = 迅雷远程设备的下载目录树（只读浏览，不建目录）；
-   设备 API 不可达时**自动降级**到「本机目录（已授权）」，不必手动切。 */
+   打开选择器的初次加载设备 API 不可达时**自动降级**到「本机目录
+   （已授权）」；导航中途失败只显示真实原因+可重试，不静默跳走
+   （0.1.38.2：点子文件夹失败被跳到本机目录，曾被误以为子文件夹
+   「无法调用」）。 */
 const DP = {
   target: null, source: "device",
   root: "", path: "", crumbs: [], entries: [],
-  loading: false, retried: false, fallbacked: false, _notice: "",
+  loading: false, retried: false, fallbacked: false, navigated: false,
+  _notice: "",
 };
 
 function dpStatus(text, cls) {
@@ -528,6 +532,8 @@ function dpStatus(text, cls) {
   el.hidden = !text;
   el.className = "dir-status" + (cls ? " " + cls : "");
   el.textContent = text || "";
+  el.onclick = null;            // 状态文本默认不可点击；错误态单独挂重试
+  el.style.cursor = "";
 }
 
 function dpRender() {
@@ -550,7 +556,9 @@ function dpRender() {
       const b = document.createElement("button");
       b.type = "button";
       b.textContent = c.name;
-      b.addEventListener("click", () => { DP.path = c.path; DP.retried = true; dpLoad(); });
+      b.addEventListener("click", () => {
+        DP.path = c.path; DP.retried = true; DP.navigated = true; dpLoad();
+      });
       cb.appendChild(b);
     });
   }
@@ -566,7 +574,9 @@ function dpRender() {
     for (const e of DP.entries) {
       const li = document.createElement("li");
       li.innerHTML = `<span class="ico">📁</span><span class="grow">${esc(e.name)}</span>`;
-      li.addEventListener("click", () => { DP.path = e.path; DP.retried = true; dpLoad(); });
+      li.addEventListener("click", () => {
+        DP.path = e.path; DP.retried = true; DP.navigated = true; dpLoad();
+      });
       ul.appendChild(li);
     }
   }
@@ -603,9 +613,11 @@ async function dpLoad() {
       DP.path = "";
       return dpLoad();
     }
-    // 设备目录不可用 → 自动降级到「本机目录（已授权）」（0.1.37.3）；
-    // 用户已手动切过来源（fallbacked=true）则不再自动跳转
-    if (DP.source === "device" && !DP.fallbacked) {
+    // 设备目录不可用 → 仅在**打开选择器的初次加载**（未导航过）自动
+    // 降级到「本机目录（已授权）」（0.1.37.3）；用户手动切过来源
+    // （fallbacked=true）或已导航过（navigated=true）则不自动跳转——
+    // 导航中途失败显示真实原因，不静默跳走（0.1.38.2）。
+    if (DP.source === "device" && !DP.fallbacked && !DP.navigated) {
       DP.fallbacked = true;
       DP.source = "local";
       DP.path = "";
@@ -617,7 +629,12 @@ async function dpLoad() {
     DP.entries = [];
     DP.crumbs = [];
     dpRender();
-    dpStatus("✗ " + e.message, "bad");
+    dpStatus("✗ " + e.message + "（点击此处重试）", "bad");
+    const st = $("#dpStatus");
+    if (st) {
+      st.style.cursor = "pointer";
+      st.onclick = () => dpLoad();
+    }
   }
 }
 
@@ -629,6 +646,7 @@ function openDirPicker(inputId, source) {
   DP.path = (el.value || "").trim();
   DP.retried = false;
   DP.fallbacked = false;
+  DP.navigated = false;   // 打开选择器 → 回到「初次加载」语义（允许自动降级）
   const box = $("#dirPicker");
   if (box) box.hidden = false;
   dpLoad();
@@ -660,6 +678,7 @@ $$("#dirPicker .dp-src .btn").forEach((b) => {
     DP.path = "";
     DP.retried = true;
     DP.fallbacked = true;   // 用户显式选了来源，不再自动降级
+    DP.navigated = true;    // 显式操作：失败显示真实错误，不自动跳走
     dpLoad();
   });
 });

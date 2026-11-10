@@ -259,6 +259,30 @@ class TestDriveCore(unittest.TestCase):
         labels = [label for label, _ in tc.core._folder_shapes("sp", "")]
         self.assertEqual(labels, ["标准形状", "极简形状"])
 
+    def test_relay_folder_shapes_kind_full_first(self):
+        """0.1.38.2 修复「选择迅雷文件夹看不到所有子文件夹」：设备 API
+        目录表第一形状为「目录形状」——kind-only 过滤（不带 trashed/
+        phase 条件，缺 phase 字段的文件夹不会被服务端滤掉）+ 全扩展
+        参数（带路径信息）；完整形状（phase/trashed 过滤）降为第二。
+        _folders 逐形状取**第一个非空结果**即返回，第一形状拿到的必须
+        是全集，否则部分滤掉时阶梯短路，用户只见部分子文件夹。"""
+        from backends.thunder_cloud import ThunderCloud
+        tc = ThunderCloud(httpx.Client(), {}, None)
+        api = {"base": "http://relay/", "plugin_app_id": "p1",
+               "plugin_app_token": "t1"}
+        shapes = tc.core._relay_folder_shapes(api, "user#runner", "pid-1")
+        self.assertEqual([label for label, _ in shapes],
+                         ["设备API目录形状", "设备API完整形状",
+                          "设备API极简形状"])
+        first = shapes[0][1]
+        self.assertIn("drive#folder", first["filters"])
+        self.assertNotIn("phase", first["filters"])
+        self.assertNotIn("trashed", first["filters"])
+        self.assertEqual(first["with"],
+                         ["withCategoryDiskMountPath",
+                          "withCategoryHistoryDownloadPath"])
+        self.assertIn("PHASE_TYPE_COMPLETE", shapes[1][1]["filters"])
+
     def test_folders_kind_filter_client_side(self):
         """极简形状无服务端过滤：kind 非 drive#folder 的条目客户端兜底剔除。"""
         core = self._mk(self._folder_handler(files=[

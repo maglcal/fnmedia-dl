@@ -36,6 +36,11 @@ DOWNLOAD_ROOT_NAMES = {"download", "downloads", "下载", "下载目录"}
 # 无界累计会拖垮网关响应预算（0.1.31「提示502」原因链的一环）——超预算
 # 即止损降级/报明确错误，单次解析最长 ~18s。
 RESOLVE_BUDGET = 18.0
+# 目录浏览预算（0.1.38.2）：浏览是交互场景（用户点目录逐级下钻，慢一点
+# 也愿意等），比派发链更宽容；设备中继已知慢（error_code=2 超时史），
+# 深路径在 18s 派发预算下必超支（顶层+config+逐段+entries 多次请求），
+# 中途耗尽报「目录不存在」是「看不到子文件夹」的来源之一。
+BROWSE_BUDGET = 30.0
 # 解析结果复用窗口（秒）：批量派发同一目录只解析一次（0.1.31 提速关键）。
 # 按 client 身份隔离（每个请求新建 DownloadManager/client），不跨请求串味。
 RESOLVE_CACHE_TTL = 120.0
@@ -396,7 +401,8 @@ class DriveCore:
             best = best or (pid, "")
         return best
 
-    def _root_folder(self, space: str, deadline: float) -> tuple[str, str]:
+    def _root_folder(self, space: str, deadline: float,
+                     tops: list[dict] | None = None) -> tuple[str, str]:
         """只读识别下载根目录 → (root_id, root_path)。识别阶梯：
           1. /device/config download_paths[0] 与目录表 realPath/aliasPath 匹配
           2. 顶层只有一个目录 → 即根
@@ -404,9 +410,12 @@ class DriveCore:
           4. 启发式兜底：首个顶层目录的 parent_id 或 id
         目录表彻底不可用（设备插件超时 error_code=2 等）时历史任务反查兜底。
         **不创建任何目录**——建目录只发生在 _resolve_uncached 的子目录解析里，
-        因此本方法可安全复用于目录浏览选择器。"""
+        因此本方法可安全复用于目录浏览选择器。
+        tops（0.1.38.2）：调用方已拉好的顶层目录表，复用避免重复请求
+        （浏览链此前把顶层列表拉两遍，白烧设备 API 预算）；None = 自拉。"""
         try:
-            folders = self._folders(space, "", deadline=deadline)
+            folders = (tops if tops is not None
+                       else self._folders(space, "", deadline=deadline))
             if not folders:
                 raise BackendError(
                     "引擎目录表为空，无法解析下载根目录"
@@ -569,8 +578,22 @@ class DriveCore:
 
         **只读不建目录**：路径缺级直接报「目录不存在」，由用户挑已存在的
         目录——选择器语义是「浏览并选定」，不该有隐藏的写副作用。"""
-        dl = deadline if deadline is not None else time.monotonic() + RESOLVE_BUDGET
-        root_id, root_path = self._root_folder(space, dl)
+        dl = deadline if deadline is not None else time.monotonic() + BROWSE_BUDGET
+        memo: dict[str, list[dict]] = {}
+
+        def folders(pid: str) -> list[dict]:
+            """同一 parent 在一次浏览内只拉一次目录表（0.1.38.2）：
+            根外锚定场景此前顶层列表会被 _root_folder 与 _anchor_abs
+            各拉一遍，白烧设备 API 预算。"""
+            if pid not in memo:
+                memo[pid] = self._folders(space, pid, deadline=dl)
+            return memo[pid]
+
+        try:
+            tops = folders("")
+        except BackendError:
+            tops = None       # 目录表不可用 → 交给 _root_folder 反查兜底
+        root_id, root_path = self._root_folder(space, dl, tops=tops)
         nd = _norm_dir((path or "").strip())
         # 归一到「走树起点 + 相对段」：根下绝对路径去根前缀；根外绝对路径
         # 与派发同一套 _anchor_abs 锚定（只读），其余按根下相对段处理
@@ -581,12 +604,7 @@ class DriveCore:
         elif root_path and nd.startswith(root_path):
             rel = nd[len(root_path):]
         elif (path or "").strip().startswith("/"):
-            anchor = None
-            try:
-                anchor = self._anchor_abs(
-                    self._folders(space, "", deadline=dl), nd)
-            except BackendError:
-                anchor = None         # 目录表不可用 → 沿用根下相对解释
+            anchor = self._anchor_abs(tops, nd) if tops else None
             if anchor:
                 pid, ppath, rel = anchor
                 base = ppath
@@ -596,7 +614,7 @@ class DriveCore:
             rel = nd.lstrip("/")
         for seg in [s for s in rel.split("/") if s]:
             child = None
-            for f in self._folders(space, pid, deadline=dl):
+            for f in folders(pid):
                 if ((f.get("name") or "").strip() == seg
                         or _folder_path(f) == ppath + seg + "/"):
                     child = f
@@ -606,7 +624,7 @@ class DriveCore:
             pid = str(child.get("id"))
             ppath = ppath + seg + "/"
         entries = []
-        for f in self._folders(space, pid, deadline=dl):
+        for f in folders(pid):
             name = (f.get("name") or "").strip()
             if not name:
                 continue

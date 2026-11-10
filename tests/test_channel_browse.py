@@ -190,6 +190,61 @@ class TestBrowseAPI(unittest.TestCase):
                                         "path": str(self.share / "nope")})
         self.assertEqual(r.status_code, 404)
 
+    def test_local_stat_denied_inside_roots_403_perm_hint(self):
+        """0.1.38.2：授权范围内但子目录系统权限不足（stat 被拒）→
+        403 + 权限指引（区别于「去授权目录授权」），不是 404「目录
+        不存在」——此前 os.path.isdir 把无权子目录吞成 404，用户误以为
+        「子目录未被正确授予访问权限」。"""
+        target = self.share / "movies"
+        real_stat = os.stat
+
+        def fake_stat(p, *a, **k):
+            if str(p) == str(target):
+                raise PermissionError(13, "denied")
+            return real_stat(p, *a, **k)
+
+        with self._patch_paths(self.share, [self.granted]), \
+                mock.patch("os.stat", fake_stat):
+            r = self.client.get("/api/fs/browse",
+                                params={"source": "local",
+                                        "path": str(target)})
+        self.assertEqual(r.status_code, 403)
+        detail = r.json()["detail"]
+        self.assertIn("系统文件权限", detail)
+        self.assertNotIn("应用设置 → 授权目录", detail)
+
+    def test_local_scandir_denied_403_perm_hint(self):
+        """进入目录后枚举子目录被拒：同样 403 + 权限指引。"""
+        target = self.share / "movies"
+        real_scandir = os.scandir
+
+        def fake_scandir(p):
+            if str(p) == str(target):
+                raise PermissionError(13, "denied")
+            return real_scandir(p)
+
+        with self._patch_paths(self.share, [self.granted]), \
+                mock.patch("os.scandir", fake_scandir):
+            r = self.client.get("/api/fs/browse",
+                                params={"source": "local",
+                                        "path": str(target)})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("系统文件权限", r.json()["detail"])
+
+    def test_local_shows_symlink_to_another_granted_root(self):
+        """0.1.38.2 全 roots 并集判定：软链指向**另一个**授权目录应展示
+        （此前只对当前 root 判定会把它隐藏，表现为「子文件夹不显示」）。"""
+        link = self.share / "to-granted"
+        try:
+            os.symlink(self.granted / "backup", link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("当前环境不支持符号链接")
+        with self._patch_paths(self.share, [self.granted]):
+            r = self.client.get("/api/fs/browse",
+                                params={"source": "local",
+                                        "path": str(self.share)})
+        self.assertIn("to-granted", [e["name"] for e in r.json()["entries"]])
+
     def test_device_missing_backend_404(self):
         self._patch_backends({})
         r = self.client.get("/api/fs/browse", params={"source": "device"})
@@ -298,8 +353,10 @@ class FakeCore(DriveCore):
     def __init__(self):
         super().__init__(None, "http://engine/drive/v1", lambda: {})
         self.made = []
+        self.calls = []       # _folders 调用轨迹（parent_id），钉 memo 消重
 
     def _folders(self, space, parent_id="", deadline=None):
+        self.calls.append(parent_id)
         return list(self.TREE.get(parent_id, []))
 
     def _device_config(self, space="", deadline=None):
@@ -361,6 +418,18 @@ class TestDriveCoreBrowse(unittest.TestCase):
             self.core.browse("sp", "/vol1/nope/x")
         self.assertEqual(self.core.made, [])
 
+    def test_browse_fetches_top_level_once(self):
+        """0.1.38.2 memo 消重：根外锚定场景此前 _root_folder 与
+        _anchor_abs 会把顶层目录表各拉一遍，白烧设备 API 预算。"""
+        self.core.browse("sp", "/vol1/1000/movie")
+        self.assertEqual(self.core.calls.count(""), 1)
+
+    def test_root_listing_fetches_each_parent_once(self):
+        """一次浏览内同一 parent 只拉一次目录表（0.1.38.2 memo）。"""
+        self.core.browse("sp")
+        self.assertEqual(self.core.calls.count(""), 1)
+        self.assertEqual(self.core.calls.count("root"), 1)
+
 
 class TestUIMarkup(unittest.TestCase):
     """UI 骨架与脚本绑定一致性——本项目吃过「元素改名后 app.js 静默失效」
@@ -386,6 +455,15 @@ class TestUIMarkup(unittest.TestCase):
         ids = set(re.findall(r'\$\("#([A-Za-z][A-Za-z0-9_-]*)"\)', self.js))
         missing = [i for i in sorted(ids) if f'id="{i}"' not in self.html]
         self.assertEqual(missing, [], f"index.html 缺少 app.js 引用的元素：{missing}")
+
+    def test_dir_picker_fallback_only_on_initial_open(self):
+        """0.1.38.2：设备来源自动降级只限打开选择器的初次加载
+        （!DP.navigated）；导航失败显示真实原因+可点击重试，不再静默
+        跳到本机目录（曾被误以为子文件夹「无法调用」）。"""
+        self.assertIn("!DP.navigated", self.js)
+        self.assertIn("DP.navigated = false", self.js)
+        self.assertIn("DP.navigated = true", self.js)
+        self.assertIn("点击此处重试", self.js)
 
 
 if __name__ == "__main__":

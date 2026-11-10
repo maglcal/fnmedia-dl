@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
@@ -363,6 +364,25 @@ class TestAPI(unittest.TestCase):
         self.assertFalse(body["exists"])
         self.assertFalse(body["ok"])
         self.assertIn("授权目录", body["hint"])
+
+    def test_fs_check_permission_denied(self):
+        """0.1.38.2：stat 被拒（子目录权限未继承）按「存在但不可写」
+        返回并给权限指引，不再误报「目录不存在」。"""
+        with tempfile.TemporaryDirectory() as d:
+            real_stat = os.stat
+
+            def fake_stat(p, *a, **k):
+                if str(p) == d:
+                    raise PermissionError(13, "denied")
+                return real_stat(p, *a, **k)
+
+            with mock.patch("os.stat", fake_stat):
+                body = self.client.get("/api/fs/check",
+                                       params={"path": d}).json()
+        self.assertTrue(body["exists"])
+        self.assertFalse(body["writable"])
+        self.assertTrue(body["denied"])
+        self.assertIn("系统文件权限", body["hint"])
 
 
 class TestUIPaths(unittest.TestCase):
