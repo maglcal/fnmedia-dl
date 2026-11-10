@@ -587,10 +587,11 @@ def _browse_local(path: str) -> dict:
             # 子目录被隐藏，表现为「子文件夹不显示」。范围外的仍不展示。
             if not any(_within(e.path, r) for r in roots):
                 continue
-            entries.append({"name": e.name, "path": e.path})
+            entries.append({"name": e.name, "path": e.path, "real": e.path})
     except PermissionError as exc:
         raise HTTPException(403, f"无权读取该目录。{PERM_HINT}") from exc
-    return _browse_payload("local", root, target, entries, roots)
+    return _browse_payload("local", root, target, entries, roots,
+                           real=target)
 
 
 def _browse_device(path: str) -> dict:
@@ -604,7 +605,8 @@ def _browse_device(path: str) -> dict:
         raise HTTPException(502, f"远程设备目录读取失败：{exc}") from exc
     return _browse_payload("device", d.get("root") or "/", d.get("path") or "",
                            d.get("entries") or [],
-                           root_id=d.get("root_id", ""))
+                           root_id=d.get("root_id", ""),
+                           real=d.get("real", ""))
 
 
 @app.get("/api/fs/browse")

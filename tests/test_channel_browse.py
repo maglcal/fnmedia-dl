@@ -245,6 +245,35 @@ class TestBrowseAPI(unittest.TestCase):
                                         "path": str(self.share)})
         self.assertIn("to-granted", [e["name"] for e in r.json()["entries"]])
 
+    def test_local_entries_carry_real_path(self):
+        """0.1.38.3：本机来源 entries/当前目录同样带真实路径（本机路径
+        即真实路径），选择器实际路径行对双来源统一显示。"""
+        with self._patch_paths(self.share, [self.granted]):
+            r = self.client.get("/api/fs/browse",
+                                params={"source": "local",
+                                        "path": str(self.share)})
+        body = r.json()
+        self.assertEqual(body["real"], str(self.share))
+        self.assertEqual(body["entries"][0]["real"],
+                         str(self.share / "movies"))
+
+    def test_device_real_path_passthrough(self):
+        """0.1.38.3：设备来源真实路径（目录表 realPath）透传到浏览结果。"""
+        class FakeTC:
+            def browse_dirs(self, path=""):
+                return {"root_id": "r1", "root": "/downloads/",
+                        "path": "/downloads/",
+                        "real": "/var/apps/xunlei/shares/downloads/",
+                        "entries": [{"id": "m1", "name": "movies",
+                                     "path": "/downloads/movies/",
+                                     "real": "/vol1/1000/movies/"}]}
+
+        self._patch_backends({"thunder_cloud": FakeTC()})
+        r = self.client.get("/api/fs/browse", params={"source": "device"})
+        body = r.json()
+        self.assertEqual(body["real"], "/var/apps/xunlei/shares/downloads/")
+        self.assertEqual(body["entries"][0]["real"], "/vol1/1000/movies/")
+
     def test_device_missing_backend_404(self):
         self._patch_backends({})
         r = self.client.get("/api/fs/browse", params={"source": "device"})
@@ -430,6 +459,20 @@ class TestDriveCoreBrowse(unittest.TestCase):
         self.assertEqual(self.core.calls.count(""), 1)
         self.assertEqual(self.core.calls.count("root"), 1)
 
+    def test_browse_returns_real_paths(self):
+        """0.1.38.3：entries 与当前目录透出 NAS 真实路径
+        （目录表 params.RealPath），选择器实时显示真实目录用。"""
+        d = self.core.browse("sp")
+        self.assertEqual(d["real"], "/downloads/")
+        self.assertEqual({e["name"]: e["real"] for e in d["entries"]},
+                         {"movies": "/downloads/movies/",
+                          "music": "/downloads/music/"})
+        d2 = self.core.browse("sp", "movies")
+        self.assertEqual(d2["real"], "/downloads/movies/")
+        self.assertEqual(d2["entries"][0]["real"], "/downloads/movies/2026/")
+        d3 = self.core.browse("sp", "/vol1/1000/movie")
+        self.assertEqual(d3["real"], "/vol1/1000/movie/")
+
 
 class TestUIMarkup(unittest.TestCase):
     """UI 骨架与脚本绑定一致性——本项目吃过「元素改名后 app.js 静默失效」
@@ -464,6 +507,14 @@ class TestUIMarkup(unittest.TestCase):
         self.assertIn("DP.navigated = false", self.js)
         self.assertIn("DP.navigated = true", self.js)
         self.assertIn("点击此处重试", self.js)
+
+    def test_dir_picker_shows_real_path_live(self):
+        """0.1.38.3：目录选择器实时显示 NAS 真实路径（行内小字 + 底部
+        实时行随导航更新）。"""
+        self.assertIn('id="dpReal"', self.html)
+        self.assertIn("NAS 实际路径", self.js)
+        self.assertIn("e.real", self.js)
+        self.assertIn("DP.real", self.js)
 
 
 if __name__ == "__main__":

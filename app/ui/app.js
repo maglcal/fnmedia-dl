@@ -521,7 +521,7 @@ on("#btnCheckDir", "click", async () => {
    「无法调用」）。 */
 const DP = {
   target: null, source: "device",
-  root: "", path: "", crumbs: [], entries: [],
+  root: "", path: "", real: "", crumbs: [], entries: [],
   loading: false, retried: false, fallbacked: false, navigated: false,
   _notice: "",
 };
@@ -573,12 +573,21 @@ function dpRender() {
     }
     for (const e of DP.entries) {
       const li = document.createElement("li");
-      li.innerHTML = `<span class="ico">📁</span><span class="grow">${esc(e.name)}</span>`;
+      li.innerHTML = `<span class="ico">📁</span><span class="grow col">` +
+        `<span class="nm">${esc(e.name)}</span>` +
+        (e.real ? `<span class="real">${esc(e.real)}</span>` : "") +
+        `</span>`;
       li.addEventListener("click", () => {
         DP.path = e.path; DP.retried = true; DP.navigated = true; dpLoad();
       });
       ul.appendChild(li);
     }
+  }
+  /* 实际路径实时行（0.1.38.3）：随导航实时更新 NAS 真实目录 */
+  const pr = $("#dpReal");
+  if (pr) {
+    pr.hidden = !DP.real;
+    pr.innerHTML = DP.real ? `<b>NAS 实际路径：</b>${esc(DP.real)}` : "";
   }
   const use = $("#dpUse");
   if (use) use.disabled = !DP.path || DP.loading;
@@ -594,6 +603,7 @@ async function dpLoad() {
     DP.loading = false;
     DP.root = d.root || "";
     DP.path = d.path || "";
+    DP.real = d.real || "";
     DP.crumbs = d.crumbs || [];
     DP.entries = d.entries || [];
     if (DP._notice) {
@@ -662,10 +672,11 @@ on("#dpUse", "click", () => {
   if (!DP.target || !DP.path) return;
   DP.target.value = DP.path;
   const id = DP.target.id;
+  const shown = DP.real || DP.path;
   dpClose();
   toast(id === "dirInput"
-    ? "✓ 已填入保存目录，可直接点「开始下载」"
-    : "✓ 已填入目录，记得点「保存全部设置」");
+    ? `✓ 已填入保存目录（实际路径：${shown}），可直接点「开始下载」`
+    : `✓ 已填入目录（实际路径：${shown}），记得点「保存全部设置」`);
 });
 on("#dpCancel", "click", dpClose);
 on("#dpClose", "click", dpClose);

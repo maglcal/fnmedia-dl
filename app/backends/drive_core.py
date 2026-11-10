@@ -573,8 +573,10 @@ class DriveCore:
         path 为下载根下的相对路径（或根下的绝对路径），空 = 下载根本身；
         根外绝对路径按 _anchor_abs 锚定到真实落点后浏览（与派发同一套
         落点规则，选择器回填的路径派发时能解析到同一处）。
-        返回 {root_id, root, path, entries}；
-        entries 只含子目录，path 值可直接回填给 create_task 的 directory。
+        返回 {root_id, root, path, real, entries}；
+        entries 只含子目录，path 值可直接回填给 create_task 的 directory；
+        real 为 NAS 真实路径（目录表 params.RealPath，0.1.38.3 实时显示
+        真实目录用；目录项无路径信息时为空字符串），entries[].real 同理。
 
         **只读不建目录**：路径缺级直接报「目录不存在」，由用户挑已存在的
         目录——选择器语义是「浏览并选定」，不该有隐藏的写副作用。"""
@@ -599,15 +601,19 @@ class DriveCore:
         # 与派发同一套 _anchor_abs 锚定（只读），其余按根下相对段处理
         base = root_path or "/"
         pid, ppath = root_id, root_path
+        real = ""                     # NAS 真实路径（目录表 realPath 信息）
         if root_path and nd == root_path:
             rel = ""
+            real = root_path
         elif root_path and nd.startswith(root_path):
             rel = nd[len(root_path):]
+            real = root_path          # 走树逐段修正为更深层的真实路径
         elif (path or "").strip().startswith("/"):
             anchor = self._anchor_abs(tops, nd) if tops else None
             if anchor:
                 pid, ppath, rel = anchor
                 base = ppath
+                real = ppath          # 锚定路径来自目录表 realPath
             else:
                 rel = nd.lstrip("/")
         else:
@@ -623,16 +629,20 @@ class DriveCore:
                 raise BackendError(f"目录不存在：{seg}（浏览为只读，不会自动创建）")
             pid = str(child.get("id"))
             ppath = ppath + seg + "/"
+            cr = _folder_path(child)
+            if cr:
+                real = cr
         entries = []
         for f in folders(pid):
             name = (f.get("name") or "").strip()
             if not name:
                 continue
             entries.append({"id": str(f.get("id")), "name": name,
-                            "path": ppath + name + "/"})
+                            "path": ppath + name + "/",
+                            "real": _folder_path(f)})
         entries.sort(key=lambda e: e["name"])
         return {"root_id": root_id, "root": base or "/",
-                "path": ppath, "entries": entries}
+                "path": ppath, "real": real, "entries": entries}
 
     # ------------------------------------------------------------ 建任务
 

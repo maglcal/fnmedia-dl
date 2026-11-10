@@ -383,6 +383,18 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 .dp-list li.empty { cursor: default; color: var(--muted); justify-content: center; }
 .dp-list li.empty:hover { background: transparent; }
 .dp-list .ico { opacity: .7; }
+/* 目录行：名称 + NAS 真实路径小字（0.1.38.3 实时显示真实目录） */
+.dp-list li .col { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dp-list li .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-list li .real {
+  font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dp-real {
+  margin-top: 8px; font-size: 12px; color: var(--muted);
+  word-break: break-all;
+}
+.dp-real b { color: var(--text); font-weight: 600; }
 
 /* ---------------- 更新提示弹窗（0.1.37.5） ---------------- */
 .update-notes {
