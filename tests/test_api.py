@@ -511,6 +511,8 @@ class TestDailyCheck(unittest.TestCase):
                                    has_update=False, latest="0.1.0")):
             r = self.client.get("/api/update/daily-check")
         self.assertEqual(r.json()["action"], "none")
+        # 0.1.39.1：无更新也回传当前版本，前端给「已是最新版」反馈
+        self.assertEqual(r.json()["current"], "0.1.0")
 
     def test_same_version_same_day_no_repeat(self):
         """同一版本同一天只弹一次窗。"""
@@ -539,13 +541,16 @@ class TestDailyCheck(unittest.TestCase):
         self.assertEqual(r.json()["latest"], "0.3.0")
 
     def test_source_error_saves_check_date(self):
-        """更新源不可用也记 last_check_date（当天不反复请求坏源）。"""
+        """更新源不可用也记 last_check_date（当天不反复请求坏源）；
+        0.1.39.1：失败与无更新区分——返回 action=error 带原因。"""
         import datetime, json
         from unittest import mock
         with mock.patch.object(main.updatesrc, "check",
                                side_effect=Exception("network")):
             r = self.client.get("/api/update/daily-check")
-        self.assertEqual(r.json()["action"], "none")
+        body = r.json()
+        self.assertEqual(body["action"], "error")
+        self.assertIn("network", body["error"])
         st = json.loads(self._state_file().read_text())
         self.assertEqual(st["last_check_date"],
                          datetime.date.today().isoformat())

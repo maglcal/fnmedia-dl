@@ -601,7 +601,10 @@ class DriveCore:
         # 与派发同一套 _anchor_abs 锚定（只读），其余按根下相对段处理
         base = root_path or "/"
         pid, ppath = root_id, root_path
-        real = ""                     # NAS 真实路径（目录表 realPath 信息）
+        real = root_path or ""        # NAS 真实路径（目录表 realPath 信息）；
+        #                              空 path 浏览根即根路径（0.1.39.1 补漏：
+        #                              此前只在 nd==root_path/走树时才赋值，
+        #                              根浏览时「NAS 实际路径」行是空的）
         if root_path and nd == root_path:
             rel = ""
             real = root_path

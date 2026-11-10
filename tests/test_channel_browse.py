@@ -516,6 +516,20 @@ class TestUIMarkup(unittest.TestCase):
         self.assertIn("e.real", self.js)
         self.assertIn("DP.real", self.js)
 
+    def test_daily_check_gives_visible_feedback(self):
+        """0.1.39.1：每天首次自动检查更新无论结果都给一次性反馈
+        （无更新/失败 toast），不再静默——静默曾被误认为功能没实现。"""
+        self.assertIn("已自动检查更新", self.js)
+        self.assertIn('r.action === "error"', self.js)
+        self.assertIn("自动检查更新失败", self.js)
+
+    def test_update_check_shows_release_notes(self):
+        """0.1.39.1：手动「检查更新」发现新版本时展示最新版本修改项，
+        不再只有一行版本号。"""
+        self.assertIn('id="updateNotes"', self.html)
+        self.assertIn("更新内容", self.js)
+        self.assertIn("查看完整更新日志", self.js)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

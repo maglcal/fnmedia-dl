@@ -27,7 +27,7 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude='.venv/' --exclude='__pycache__/' --exclude='*.pyc' \
     --exclude='.git/' --exclude='dist/' --exclude='logs/' \
     --exclude='state/' --exclude='packaging/fpk/.build/' \
-    --exclude='.tools/' --exclude='*.fpk' --exclude='.DS_Store' \
+    --exclude='.tools/' --exclude='.playwright-cli/' --exclude='*.fpk' --exclude='.DS_Store' \
     --exclude='tests/' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
 else
@@ -37,7 +37,7 @@ import shutil, sys
 from pathlib import Path
 src, dst = Path(sys.argv[1]), Path(sys.argv[2])
 EXCLUDE_DIRS = {".venv", "__pycache__", ".git", "dist", "logs", "state",
-                ".build", ".tools", "tests", "node_modules"}
+                ".build", ".tools", ".playwright-cli", "tests", "node_modules"}
 EXCLUDE_NAMES = {".DS_Store"}
 
 def ignore(directory, names):

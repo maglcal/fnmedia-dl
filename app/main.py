@@ -198,7 +198,8 @@ def update_daily_check():
                        → 今天已对此版本弹过窗，skip（同一版本同一天不重复弹）
     返回 action：
       "skip"  —— 今天已检查/已弹过，不处理
-      "none"  —— 无更新（或更新源不可用，当天不再重试）
+      "none"  —— 无更新（current 为当前版本）
+      "error" —— 更新源不可用（error 为脱敏原因，当天不再重试）
       "prompt" —— 发现新版本，携带版本号/更新日志/资产供弹窗展示
     """
     state = _read_update_check_state()
@@ -208,18 +209,21 @@ def update_daily_check():
     if state.get("last_check_date") == today:
         return {"action": "skip"}
 
-    # 执行检查（失败也记录当天已查，避免反复请求坏源）
+    # 执行检查（失败也记录当天已查，避免反复请求坏源）。
+    # 0.1.39.1：「检查失败」与「无更新」区分开返回——两者都静默的话
+    # 用户完全感知不到自动检查的存在（被误认为功能没实现）。
     try:
         result = updatesrc.check(cfgmod.load(), VERSION)
-    except Exception:
+    except Exception as exc:
         state["last_check_date"] = today
         _save_update_check_state(state)
-        return {"action": "none"}
+        return {"action": "error", "current": VERSION,
+                "error": updmod._mask_secrets(str(exc))[:160]}
 
     if not result.get("has_update"):
         state["last_check_date"] = today
         _save_update_check_state(state)
-        return {"action": "none"}
+        return {"action": "none", "current": result.get("current", VERSION)}
 
     latest = result.get("latest", "")
 

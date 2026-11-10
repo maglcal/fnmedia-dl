@@ -1008,10 +1008,12 @@ async function loadVersion() {
 on("#updateCheckBtn", "click", async () => {
   const btn = $("#updateCheckBtn");
   const st = $("#updateStatus");
+  const notesBox = $("#updateNotes");
   btn.disabled = true;
   st.hidden = false;
   st.className = "dir-status";
   st.textContent = "正在检查更新…";
+  if (notesBox) { notesBox.hidden = true; notesBox.innerHTML = ""; }
   try {
     const r = await API.get("/api/update/check");
     if (r.has_update) {
@@ -1027,7 +1029,12 @@ on("#updateCheckBtn", "click", async () => {
       st.innerHTML = notice +
         `发现新版本 <b>v${r.latest}</b>（当前 v${r.current}）` +
         (fpk ? "，可点「一键更新」在线升级" :
-          (r.url ? ` —— <a href="${r.url}" target="_blank" rel="noreferrer">前往下载</a>` : ""));
+          (r.url ? ` —— <a href="${esc(r.url)}" target="_blank" rel="noreferrer">前往下载</a>` : ""));
+      // 0.1.39.1：展示最新版本的修改项（此前只有版本号一行，更新内容看不到）
+      if (notesBox && r.notes) {
+        notesBox.hidden = false;
+        notesBox.innerHTML = `<b>v${esc(r.latest)} 更新内容：</b><br>` + _renderNotes(r.notes);
+      }
     } else {
       $("#updateRunBtn").hidden = true;
       st.innerHTML = (r.notice
@@ -1322,14 +1329,26 @@ function _renderNotes(md) {
 
 function dailyCheck() {
   API.get("/api/update/daily-check").then((r) => {
+    if (r.action === "none") {
+      // 0.1.39.1：每天首次检查给一次性反馈，让「自动检查更新」看得见
+      toast(`✓ 已自动检查更新，当前已是最新版 v${r.current || ""}`);
+      return;
+    }
+    if (r.action === "error") {
+      toast(`⚠ 自动检查更新失败：${r.error || "更新源不可用"}（明天再试）`);
+      return;
+    }
     if (r.action !== "prompt") return;
     // 填充弹窗
     const verEl = $("#upVer");
     if (verEl) verEl.textContent = "v" + r.latest;
     const notesEl = $("#upNotes");
     if (notesEl) {
+      const link = r.url
+        ? `<p><a href="${esc(r.url)}" target="_blank" rel="noreferrer">查看完整更新日志 →</a></p>` : "";
       notesEl.innerHTML = `<p>当前版本 <b>v${esc(r.current)}</b> → 新版本 <b>v${esc(r.latest)}</b></p>`
-        + (r.notes ? _renderNotes(r.notes) : "<p>（本次更新无详细日志）</p>");
+        + (r.notes ? _renderNotes(r.notes) : "<p>（本次更新无详细日志）</p>")
+        + link;
     }
     const noticeEl = $("#upNotice");
     if (noticeEl) {

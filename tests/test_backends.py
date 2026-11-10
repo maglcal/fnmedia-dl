@@ -1580,10 +1580,10 @@ class TestCloudDeviceApi(unittest.TestCase):
         self.assertEqual(seen["with_multi"],
                          ["withCategoryDiskMountPath",
                           "withCategoryHistoryDownloadPath"])
-        self.assertEqual(json.loads(p["filters"]), {
-            "trashed": {"eq": False},
-            "phase": {"eq": "PHASE_TYPE_COMPLETE"},
-            "kind": {"eq": "drive#folder"}})
+        # 0.1.38.2 起首轮第一形状为「目录形状」：kind-only 过滤
+        #（不带 trashed/phase，缺 phase 字段的文件夹不被滤掉）
+        self.assertEqual(json.loads(p["filters"]),
+                         {"kind": {"eq": "drive#folder"}})
 
     def test_relay_links_variant_cached_and_slash_norm(self):
         """INNER_API 的 links[].url 变体可解析；link 无尾斜杠时 base 自动补
@@ -1621,7 +1621,7 @@ class TestCloudDeviceApi(unittest.TestCase):
                     "link": "https://relay.example/p/?plugin_app_id=i&plugin_app_token=t"})
             if host == "relay.example" and path.endswith("/drive/v1/files"):
                 state["files"] += 1
-                if state["files"] <= 2:          # 第一轮两个形状都 502
+                if state["files"] <= 3:          # 第一轮三个形状都 502
                     return httpx.Response(502, text="bad gateway")
                 return httpx.Response(200, json={"files": [
                     {"id": "d1", "name": "downloads", "kind": "drive#folder"}]})
@@ -1631,7 +1631,7 @@ class TestCloudDeviceApi(unittest.TestCase):
         files = tc.core._folders("remote-1", "")
         self.assertEqual([f["id"] for f in files], ["d1"])
         self.assertEqual(state["inner"], 2)      # 第二轮重新发现
-        self.assertEqual(state["files"], 3)      # 2 失败形状 + 1 重试成功
+        self.assertEqual(state["files"], 4)      # 3 失败形状 + 1 重试成功
 
     def test_inner_api_fails_falls_back_apipan(self):
         """INNER_API 不可达/无 link → 回退 api-pan 形状阶梯（兼容未来变化）。"""
