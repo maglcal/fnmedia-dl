@@ -16,6 +16,11 @@ set -uo pipefail
 LOG="${FNDL_LOG:-/tmp/fnmedia-dl.log}"
 log(){ echo "[deps] $*" >> "$LOG" 2>&1 || true; }
 
+# ---- 诊断头：无论成败都在日志开头留痕，下次失败一眼定案 ----
+log "===== 依赖引导开始 $(date '+%F %T') ====="
+log "系统: $(uname -srm 2>/dev/null || echo unknown)"
+log "python3: $(command -v python3 2>/dev/null || echo 'NOT FOUND') | $(python3 -V 2>&1 || echo '无版本信息')"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || { echo "无法进入应用目录" >&2; exit 1; }
 VENV="$ROOT/.venv"
@@ -51,17 +56,30 @@ if [ ! -x "$PYBIN" ]; then
     else
       python3 -m pip install --user virtualenv >> "$LOG" 2>&1 || true
       python3 -m virtualenv -p python3 "$VENV" >> "$LOG" 2>&1 \
-        || { echo "创建 venv 失败：请在应用中心或终端安装 python3-venv / python3-pip" >&2; exit 2; }
+        || { log "FAIL exit=2 venv 创建全部失败"; echo "创建 venv 失败：请在应用中心或终端安装 python3-venv / python3-pip" >&2; exit 2; }
     fi
   fi
 fi
-[ -x "$PYBIN" ] || { echo "虚拟环境 python 不可用" >&2; exit 2; }
+[ -x "$PYBIN" ] || { log "FAIL exit=2 venv python 不可执行: $PYBIN"; echo "虚拟环境 python 不可用" >&2; exit 2; }
 
 # pip 基础参数：安静、不超时太死、必要时信任国内镜像 http/自签
 PIP_BASE=(--disable-pip-version-check --retries 2 --timeout 25)
 
-# ---------- 2. 离线 wheelhouse 优先 ----------
 WHEELHOUSE="$ROOT/wheelhouse"
+
+# ---- pip 自更新兜底：旧 pip（<21）可能无法解析新版 wheel 元数据 ----
+# 若 wheelhouse 带了新版 pip wheel，先离线自更新，避免后续安装因 pip 太旧而失败。
+if [ "${FNDL_REQUIRE_NET:-0}" != "1" ] && [ -d "$WHEELHOUSE" ]; then
+  PIP_WHEEL="$(ls "$WHEELHOUSE"/pip-*.whl 2>/dev/null | head -n1)"
+  if [ -n "$PIP_WHEEL" ]; then
+    log "检测到内置 pip wheel，尝试离线自更新 pip（兜旧版 pip 元数据解析）"
+    "$PIP" install "${PIP_BASE[@]}" --no-index --find-links "$WHEELHOUSE" --upgrade pip >> "$LOG" 2>&1 \
+      && log "pip 自更新成功（$("$PIP" --version 2>&1 | head -n1)）" \
+      || log "pip 自更新失败（不影响后续，继续尝试安装）"
+  fi
+fi
+
+# ---------- 2. 离线 wheelhouse 优先 ----------
 offline_ok=0
 if [ "${FNDL_REQUIRE_NET:-0}" != "1" ] && [ -d "$WHEELHOUSE" ]; then
   if ls "$WHEELHOUSE"/*.whl >/dev/null 2>&1; then
@@ -88,7 +106,7 @@ if [ "$offline_ok" != "1" ]; then
     fi
     log "源失败：$idx"
   done
-  [ "$installed" = "1" ] || { echo "依赖在线安装全部失败（已尝试内置离线包与多个镜像）" >&2; exit 3; }
+  [ "$installed" = "1" ] || { log "FAIL exit=3 在线安装全部镜像失败（离线也未成功）"; echo "依赖在线安装全部失败（已尝试内置离线包与多个镜像）" >&2; exit 3; }
 fi
 
 # ---------- 4. 真实 import 自检 ----------
@@ -100,6 +118,7 @@ print("[deps] import OK:",
       "httpx", httpx.__version__)
 PY
 then
+  log "FAIL exit=4 import 自检失败（平台/Python 版本不兼容）"
   echo "依赖已安装但自检 import 失败（平台/Python 版本不兼容）" >&2
   exit 4
 fi
