@@ -351,7 +351,7 @@ def deploy(data_dir_raw: str = "", dl_dir_raw: str = "") -> dict:
         low = out.lower()
         if "permission denied" in low or "dial unix" in low or "access is denied" in low:
             raise DeployError("应用用户无权访问 Docker（docker 组权限未生效）："
-                              "请到应用中心重装或升级一次「飞牛下载助手」让权限生效后重试")
+                              "请到应用中心重装或升级一次「批量下载助手」让权限生效后重试")
         raise DeployError("Docker 服务未运行：请到 应用中心 → Docker 启动后重试"
                           + (f"（{out[-120:]}）" if out else ""))
 

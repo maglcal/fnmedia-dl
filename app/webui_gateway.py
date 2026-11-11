@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""飞牛桌面应用网关：/app/fnmedia-dl → fnmedia-dl FastAPI Unix socket。
+"""fnOS 桌面应用网关：/app/fnmedia-dl → fnmedia-dl FastAPI Unix socket。
 
 App Center 桌面入口使用同源 HTTPS 路径 `/app/fnmedia-dl/`，并按
 ui/config 中的 gatewaySocket 连接应用根目录下的 fnmedia-dl.sock。

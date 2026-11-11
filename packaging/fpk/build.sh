@@ -66,8 +66,52 @@ else
 fi
 # manifest version 用完整版本号（支持四段分支号；fnOS 宽松接受，安装校验若拒则回退 0.1.36-1 形式）
 MANIFEST_VER="${VERSION}"
-sed -e "s/@VERSION@/${MANIFEST_VER}/g" -e "s/@TAG@/${RELEASE_TAG}/g" \
-    "${FPK_DIR}/manifest.in" > "${STAGE}/manifest"
+# manifest 生成：@VERSION@/@TAG@/@CHANGELOG@ 一次性替换（Python 处理多字节与转义）。
+# changelog 从随包 CHANGELOG.md 提取当前版本段落单行化（≤280 字符），
+# 提取不到回退 releases 链接——内嵌真实修改项，不再只放一个链接。
+PYBIN="${PYTHON:-python3}"; command -v "${PYBIN}" >/dev/null 2>&1 || PYBIN=python
+"${PYBIN}" - "${FPK_DIR}/manifest.in" "${STAGE}/manifest" \
+    "${MANIFEST_VER}" "${RELEASE_TAG}" "${REPO_ROOT}/CHANGELOG.md" <<'PYMANIFEST'
+import re, sys
+from pathlib import Path
+src, dst, version, tag, changelog_path = sys.argv[1:6]
+text = ""
+try:
+    text = Path(changelog_path).read_text(encoding="utf-8")
+except OSError:
+    pass
+sections, cur, lines = [], None, []
+for line in text.splitlines():
+    m = re.match(r"^##\s+\**\s*(?:main-)?v?([0-9][^\s*]*)", line)
+    if m:
+        if cur is not None:
+            sections.append((cur, "\n".join(lines).strip()))
+        cur, lines = m.group(1), []
+    elif cur is not None:
+        lines.append(line)
+if cur is not None:
+    sections.append((cur, "\n".join(lines).strip()))
+body = ""
+for ver, b in sections:
+    if ver == version:
+        body = b
+        break
+if not body and sections:
+    body = sections[0][1]
+one = body.lstrip("- ").replace("\n- ", "；").replace("\n", " ")
+one = re.sub(r"\*\*", "", one)
+one = re.sub(r"\s+", " ", one).strip()
+if len(one) > 280:
+    one = one[:280] + "…"
+if not one:
+    one = "更新内容详见 https://github.com/maglcal/fnmedia-dl/releases/tag/" + tag
+tpl = Path(src).read_text(encoding="utf-8")
+tpl = (tpl.replace("@VERSION@", version)
+          .replace("@TAG@", tag)
+          .replace("@CHANGELOG@", one))
+Path(dst).write_text(tpl, encoding="utf-8")
+print("[fpk] manifest 生成完成（changelog %d 字符）" % len(one))
+PYMANIFEST
 # UI 资源版本戳（?v=@VERSION@）防浏览器旧缓存：与 manifest 同步替换
 if [ -f "${STAGE}/app/repo/app/ui/index.html" ]; then
   sed -i "s/@VERSION@/${MANIFEST_VER}/g" "${STAGE}/app/repo/app/ui/index.html"

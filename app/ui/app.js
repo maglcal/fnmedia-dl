@@ -1,4 +1,4 @@
-/* 飞牛下载助手 管理页脚本（原生 JS，无构建步骤） */
+/* 批量下载助手 管理页脚本（原生 JS，无构建步骤） */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -1005,6 +1005,43 @@ async function loadVersion() {
   }
 }
 
+/* 0.1.39.2 可见性重设计：自动检查结果与当前版本更新内容常驻可见，
+   不再只在「发现新版本」时才有变化——用户能明确看到修改已生效。 */
+
+async function refreshUpdateStatus() {
+  /* 常驻状态行：最近一次自动检查的时间与结果（About 页「自动检查更新：…」） */
+  try {
+    const r = await API.get("/api/update/status");
+    const el = $("#updateAutoStatus");
+    if (!el) return;
+    if (!r.last_check_date) {
+      el.textContent = "自动检查更新：每天首次打开时自动检查一次";
+      return;
+    }
+    const map = { none: "✓ 无更新（已是最新）", error: "✗ 检查失败", prompt: "🔔 发现新版本" };
+    let txt = `自动检查更新：${esc(r.last_check_date)} ${map[r.last_result] || "已检查"}`;
+    if (r.last_result === "error" && r.last_error) txt += `（${esc(r.last_error)}）`;
+    if (r.last_result === "prompt" && r.prompted_version) txt += ` v${esc(r.prompted_version)}`;
+    el.textContent = txt;
+  } catch {
+    /* 状态行失败不影响主功能 */
+  }
+}
+
+async function refreshVersionNotes() {
+  /* 当前版本更新内容常显（读随包 CHANGELOG.md）：「已是最新」也看得见改了什么 */
+  const notesBox = $("#updateNotes");
+  if (!notesBox) return;
+  try {
+    const r = await API.get("/api/update/changelog");
+    notesBox.hidden = false;
+    notesBox.innerHTML = `<b>v${esc(r.version || r.current || "")} 更新内容：</b><br>`
+      + (r.text ? _renderNotes(r.text) : '<span class="hint">（暂无更新内容记录）</span>');
+  } catch {
+    notesBox.hidden = true;
+  }
+}
+
 on("#updateCheckBtn", "click", async () => {
   const btn = $("#updateCheckBtn");
   const st = $("#updateStatus");
@@ -1040,11 +1077,15 @@ on("#updateCheckBtn", "click", async () => {
       st.innerHTML = (r.notice
         ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "") +
         `✓ 已是最新版本（v${r.current}）`;
+      // 0.1.39.2：无更新也渲染当前版本更新内容——「检查更新」永远有可见反馈
+      refreshVersionNotes();
     }
   } catch (e) {
     st.textContent = "✗ 检查更新失败：" + e.message;
+    refreshVersionNotes();
   } finally {
     btn.disabled = false;
+    refreshUpdateStatus();
   }
 });
 
@@ -1166,7 +1207,7 @@ on("#updateRunBtn", "click", async () => {
           clearInterval(healthTimer);
           st.className = "dir-status bad";
           st.textContent = `⚠ 文件已替换为 v${newVer}，但服务未在预期时间内恢复，` +
-            `请到应用中心重启「飞牛下载助手」`;
+            `请到应用中心重启「批量下载助手」`;
           box.hidden = true;
           $("#updateRunBtn").disabled = false;
           $("#updateCheckBtn").disabled = false;
@@ -1367,7 +1408,8 @@ function dailyCheck() {
     if (box) box.hidden = false;
     $("#upProgressBox").hidden = true;
     $("#upActions").hidden = false;
-  }).catch(() => { /* 检查失败不影响主功能 */ });
+  }).catch(() => { /* 检查失败不影响主功能 */ })
+    .finally(() => { refreshUpdateStatus(); });
 }
 
 on("#upClose", "click", () => { const b = $("#updatePrompt"); if (b) b.hidden = true; });
@@ -1452,6 +1494,8 @@ on("#upNowBtn", "click", async () => {
 try {
   loadChips();
   loadVersion();
+  refreshUpdateStatus();
+  refreshVersionNotes();
   loadQueue();
   dailyCheck();
   scheduleAutoRefresh();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fnmedia-dl 服务入口：uvicorn（Unix socket）+ 飞牛桌面网关线程。
+"""fnmedia-dl 服务入口：uvicorn（Unix socket）+ fnOS 桌面网关线程。
 
 生产（fnOS）：
   .venv/bin/python serve.py
@@ -57,6 +57,20 @@ def main() -> int:
     gw_sock = webui_gateway.gateway_socket_path(REPO_ROOT)
     threading.Thread(target=webui_gateway.serve,
                      args=(gw_sock, APP_SOCK), daemon=True).start()
+
+    # 私有 socket 收紧为 600（仅属主可读写）：uvicorn 绑定后立即生效，
+    # 守护线程轮询补位（绑定完成即可收紧，无需等待服务就绪）。
+    def _tighten_sock():
+        import time
+        for _ in range(200):
+            if APP_SOCK.exists():
+                try:
+                    os.chmod(APP_SOCK, 0o600)
+                except OSError:
+                    pass
+                return
+            time.sleep(0.05)
+    threading.Thread(target=_tighten_sock, daemon=True).start()
 
     uvicorn.run("main:app", app_dir=str(APP_DIR), uds=str(APP_SOCK),
                 log_level="info", access_log=False)

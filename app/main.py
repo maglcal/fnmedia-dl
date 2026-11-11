@@ -6,7 +6,10 @@
   GET  /static/*             静态资源
 接口：
   GET  /api/health           健康检查（含版本号）
-  GET  /api/update/check     在线更新检查（GitHub Releases）
+  GET  /api/update/check     在线更新检查（多源：镜像优先，GitHub 兜底）
+  GET  /api/update/daily-check  每日自动检查（每天最多一次，四态返回）
+  GET  /api/update/status    最近一次自动检查的状态（常驻状态行用）
+  GET  /api/update/changelog 当前版本更新内容（随包 CHANGELOG.md）
   POST /api/update/download  一键在线更新（下载 fpk → 替换 → 重启，后台执行）
   GET  /api/update/progress  更新进度轮询（stage/percent/detail）
   GET  /api/backends         各下载通道状态
@@ -188,6 +191,73 @@ def _save_update_check_state(state: dict) -> None:
         pass
 
 
+# ------------------------------------------- 更新内容（CHANGELOG.md，0.1.39.2）
+# 随包 CHANGELOG.md 与 VERSION 同放仓库根部；按 "## <版本>" 标题分段。
+# 供 About 页「无更新也显示当前版本更新内容」与更新弹窗复用。
+
+def _changelog_path() -> Path:
+    here = Path(__file__).resolve()
+    for parent in list(here.parents)[:3]:
+        p = parent / "CHANGELOG.md"
+        if p.is_file():
+            return p
+    return here.parents[2] / "CHANGELOG.md"
+
+
+def _changelog_section(version: str) -> dict:
+    """提取指定版本的更新日志段落；找不到该版本则取最新一段（found=False）。"""
+    try:
+        text = _changelog_path().read_text(encoding="utf-8")
+    except OSError:
+        return {"version": version, "text": "", "found": False}
+    sections: list = []          # [(ver, body)]
+    cur_ver: str | None = None
+    cur_lines: list = []
+    for line in text.splitlines():
+        m = re.match(r"^##\s+\**\s*(?:main-)?v?([0-9][^\s*]*)", line)
+        if m:
+            if cur_ver is not None:
+                sections.append((cur_ver, "\n".join(cur_lines).strip()))
+            cur_ver, cur_lines = m.group(1), []
+        elif cur_ver is not None:
+            cur_lines.append(line)
+    if cur_ver is not None:
+        sections.append((cur_ver, "\n".join(cur_lines).strip()))
+    if not sections:
+        return {"version": version, "text": "", "found": False}
+    for ver, body in sections:
+        if ver == version:
+            return {"version": ver, "text": body, "found": True}
+    ver, body = sections[0]
+    return {"version": ver, "text": body, "found": False}
+
+
+@app.get("/api/update/changelog")
+def update_changelog(version: str = ""):
+    """当前版本（或 ?version= 指定版本）的更新内容，读随包 CHANGELOG.md。
+
+    UI 在「已是最新」时也渲染本接口内容——让用户始终看得见「改了什么」，
+    而不是只在有新版本时才有可见变化。"""
+    target = (version or "").strip() or VERSION
+    return {"current": VERSION, **_changelog_section(target)}
+
+
+@app.get("/api/update/status")
+def update_status():
+    """更新检查常驻状态（About 页状态行）：最近一次实际检查的时间与结果。
+
+    last_result：none（无更新）/ error（源不可用）/ prompt（发现新版本）
+                 —— 空串 = 尚未做过自动检查。"""
+    state = _read_update_check_state()
+    return {
+        "current": VERSION,
+        "last_check_date": state.get("last_check_date", ""),
+        "last_result": state.get("last_result", ""),
+        "last_error": state.get("last_error", ""),
+        "prompted_version": state.get("prompted_version", ""),
+    }
+
+
 @app.get("/api/update/daily-check")
 def update_daily_check():
     """每日首次启动自动检查更新。前端 init() 调用，返回是否需要弹更新提示窗。
@@ -212,16 +282,22 @@ def update_daily_check():
     # 执行检查（失败也记录当天已查，避免反复请求坏源）。
     # 0.1.39.1：「检查失败」与「无更新」区分开返回——两者都静默的话
     # 用户完全感知不到自动检查的存在（被误认为功能没实现）。
+    # 0.1.39.2：结果同时落 state 的 last_result/last_error，
+    # 供 About 页常驻状态行展示（/api/update/status）。
     try:
         result = updatesrc.check(cfgmod.load(), VERSION)
     except Exception as exc:
+        masked = updmod._mask_secrets(str(exc))[:160]
         state["last_check_date"] = today
+        state["last_result"] = "error"
+        state["last_error"] = masked
         _save_update_check_state(state)
-        return {"action": "error", "current": VERSION,
-                "error": updmod._mask_secrets(str(exc))[:160]}
+        return {"action": "error", "current": VERSION, "error": masked}
 
     if not result.get("has_update"):
         state["last_check_date"] = today
+        state["last_result"] = "none"
+        state["last_error"] = ""
         _save_update_check_state(state)
         return {"action": "none", "current": result.get("current", VERSION)}
 
@@ -231,6 +307,8 @@ def update_daily_check():
     if (state.get("prompted_date") == today
             and state.get("prompted_version") == latest):
         state["last_check_date"] = today
+        state["last_result"] = "prompt"
+        state["last_error"] = ""
         _save_update_check_state(state)
         return {"action": "skip"}
 
@@ -238,6 +316,8 @@ def update_daily_check():
     state["last_check_date"] = today
     state["prompted_date"] = today
     state["prompted_version"] = latest
+    state["last_result"] = "prompt"
+    state["last_error"] = ""
     _save_update_check_state(state)
 
     return {
@@ -463,7 +543,7 @@ def config_put(req: ConfigPut):
 
 # ------------------------------------------------------------ 目录/授权
 
-AUTH_HINT = ("到 应用中心 → 飞牛下载助手 → 应用设置 → 授权目录 授予该目录读写权限"
+AUTH_HINT = ("到 应用中心 → 批量下载助手 → 应用设置 → 授权目录 授予该目录读写权限"
              "（fnOS 系统机制）。下载文件由引擎写入，若引擎报目录不可写，"
              "还需在对应引擎（迅雷插件 / aria2）自身的设置里确认该目录可写。")
 
