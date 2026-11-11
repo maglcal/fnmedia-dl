@@ -14,12 +14,17 @@
 set -uo pipefail
 
 LOG="${FNDL_LOG:-/tmp/fnmedia-dl.log}"
-log(){ echo "[deps] $*" >> "$LOG" 2>&1 || true; }
+# 双日志：主日志 + /tmp 兜底（FNDL_LOG 不可写或未导出时仍留痕）
+TRACE="/tmp/fnmedia-dl-bootstrap-trace.log"
+log(){ echo "[deps] $*" >> "$LOG" 2>&1 || true; echo "[deps] $*" >> "$TRACE" 2>&1 || true; }
 
 # ---- 诊断头：无论成败都在日志开头留痕，下次失败一眼定案 ----
 log "===== 依赖引导开始 $(date '+%F %T') ====="
+log "脚本路径: ${BASH_SOURCE[0]}"
+log "工作目录: $(pwd)"
 log "系统: $(uname -srm 2>/dev/null || echo unknown)"
 log "python3: $(command -v python3 2>/dev/null || echo 'NOT FOUND') | $(python3 -V 2>&1 || echo '无版本信息')"
+log "FNDL_LOG=${FNDL_LOG:-<未设置>} LOG=${LOG}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || { echo "无法进入应用目录" >&2; exit 1; }
