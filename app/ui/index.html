@@ -21,8 +21,189 @@
 </script>
 <link rel="icon" type="image/png" href="static/favicon.png">
 <link rel="stylesheet" href="static/app.css?v=@VERSION@">
+<style>
+/* ============================================================
+   启动加载页（Startup Screen · Sky Edition）——每次打开管理页播放一次
+   类名全部 sl- 前缀、样式限定 #startupScreen 作用域，不与 app.css 交叉
+   ============================================================ */
+#startupScreen{
+  --sky-strong: oklch(52% 0.14 232);
+  --sky-600: oklch(58% 0.13 232);
+  --sky-500: oklch(68% 0.13 232);
+  --sky-400: oklch(78% 0.10 232);
+  --sky-200: oklch(90% 0.06 232);
+  --ink-900: oklch(24% 0.02 245);
+  --ink-500: oklch(50% 0.015 245);
+  --ink-400: oklch(62% 0.012 245);
+  --bg-top: oklch(95.5% 0.035 232);
+  --bg-mid: oklch(98% 0.012 232);
+  --bg-btm: oklch(99.3% 0.003 235);
+  --ok: oklch(58% 0.11 175);
+  --ff: "HarmonyOS Sans SC","MiSans","PingFang SC","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+  --f-num: "Bahnschrift","Segoe UI Variable Display","DIN Alternate","Segoe UI",system-ui,sans-serif;
+  --ease: cubic-bezier(.22,1,.36,1);
+  position:fixed;inset:0;z-index:10000;overflow:hidden;
+  font-family:var(--ff);color:var(--ink-900);
+  background:linear-gradient(180deg,var(--bg-top) 0%,var(--bg-mid) 52%,var(--bg-btm) 100%);
+  -webkit-font-smoothing:antialiased;
+  transition:opacity .55s ease;
+}
+#startupScreen.sl-done{opacity:0;pointer-events:none}
+
+/* ---- 背景氛围：漂浮光斑 + 细点阵（轻，不抢内容） ---- */
+#startupScreen .sl-blobs{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+#startupScreen .sl-blob{position:absolute;border-radius:50%;filter:blur(60px);opacity:.5}
+#startupScreen .sl-b1{width:52vw;height:52vw;left:-12vw;top:-18vw;background:radial-gradient(circle,oklch(88% 0.09 232),transparent 68%);animation:slDrift 22s ease-in-out infinite alternate}
+#startupScreen .sl-b2{width:44vw;height:44vw;right:-10vw;top:26vh;background:radial-gradient(circle,oklch(92% 0.07 200),transparent 68%);animation:slDrift 26s ease-in-out infinite alternate-reverse}
+#startupScreen .sl-b3{width:38vw;height:38vw;left:16vw;bottom:-16vw;background:radial-gradient(circle,oklch(93% 0.05 250),transparent 68%);animation:slDrift 30s ease-in-out infinite alternate}
+@keyframes slDrift{
+  from{transform:translate3d(0,0,0) scale(1)}
+  to{transform:translate3d(3vw,-2.5vh,0) scale(1.07)}
+}
+#startupScreen .sl-dots{position:absolute;inset:0;pointer-events:none;opacity:.5;
+  background-image:radial-gradient(oklch(72% 0.06 232 / .14) 1px,transparent 1px);
+  background-size:26px 26px;
+  -webkit-mask-image:radial-gradient(72% 62% at 50% 42%,#000 0%,transparent 100%);
+  mask-image:radial-gradient(72% 62% at 50% 42%,#000 0%,transparent 100%);
+}
+
+/* ---- 主舞台 ---- */
+#startupScreen .sl-stage{
+  position:relative;height:100%;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  padding:clamp(20px,4vw,48px);text-align:center;
+}
+
+/* 顶部品牌 */
+#startupScreen .sl-brand{display:flex;align-items:center;gap:11px;position:absolute;top:max(clamp(22px,4vh,40px),env(safe-area-inset-top));left:50%;
+  animation:slRiseCenter .8s .1s both}
+#startupScreen .sl-mark{width:34px;height:34px;border-radius:10px;display:block;
+  box-shadow:0 4px 14px oklch(68% 0.13 232 / .35)}
+#startupScreen .sl-brand-name{font-size:15px;font-weight:600;letter-spacing:.12em}
+#startupScreen .sl-brand-sub{font-family:var(--f-num);font-size:9px;letter-spacing:.32em;text-transform:uppercase;color:var(--ink-400);line-height:1.4}
+
+/* 中央 Hero */
+#startupScreen .sl-eyebrow{font-family:var(--f-num);font-size:11px;letter-spacing:.52em;text-transform:uppercase;
+  color:var(--sky-600);margin-bottom:clamp(14px,2.4vh,26px);animation:slRise .9s .25s both}
+#startupScreen .sl-eyebrow .sl-live{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--sky-500);
+  margin-right:10px;vertical-align:1px;animation:slPulse 2s ease-in-out infinite}
+#startupScreen .sl-title{font-size:clamp(36px,10.5vw,104px);font-weight:600;line-height:1.04;letter-spacing:.04em;
+  animation:slTitleIn 1.1s .35s var(--ease) both}
+#startupScreen .sl-title .sl-t2{background:linear-gradient(105deg,var(--sky-600),var(--sky-400));
+  -webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent}
+#startupScreen .sl-sub{margin-top:clamp(12px,2vh,22px);font-size:clamp(13px,1.7vw,17px);letter-spacing:.34em;color:var(--ink-500);
+  animation:slRise 1s .6s both}
+#startupScreen .sl-sub b{font-weight:500;color:var(--ink-900)}
+
+/* 进度区 */
+#startupScreen .sl-progress-wrap{width:min(560px,82vw);margin-top:clamp(30px,5vh,52px);animation:slRise 1s .78s both}
+#startupScreen .sl-p-meta{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px}
+#startupScreen .sl-p-pct{font-family:var(--f-num);font-variant-numeric:tabular-nums;font-size:clamp(30px,4.6vw,44px);
+  font-weight:600;color:var(--sky-600);line-height:1}
+#startupScreen .sl-p-pct small{font-size:.42em;color:var(--ink-500);margin-left:2px;font-weight:400}
+#startupScreen .sl-p-time{font-family:var(--f-num);font-variant-numeric:tabular-nums;font-size:12px;letter-spacing:.22em;color:var(--ink-400)}
+#startupScreen .sl-bar{position:relative;height:8px;border-radius:99px;background:oklch(91% 0.035 232);overflow:hidden}
+#startupScreen .sl-fill{position:absolute;inset:0;width:0%;border-radius:99px;
+  background:linear-gradient(90deg,var(--sky-400),var(--sky-strong) 70%,var(--sky-600));
+  transition:width .35s var(--ease)}
+#startupScreen .sl-fill::after{content:"";position:absolute;inset:0;border-radius:99px;
+  background:linear-gradient(100deg,transparent 30%,oklch(99% 0.005 232 / .55) 50%,transparent 70%);
+  background-size:220% 100%;animation:slShimmer 1.8s linear infinite}
+#startupScreen .sl-fill.done::after{animation:none;background:none}
+#startupScreen .sl-fill.done{box-shadow:0 0 18px oklch(68% 0.13 232 / .55)}
+@keyframes slShimmer{from{background-position:180% 0}to{background-position:-80% 0}}
+
+/* 步骤（呼应启动节奏） */
+#startupScreen .sl-steps{display:flex;justify-content:center;gap:clamp(14px,3vw,34px);margin-top:clamp(28px,4.6vh,46px);
+  list-style:none;flex-wrap:wrap;animation:slRise 1s .95s both}
+#startupScreen .sl-step{display:flex;align-items:center;gap:8px;font-family:var(--f-num);font-size:11px;
+  letter-spacing:.22em;text-transform:uppercase;color:var(--ink-400);transition:color .45s ease}
+#startupScreen .sl-step i{width:7px;height:7px;border-radius:50%;background:oklch(88% 0.02 232);flex:none;
+  transition:background-color .45s ease,box-shadow .45s ease}
+#startupScreen .sl-step.on{color:var(--ink-900)}
+#startupScreen .sl-step.on i{background:var(--sky-500);box-shadow:0 0 0 4px oklch(90% 0.06 232 / .6)}
+#startupScreen .sl-step.done{color:var(--ink-500)}
+#startupScreen .sl-step.done i{background:var(--ok);box-shadow:none}
+
+/* 底部 */
+#startupScreen .sl-foot{position:absolute;bottom:max(clamp(22px,4vh,40px),env(safe-area-inset-bottom));left:0;right:0;
+  font-family:var(--f-num);font-size:10px;letter-spacing:.34em;text-transform:uppercase;color:var(--ink-400);
+  animation:slRise 1s 1.1s both}
+
+/* 入场 */
+@keyframes slRise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@keyframes slTitleIn{from{opacity:0;transform:translateY(18px);filter:blur(8px)}to{opacity:1;transform:none;filter:blur(0)}}
+@keyframes slPulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes slRiseCenter{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
+
+@media (max-width:640px){
+  #startupScreen .sl-title{letter-spacing:.02em}
+  #startupScreen .sl-steps{gap:12px 18px}
+  #startupScreen .sl-sub{letter-spacing:.22em}
+}
+@media (max-width:400px){
+  #startupScreen .sl-title{letter-spacing:.01em}
+  #startupScreen .sl-step{font-size:10px;letter-spacing:.14em}
+  #startupScreen .sl-p-time{letter-spacing:.12em}
+}
+/* 短屏（手机横屏等）：压缩垂直节奏，保证一屏完整呈现 */
+@media (max-height:560px){
+  #startupScreen .sl-brand-sub{display:none}
+  #startupScreen .sl-eyebrow{margin-bottom:8px}
+  #startupScreen .sl-title{font-size:clamp(28px,7.2vh,54px)}
+  #startupScreen .sl-sub{margin-top:8px;font-size:12px;letter-spacing:.18em}
+  #startupScreen .sl-progress-wrap{margin-top:16px}
+  #startupScreen .sl-p-pct{font-size:26px}
+  #startupScreen .sl-steps{margin-top:14px}
+  #startupScreen .sl-foot{font-size:9px}
+}
+
+@media (prefers-reduced-motion:reduce){
+  #startupScreen *,#startupScreen *::before,#startupScreen *::after{animation-duration:.01ms !important;transition-duration:.01ms !important}
+}
+</style>
 </head>
 <body>
+
+<!-- 启动加载页：每次打开管理页播放一次，播完淡出交棒主界面 -->
+<div id="startupScreen">
+  <div class="sl-blobs" aria-hidden="true">
+    <div class="sl-blob sl-b1"></div><div class="sl-blob sl-b2"></div><div class="sl-blob sl-b3"></div>
+  </div>
+  <div class="sl-dots" aria-hidden="true"></div>
+
+  <div class="sl-stage">
+    <div class="sl-brand">
+      <img class="sl-mark" src="static/icon.png" alt="">
+      <div style="text-align:left">
+        <div class="sl-brand-name">批量下载助手</div>
+        <div class="sl-brand-sub">Batch Downloader</div>
+      </div>
+    </div>
+
+    <p class="sl-eyebrow"><span class="sl-live" aria-hidden="true"></span>Loading · 正在启动</p>
+    <h1 class="sl-title"><span class="sl-t1">批量下载</span><span class="sl-t2">助手</span></h1>
+    <p class="sl-sub" id="slStatus" role="status">正在准备<b>下载环境</b></p>
+
+    <div class="sl-progress-wrap">
+      <div class="sl-p-meta">
+        <div class="sl-p-pct"><span id="slPct">0</span><small>%</small></div>
+        <div class="sl-p-time">T+ <span id="slTcode">00:00.00</span></div>
+      </div>
+      <div class="sl-bar" id="slBar" role="progressbar" aria-label="加载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="sl-fill" id="slFill"></div>
+      </div>
+      <ul class="sl-steps" id="slSteps">
+        <li class="sl-step"><i></i>连接服务器</li>
+        <li class="sl-step"><i></i>校验清单</li>
+        <li class="sl-step"><i></i>建立队列</li>
+        <li class="sl-step"><i></i>预热缓存</li>
+      </ul>
+    </div>
+
+    <div class="sl-foot">Startup Screen · Sky Edition &nbsp;·&nbsp; V1.0</div>
+  </div>
+</div>
 
 <header class="topbar">
   <div class="brand">
@@ -442,6 +623,75 @@ setTimeout(function () {
     document.body.appendChild(d);
   }
 }, 2500);
+</script>
+<script>
+/* 启动加载页动画：前快后稳的收敛进度 + 四步依次点亮，播完淡出交给主界面 */
+(function () {
+  'use strict';
+  var scr = document.getElementById('startupScreen');
+  if (!scr) return;
+  var fill = document.getElementById('slFill');
+  var pctEl = document.getElementById('slPct');
+  var tcode = document.getElementById('slTcode');
+  var statusline = document.getElementById('slStatus');
+  var bar = document.getElementById('slBar');
+  var steps = Array.prototype.slice.call(document.querySelectorAll('#slSteps .sl-step'));
+
+  var DURATION = 3800;      // 总加载时长（ms）
+  var t0 = Date.now();
+  var finished = false;
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+  // 加速-收敛曲线：前快后稳，像真实加载
+  function easeOut(t) { return 1 - Math.pow(1 - t, 2.2); }
+
+  function frame() {
+    var el = Date.now() - t0;
+    var t = Math.min(1, el / DURATION);
+    var p = easeOut(t);
+
+    // 进度到 99% 前停一拍，最后补满（加载页的经典手感）
+    var shown = t < 1 ? Math.min(99, Math.floor(p * 100)) : 100;
+    pctEl.textContent = shown;
+    bar.setAttribute('aria-valuenow', shown);
+    fill.style.width = shown + '%';
+
+    // 时间码
+    var s = el / 1000;
+    tcode.textContent = pad(Math.floor(s / 60)) + ':' + pad(Math.floor(s % 60)) + '.' + pad(Math.floor((s % 1) * 100));
+
+    // 步骤推进：四步依次点亮
+    for (var i = 0; i < steps.length; i++) {
+      var onAt = (i + 1) / (steps.length + 1);
+      if (t >= onAt && !steps[i].classList.contains('done')) {
+        steps[i].classList.remove('on');
+        steps[i].classList.add('done');
+        if (steps[i + 1]) steps[i + 1].classList.add('on');
+      }
+    }
+    if (t > 0.02 && !steps[0].classList.contains('done') && !steps[0].classList.contains('on')) {
+      steps[0].classList.add('on');
+    }
+
+    if (t < 1) {
+      requestAnimationFrame(frame);
+    } else if (!finished) {
+      finished = true;
+      fill.style.width = '100%';
+      fill.classList.add('done');
+      steps.forEach(function (s2) { s2.classList.remove('on'); s2.classList.add('done'); });
+      statusline.innerHTML = '<b>准备就绪</b> · 即将进入下载台';
+      // 淡出交棒主界面，随后从 DOM 移除，避免遮挡后续交互
+      scr.classList.add('sl-done');
+      setTimeout(function () {
+        if (scr.parentNode) scr.parentNode.removeChild(scr);
+      }, 700);
+    }
+  }
+
+  requestAnimationFrame(frame);
+})();
 </script>
 </body>
 </html>
