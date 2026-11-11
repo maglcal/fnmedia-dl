@@ -39,7 +39,8 @@ DOWNLOAD_URL_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
 
 # 替换白名单：随新版本整体替换。state/ 与 .venv/ 永不在列（凭据/任务记录/运行环境）。
 REPLACE_ENTRIES = ("app", "deploy", "packaging", "wheelhouse",
-                   "VERSION", "requirements.txt", "README.md", "LICENSE")
+                   "VERSION", "requirements.txt", "README.md", "LICENSE",
+                   "CHANGELOG.md")
 
 BACKUP_DIR = REPO_ROOT / ".update-backup"
 SERVICE_NAME = "fnmedia-dl.service"

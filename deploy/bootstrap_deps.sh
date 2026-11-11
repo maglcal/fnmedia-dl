@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fnmedia-dl 运行时依赖引导（被 install_callback / upgrade_callback 复用）。
 #
-# 目标：在“干净、可能无法直连 PyPI”的飞牛 NAS 上高成功率地准备 .venv。
+# 目标：在“干净、可能无法直连 PyPI”的fnOS NAS 上高成功率地准备 .venv。
 #   1) 创建独立 venv（系统 python3-venv 缺失时尝试 virtualenv / 自带 ensurepip 兜底）；
 #   2) 优先用随包内置的【离线 wheelhouse】安装（无需联网、无需编译）；
 #   3) 离线不全时，按国内镜像 → 官方源顺序在线兜底；

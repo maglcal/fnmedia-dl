@@ -1,5 +1,6 @@
 dist/
 .tools/
+.playwright-cli/
 packaging/fpk/.build/
 __pycache__/
 *.pyc

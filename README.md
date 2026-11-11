@@ -1,4 +1,4 @@
-# fnmedia-dl · 飞牛下载助手
+# fnmedia-dl · 批量下载助手
 
 NAS 多通道下载管理工具（fnOS 第三方应用）。批量解析磁力 / thunder / 直链 / 种子链接，
 统一任务面板管理下载进度，三通道下载引擎自动选择与失败降级：
@@ -34,7 +34,7 @@ NAS 多通道下载管理工具（fnOS 第三方应用）。批量解析磁力 /
 fnmedia-dl/
 ├── app/
 │   ├── serve.py            # 服务入口：uvicorn(UDS) + 桌面网关线程
-│   ├── webui_gateway.py    # 飞牛桌面 iframe 网关（/app/fnmedia-dl → app.sock）
+│   ├── webui_gateway.py    # fnOS 桌面 iframe 网关（/app/fnmedia-dl → app.sock）
 │   ├── main.py             # FastAPI：管理页 + JSON API
 │   ├── links.py            # 下载链接解析
 │   ├── downloader.py       # 派发调度（降级链 / 统一任务视图 / 记录）
@@ -61,7 +61,7 @@ bash packaging/fpk/build.sh          # 产出 dist/fnmedia-dl-main-v<版本>.fpk
 ```
 
 把 `.fpk` 上传到 fnOS 应用中心安装；安装向导需勾选同意免责声明。
-桌面/应用中心会出现「飞牛下载助手」入口（iframe 管理页）。
+桌面/应用中心会出现「批量下载助手」入口（iframe 管理页）。
 
 ### 方式二：手动部署
 
@@ -129,7 +129,7 @@ cd app && python serve.py --http 127.0.0.1:8787
    拉镜像、起容器、配面板地址（详见下一节）。注意此通道走套件端入口，
    任务数可能受每日配额限制。
    **支持范围**：仅「群晖套件系」面板（cnk3x/xunlei 的 Docker 版、群晖迅雷套件等）。
-   **应用中心官方原生迅雷（"飞牛社区版"）不支持本地直连**——它没有这套面板接口；
+   **应用中心官方原生迅雷（"fnOS 社区版"）不支持本地直连**——它没有这套面板接口；
    如需配合官方原生迅雷，请用**迅雷远程通道**（原生迅雷会把 NAS 注册为你迅雷账号的
    远程设备，远程通道可直接向它派发任务）。
 3. **aria2**：需 aria2 开启 RPC（`--enable-rpc --rpc-listen-port=6800`），有 RPC 密钥则一并填写。

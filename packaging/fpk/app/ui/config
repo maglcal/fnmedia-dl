@@ -1,7 +1,7 @@
 {
     ".url": {
         "fnmedia-dl.main": {
-            "title": "飞牛下载助手",
+            "title": "批量下载助手",
             "desc": "多通道下载 / 链接解析 / 任务管理",
             "icon": "images/icon_{0}.png",
             "type": "iframe",

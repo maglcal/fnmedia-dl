@@ -3,16 +3,10 @@
     "data-share": {
         "shares": [
             {
-                "name": "fnmedia-dl",
-                "permission": {
-                    "rw": ["fnmedia-dl"]
-                }
+                "name": "fnmedia-dl"
             },
             {
-                "name": "fnmedia-dl/downloads",
-                "permission": {
-                    "rw": ["fnmedia-dl"]
-                }
+                "name": "fnmedia-dl/downloads"
             }
         ]
     }

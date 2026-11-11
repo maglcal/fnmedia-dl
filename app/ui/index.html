@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>飞牛下载助手</title>
+<title>批量下载助手</title>
 <script>
 /* 挂载前缀自适应：桌面 iframe 挂在 /app/fnmedia-dl/ 下，开发模式挂 / 。
    设置 <base> 后所有相对路径（static/、api/）自动解析到正确前缀。
@@ -28,7 +28,7 @@
   <div class="brand">
     <img class="brand-icon" src="static/icon.png" alt="">
     <div>
-      <h1>飞牛下载助手 <span class="badge ver" id="appVersion">v…</span></h1>
+      <h1>批量下载助手 <span class="badge ver" id="appVersion">v…</span></h1>
       <span class="sub">多通道下载 · 链接解析 · 任务管理</span>
     </div>
   </div>
@@ -178,7 +178,7 @@
       <div class="auth-box">
         <p class="hint">下载文件由下载引擎写入。留空 = 引擎默认目录（推荐先这样跑通）。
           自定义 NAS 目录需引擎可写；如需本应用做目录检测，请到
-          <b>应用中心 → 飞牛下载助手 → 应用设置 → 授权目录</b> 授予读写权限。</p>
+          <b>应用中心 → 批量下载助手 → 应用设置 → 授权目录</b> 授予读写权限。</p>
         <p class="hint">已授权目录：<span id="authPaths">加载中…</span></p>
       </div>
     </div>
@@ -348,10 +348,10 @@
   <section id="tab-about" class="panel">
     <div class="card">
       <div class="card-head">
-        <h2>关于 飞牛下载助手</h2>
+        <h2>关于 批量下载助手</h2>
         <span class="badge ver" id="aboutVersion">v…</span>
       </div>
-      <p class="hint">fnmedia-dl —— 飞牛 OS 第三方下载插件。磁力 / thunder /
+      <p class="hint">fnmedia-dl —— fnOS 第三方下载插件。磁力 / thunder /
         直链 / 种子一站式解析派发，支持迅雷远程（P2SP 加速）、迅雷下载引擎、
         aria2 三通道，自动降级、任务统一管理。</p>
       <ul class="about-list">
@@ -369,8 +369,12 @@
         <a class="btn ghost" href="https://github.com/maglcal/fnmedia-dl/releases"
            target="_blank" rel="noreferrer">全部版本</a>
       </div>
+      <div id="updateAutoStatus" class="hint">自动检查更新：加载中…</div>
       <div id="diagResult" class="dir-status" hidden></div>
       <div id="updateStatus" class="dir-status" hidden></div>
+      <div id="updateNotes" class="update-notes">
+        <b>更新内容</b><br><span class="hint">加载中…</span>
+      </div>
       <div id="updateProgressBox" hidden>
         <div class="progress"><div id="updateProgressBar" style="width:0%"></div></div>
         <div class="progress-text">

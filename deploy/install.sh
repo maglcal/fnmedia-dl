@@ -53,7 +53,7 @@ systemctl restart fnmedia-dl.service
 sleep 4
 if systemctl is-active --quiet fnmedia-dl; then
   echo "[OK] fnmedia-dl 已安装并运行（ROOT=$ROOT）"
-  echo "[OK] 管理页：应用中心/桌面 打开「飞牛下载助手」"
+  echo "[OK] 管理页：应用中心/桌面 打开「批量下载助手」"
   echo "[OK] 卸载：bash $ROOT/deploy/uninstall.sh"
 else
   echo "ERROR: 服务未正常启动；journalctl -u fnmedia-dl -n 50" >&2

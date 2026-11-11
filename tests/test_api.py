@@ -511,6 +511,8 @@ class TestDailyCheck(unittest.TestCase):
                                    has_update=False, latest="0.1.0")):
             r = self.client.get("/api/update/daily-check")
         self.assertEqual(r.json()["action"], "none")
+        # 0.1.39.1：无更新也回传当前版本，前端给「已是最新版」反馈
+        self.assertEqual(r.json()["current"], "0.1.0")
 
     def test_same_version_same_day_no_repeat(self):
         """同一版本同一天只弹一次窗。"""
@@ -539,13 +541,16 @@ class TestDailyCheck(unittest.TestCase):
         self.assertEqual(r.json()["latest"], "0.3.0")
 
     def test_source_error_saves_check_date(self):
-        """更新源不可用也记 last_check_date（当天不反复请求坏源）。"""
+        """更新源不可用也记 last_check_date（当天不反复请求坏源）；
+        0.1.39.1：失败与无更新区分——返回 action=error 带原因。"""
         import datetime, json
         from unittest import mock
         with mock.patch.object(main.updatesrc, "check",
                                side_effect=Exception("network")):
             r = self.client.get("/api/update/daily-check")
-        self.assertEqual(r.json()["action"], "none")
+        body = r.json()
+        self.assertEqual(body["action"], "error")
+        self.assertIn("network", body["error"])
         st = json.loads(self._state_file().read_text())
         self.assertEqual(st["last_check_date"],
                          datetime.date.today().isoformat())
@@ -560,6 +565,140 @@ class TestDailyCheck(unittest.TestCase):
         import json
         st = json.loads(self._state_file().read_text(encoding="utf-8"))
         self.assertEqual(st["prompted_version"], "0.2.0")
+
+    # ---- 0.1.39.2：检查结果落 last_result/last_error，供常驻状态行展示 ----
+
+    def test_last_result_none_recorded(self):
+        import json
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               return_value=self._mock_result(
+                                   has_update=False, latest="0.1.0")):
+            self.client.get("/api/update/daily-check")
+        st = json.loads(self._state_file().read_text(encoding="utf-8"))
+        self.assertEqual(st["last_result"], "none")
+        self.assertEqual(st["last_error"], "")
+
+    def test_last_result_error_recorded(self):
+        import json
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               side_effect=Exception("boom")):
+            self.client.get("/api/update/daily-check")
+        st = json.loads(self._state_file().read_text(encoding="utf-8"))
+        self.assertEqual(st["last_result"], "error")
+        self.assertIn("boom", st["last_error"])
+
+    def test_last_result_prompt_recorded(self):
+        import json
+        from unittest import mock
+        with mock.patch.object(main.updatesrc, "check",
+                               return_value=self._mock_result()):
+            self.client.get("/api/update/daily-check")
+        st = json.loads(self._state_file().read_text(encoding="utf-8"))
+        self.assertEqual(st["last_result"], "prompt")
+
+
+class TestUpdateStatusChangelog(unittest.TestCase):
+    """/api/update/status 与 /api/update/changelog（0.1.39.2 可见性重设计）。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        td = Path(self._td.name)
+        self._orig = cfgmod.STATE_DIR, cfgmod.CONFIG_PATH
+        cfgmod.STATE_DIR = td
+        cfgmod.CONFIG_PATH = td / "config.json"
+        self.client = TestClient(main.app)
+
+    def tearDown(self):
+        cfgmod.STATE_DIR, cfgmod.CONFIG_PATH = self._orig
+        self._td.cleanup()
+
+    def test_status_empty_state(self):
+        r = self.client.get("/api/update/status")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["last_check_date"], "")
+        self.assertEqual(body["last_result"], "")
+        self.assertEqual(body["last_error"], "")
+        self.assertIn("current", body)
+
+    def test_status_reflects_state(self):
+        import datetime, json
+        today = datetime.date.today().isoformat()
+        (cfgmod.STATE_DIR / "update-check.json").write_text(json.dumps({
+            "last_check_date": today, "last_result": "error",
+            "last_error": "源不可用", "prompted_version": "0.2.0"}),
+            encoding="utf-8")
+        body = self.client.get("/api/update/status").json()
+        self.assertEqual(body["last_check_date"], today)
+        self.assertEqual(body["last_result"], "error")
+        self.assertEqual(body["last_error"], "源不可用")
+        self.assertEqual(body["prompted_version"], "0.2.0")
+
+    def test_changelog_current_version_section(self):
+        """无参调用返回当前版本段落（随包 CHANGELOG.md 提取）。"""
+        body = self.client.get("/api/update/changelog").json()
+        self.assertTrue(body["found"])
+        self.assertEqual(body["version"], body["current"])
+        self.assertTrue(body["text"].strip())
+        self.assertNotIn("##", body["text"])   # 段落正文不含下级标题行
+
+    def test_changelog_missing_version_falls_back_to_latest(self):
+        """指定不存在的版本 → 取最新一段，found=False。"""
+        body = self.client.get("/api/update/changelog",
+                               params={"version": "9.9.9"}).json()
+        self.assertFalse(body["found"])
+        self.assertTrue(body["text"].strip())
+        self.assertNotEqual(body["version"], "9.9.9")   # 回退到已有段落
+
+    def test_changelog_heading_parse(self):
+        """分段解析：提取正文不含其他版本的条目。"""
+        sec = main._changelog_section(main.VERSION)
+        self.assertTrue(sec["found"])
+        self.assertEqual(sec["version"], main.VERSION)
+
+
+class TestCompliancePins(unittest.TestCase):
+    """命名合规与可见性重设计的文件级钉子（0.1.39.2）。"""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_manifest_display_name(self):
+        text = (self.ROOT / "packaging" / "fpk" / "manifest.in").read_text(
+            encoding="utf-8")
+        self.assertIn("display_name          = 批量下载助手", text)
+        self.assertNotIn("飞牛下载助手", text)
+
+    def test_entry_title(self):
+        text = (self.ROOT / "packaging" / "fpk" / "app" / "ui" / "config").read_text(
+            encoding="utf-8")
+        self.assertIn("批量下载助手", text)
+        self.assertNotIn("飞牛下载助手", text)
+
+    def test_no_legacy_product_name(self):
+        """「飞牛下载助手」为旧产品名（违反命名规范），关键文件不得出现。"""
+        rels = ["app/ui/index.html", "app/ui/app.js", "app/ui/app.css",
+                "app/main.py", "app/xunlei_docker.py",
+                "packaging/fpk/manifest.in", "packaging/fpk/app/ui/config",
+                "packaging/fpk/wizard/install", "README.md"]
+        for rel in rels:
+            text = (self.ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotIn("飞牛下载助手", text, f"{rel} 残留旧产品名")
+
+    def test_update_status_markup(self):
+        html = (self.ROOT / "app" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="updateAutoStatus"', html)          # 常驻状态行
+        self.assertIn('<div id="updateNotes" class="update-notes">', html)
+        js = (self.ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("refreshUpdateStatus", js)
+        self.assertIn("refreshVersionNotes", js)
+
+    def test_changelog_file_shipped(self):
+        self.assertTrue((self.ROOT / "CHANGELOG.md").is_file())
+        text = (self.ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        # 当前版本必须有对应段落（/api/update/changelog 的数据源）
+        self.assertIn("## " + main.VERSION, text)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,14 @@
 # 应用中心 start/stop/status。
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; . "${SELF_DIR}/_common"
 case "${1:-}" in
-  start)  fndl_sync_paths; systemctl start fnmedia-dl.service 2>>"${FNDL_LOG}" || true; exit 0 ;;
+  start)
+    fndl_sync_paths
+    systemctl start fnmedia-dl.service 2>>"${FNDL_LOG}" || true
+    # 启动失败要把用户可见原因写 TRIM_TEMP_LOGFILE（官方规范），不能静默 exit 0
+    systemctl is-active --quiet fnmedia-dl.service \
+      || fndl_fail "批量下载助手启动失败：服务未进入运行状态，详细日志见 ${FNDL_LOG}"
+    exit 0
+    ;;
   stop)
     systemctl stop fnmedia-dl.service 2>>"${FNDL_LOG}" || true
     sleep 0.5
