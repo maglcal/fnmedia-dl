@@ -11,6 +11,7 @@
 #   FNDL_REQUIRE_NET=1   跳过离线、强制在线（排障用）
 #   FNDL_PIP_INDEX=URL   追加自定义 pip 源
 #   FNDL_LOG=路径        日志文件（由 _common 提供默认值）
+echo "[boot-trace] started $(date '+%F %T') pid=$$ args=$*" >> /tmp/fnmedia-dl-bootstrap-trace.log 2>/dev/null || true
 set -uo pipefail
 
 LOG="${FNDL_LOG:-/tmp/fnmedia-dl.log}"
@@ -129,4 +130,5 @@ then
 fi
 
 log "依赖就绪"
+echo "[boot-trace] completed $(date '+%F %T') exit=0" >> /tmp/fnmedia-dl-bootstrap-trace.log 2>/dev/null || true
 exit 0
