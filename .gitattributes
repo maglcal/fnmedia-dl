@@ -1,13 +1,6 @@
-# 强制 shell 脚本与生命周期脚本使用 LF（CRLF 会导致 bash \ 续行断裂）
-*.sh    text eol=lf
-packaging/fpk/cmd/*   text eol=lf
-*.py    text eol=lf
-*.html  text eol=lf
-*.css   text eol=lf
-*.js    text eol=lf
-*.md    text eol=lf
-*.json  text eol=lf
-*.in    text eol=lf
+# 兜底：所有文本统一 LF（CRLF 会导致 bash \ 续行断裂），
+# 二进制由 git 自动识别 + 下方显式标记双保险
+*       text=auto eol=lf
 
 # 二进制文件不转换
 *.whl   binary
