@@ -25,9 +25,9 @@ if [ "$need_deps" = "1" ]; then
   echo "[install] bootstrap exit=${BOOT_RC}" >> "${FNDL_LOG}" 2>&1 || true
   cat "${BOOT_LOG}" >> "${FNDL_LOG}" 2>&1 || true
   if [ "${BOOT_RC}" != "0" ]; then
-    tail -n 20 "${BOOT_LOG}" >&2 2>/dev/null || true
+    BOOT_TAIL="$(tail -n 8 "${BOOT_LOG}" 2>/dev/null | tr '\n' ' ' | tail -c 280)"
     rm -f "${BOOT_LOG}" 2>/dev/null || true
-    fndl_fail "Python 运行环境准备失败（exit=${BOOT_RC}），详见 ${FNDL_LOG}"
+    fndl_fail "Python 运行环境准备失败（exit=${BOOT_RC}）：${BOOT_TAIL}"
   fi
   rm -f "${BOOT_LOG}" 2>/dev/null || true
 fi

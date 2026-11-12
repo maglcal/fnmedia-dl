@@ -54,19 +54,33 @@ fi
 
 if [ ! -x "$PYBIN" ]; then
   log "创建虚拟环境 $VENV (python3 -> $(command -v python3) $(python3 -V 2>&1))"
-  if ! python3 -m venv "$VENV" >> "$LOG" 2>&1; then
-    log "python3 -m venv 失败，尝试 ensurepip / virtualenv 兜底"
+  # 清掉半残 .venv（上次升级中断留下的），避免 python3 -m venv 拒绝重建
+  [ -d "$VENV" ] && { log "发现残留 .venv 目录，清理后重建"; rm -rf "$VENV" 2>/dev/null || true; }
+  VENV_ERR="$(python3 -m venv "$VENV" 2>&1)"; VENV_RC=$?
+  [ -n "$VENV_ERR" ] && log "venv 创建输出: ${VENV_ERR}"
+  if [ "${VENV_RC}" != "0" ]; then
+    log "python3 -m venv 失败(rc=${VENV_RC})，尝试 ensurepip / virtualenv 兜底"
     python3 -m ensurepip --upgrade >> "$LOG" 2>&1 || true
-    if python3 -m venv "$VENV" >> "$LOG" 2>&1; then :; elif command -v virtualenv >/dev/null 2>&1; then
-      virtualenv -p python3 "$VENV" >> "$LOG" 2>&1
-    else
-      python3 -m pip install --user virtualenv >> "$LOG" 2>&1 || true
-      python3 -m virtualenv -p python3 "$VENV" >> "$LOG" 2>&1 \
-        || { log "FAIL exit=2 venv 创建全部失败"; echo "创建 venv 失败：请在应用中心或终端安装 python3-venv / python3-pip" >&2; exit 2; }
+    VENV_ERR="$(python3 -m venv "$VENV" 2>&1)"; VENV_RC=$?
+    [ -n "$VENV_ERR" ] && log "venv 二次尝试输出: ${VENV_ERR}"
+    if [ "${VENV_RC}" != "0" ]; then
+      if command -v virtualenv >/dev/null 2>&1; then
+        VENV_ERR="$(virtualenv -p python3 "$VENV" 2>&1)"; VENV_RC=$?
+        [ -n "$VENV_ERR" ] && log "virtualenv 输出: ${VENV_ERR}"
+      else
+        python3 -m pip install --user virtualenv >> "$LOG" 2>&1 || true
+        VENV_ERR="$(python3 -m virtualenv -p python3 "$VENV" 2>&1)"; VENV_RC=$?
+        [ -n "$VENV_ERR" ] && log "python3 -m virtualenv 输出: ${VENV_ERR}"
+      fi
     fi
   fi
 fi
-[ -x "$PYBIN" ] || { log "FAIL exit=2 venv python 不可执行: $PYBIN"; echo "虚拟环境 python 不可用" >&2; exit 2; }
+[ -x "$PYBIN" ] || {
+  log "FAIL exit=2 venv python 不可执行: $PYBIN (venv_rc=${VENV_RC:-N/A})"
+  [ -n "${VENV_ERR:-}" ] && log "最后错误输出: ${VENV_ERR}"
+  echo "创建 venv 失败（rc=${VENV_RC:-N/A}）：${VENV_ERR:-请在应用中心安装 python3-venv}" >&2
+  exit 2
+}
 
 # pip 基础参数：安静、不超时太死、必要时信任国内镜像 http/自签
 PIP_BASE=(--disable-pip-version-check --retries 2 --timeout 25)
