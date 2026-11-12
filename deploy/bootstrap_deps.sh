@@ -11,10 +11,21 @@
 #   FNDL_REQUIRE_NET=1   跳过离线、强制在线（排障用）
 #   FNDL_PIP_INDEX=URL   追加自定义 pip 源
 #   FNDL_LOG=路径        日志文件（由 _common 提供默认值）
+echo "[boot-trace] started $(date '+%F %T') pid=$$ args=$*" >> /tmp/fnmedia-dl-bootstrap-trace.log 2>/dev/null || true
 set -uo pipefail
 
 LOG="${FNDL_LOG:-/tmp/fnmedia-dl.log}"
-log(){ echo "[deps] $*" >> "$LOG" 2>&1 || true; }
+# 双日志：主日志 + /tmp 兜底（FNDL_LOG 不可写或未导出时仍留痕）
+TRACE="/tmp/fnmedia-dl-bootstrap-trace.log"
+log(){ echo "[deps] $*" >> "$LOG" 2>&1 || true; echo "[deps] $*" >> "$TRACE" 2>&1 || true; }
+
+# ---- 诊断头：无论成败都在日志开头留痕，下次失败一眼定案 ----
+log "===== 依赖引导开始 $(date '+%F %T') ====="
+log "脚本路径: ${BASH_SOURCE[0]}"
+log "工作目录: $(pwd)"
+log "系统: $(uname -srm 2>/dev/null || echo unknown)"
+log "python3: $(command -v python3 2>/dev/null || echo 'NOT FOUND') | $(python3 -V 2>&1 || echo '无版本信息')"
+log "FNDL_LOG=${FNDL_LOG:-<未设置>} LOG=${LOG}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || { echo "无法进入应用目录" >&2; exit 1; }
@@ -43,25 +54,52 @@ fi
 
 if [ ! -x "$PYBIN" ]; then
   log "创建虚拟环境 $VENV (python3 -> $(command -v python3) $(python3 -V 2>&1))"
-  if ! python3 -m venv "$VENV" >> "$LOG" 2>&1; then
-    log "python3 -m venv 失败，尝试 ensurepip / virtualenv 兜底"
+  # 清掉半残 .venv（上次升级中断留下的），避免 python3 -m venv 拒绝重建
+  [ -d "$VENV" ] && { log "发现残留 .venv 目录，清理后重建"; rm -rf "$VENV" 2>/dev/null || true; }
+  VENV_ERR="$(python3 -m venv "$VENV" 2>&1)"; VENV_RC=$?
+  [ -n "$VENV_ERR" ] && log "venv 创建输出: ${VENV_ERR}"
+  if [ "${VENV_RC}" != "0" ]; then
+    log "python3 -m venv 失败(rc=${VENV_RC})，尝试 ensurepip / virtualenv 兜底"
     python3 -m ensurepip --upgrade >> "$LOG" 2>&1 || true
-    if python3 -m venv "$VENV" >> "$LOG" 2>&1; then :; elif command -v virtualenv >/dev/null 2>&1; then
-      virtualenv -p python3 "$VENV" >> "$LOG" 2>&1
-    else
-      python3 -m pip install --user virtualenv >> "$LOG" 2>&1 || true
-      python3 -m virtualenv -p python3 "$VENV" >> "$LOG" 2>&1 \
-        || { echo "创建 venv 失败：请在应用中心或终端安装 python3-venv / python3-pip" >&2; exit 2; }
+    VENV_ERR="$(python3 -m venv "$VENV" 2>&1)"; VENV_RC=$?
+    [ -n "$VENV_ERR" ] && log "venv 二次尝试输出: ${VENV_ERR}"
+    if [ "${VENV_RC}" != "0" ]; then
+      if command -v virtualenv >/dev/null 2>&1; then
+        VENV_ERR="$(virtualenv -p python3 "$VENV" 2>&1)"; VENV_RC=$?
+        [ -n "$VENV_ERR" ] && log "virtualenv 输出: ${VENV_ERR}"
+      else
+        python3 -m pip install --user virtualenv >> "$LOG" 2>&1 || true
+        VENV_ERR="$(python3 -m virtualenv -p python3 "$VENV" 2>&1)"; VENV_RC=$?
+        [ -n "$VENV_ERR" ] && log "python3 -m virtualenv 输出: ${VENV_ERR}"
+      fi
     fi
   fi
 fi
-[ -x "$PYBIN" ] || { echo "虚拟环境 python 不可用" >&2; exit 2; }
+[ -x "$PYBIN" ] || {
+  log "FAIL exit=2 venv python 不可执行: $PYBIN (venv_rc=${VENV_RC:-N/A})"
+  [ -n "${VENV_ERR:-}" ] && log "最后错误输出: ${VENV_ERR}"
+  echo "创建 venv 失败（rc=${VENV_RC:-N/A}）：${VENV_ERR:-请在应用中心安装 python3-venv}" >&2
+  exit 2
+}
 
 # pip 基础参数：安静、不超时太死、必要时信任国内镜像 http/自签
 PIP_BASE=(--disable-pip-version-check --retries 2 --timeout 25)
 
-# ---------- 2. 离线 wheelhouse 优先 ----------
 WHEELHOUSE="$ROOT/wheelhouse"
+
+# ---- pip 自更新兜底：旧 pip（<21）可能无法解析新版 wheel 元数据 ----
+# 若 wheelhouse 带了新版 pip wheel，先离线自更新，避免后续安装因 pip 太旧而失败。
+if [ "${FNDL_REQUIRE_NET:-0}" != "1" ] && [ -d "$WHEELHOUSE" ]; then
+  PIP_WHEEL="$(ls "$WHEELHOUSE"/pip-*.whl 2>/dev/null | head -n1)"
+  if [ -n "$PIP_WHEEL" ]; then
+    log "检测到内置 pip wheel，尝试离线自更新 pip（兜旧版 pip 元数据解析）"
+    "$PIP" install "${PIP_BASE[@]}" --no-index --find-links "$WHEELHOUSE" --upgrade pip >> "$LOG" 2>&1 \
+      && log "pip 自更新成功（$("$PIP" --version 2>&1 | head -n1)）" \
+      || log "pip 自更新失败（不影响后续，继续尝试安装）"
+  fi
+fi
+
+# ---------- 2. 离线 wheelhouse 优先 ----------
 offline_ok=0
 if [ "${FNDL_REQUIRE_NET:-0}" != "1" ] && [ -d "$WHEELHOUSE" ]; then
   if ls "$WHEELHOUSE"/*.whl >/dev/null 2>&1; then
@@ -88,7 +126,7 @@ if [ "$offline_ok" != "1" ]; then
     fi
     log "源失败：$idx"
   done
-  [ "$installed" = "1" ] || { echo "依赖在线安装全部失败（已尝试内置离线包与多个镜像）" >&2; exit 3; }
+  [ "$installed" = "1" ] || { log "FAIL exit=3 在线安装全部镜像失败（离线也未成功）"; echo "依赖在线安装全部失败（已尝试内置离线包与多个镜像）" >&2; exit 3; }
 fi
 
 # ---------- 4. 真实 import 自检 ----------
@@ -100,9 +138,11 @@ print("[deps] import OK:",
       "httpx", httpx.__version__)
 PY
 then
+  log "FAIL exit=4 import 自检失败（平台/Python 版本不兼容）"
   echo "依赖已安装但自检 import 失败（平台/Python 版本不兼容）" >&2
   exit 4
 fi
 
 log "依赖就绪"
+echo "[boot-trace] completed $(date '+%F %T') exit=0" >> /tmp/fnmedia-dl-bootstrap-trace.log 2>/dev/null || true
 exit 0

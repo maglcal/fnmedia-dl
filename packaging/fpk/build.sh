@@ -57,6 +57,31 @@ print("[fpk] stage 复制完成（python fallback）")
 PYSTAGE
 fi
 
+# ---- 强制 LF：Windows 打包环境会把 CRLF 混进 shell 脚本，导致 bash \ 续行断裂 ----
+PYBIN="${PYTHON:-python3}"; command -v "${PYBIN}" >/dev/null 2>&1 || PYBIN=python
+"${PYBIN}" - "${STAGE}" <<'PYCRLF'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+TEXT_EXT = {'.sh', '.py', '.html', '.css', '.js', '.md', '.json', '.txt', '.in', '.yml', '.yaml', '.toml', '.cfg'}
+count = 0
+for f in root.rglob('*'):
+    if not f.is_file():
+        continue
+    if f.suffix.lower() not in TEXT_EXT and f.parent.name != 'cmd':
+        # 无扩展名文本（wizard/install、config/resource、ui/config、LICENSE 等）
+        # 用 UTF-8 可解码性判定；二进制（wheel/PNG）均带扩展名不会进来
+        try:
+            f.read_bytes().decode('utf-8')
+        except (UnicodeDecodeError, OSError):
+            continue
+    data = f.read_bytes()
+    if b'\r\n' in data or (b'\r' in data and b'\n' in data):
+        f.write_bytes(data.replace(b'\r\n', b'\n').replace(b'\r', b'\n'))
+        count += 1
+print(f"[fpk] CRLF 清理完成（{count} 个文件）")
+PYCRLF
+
 # 版本号段数判定（用户定规范）：三段=正式发布版 main-vX.Y.Z，四段=分支测试版 vX.Y.Z.x
 SEG_COUNT="$(echo "${VERSION}" | awk -F. '{print NF}')"
 if [ "${SEG_COUNT}" -ge 4 ]; then

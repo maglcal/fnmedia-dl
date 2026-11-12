@@ -1,0 +1,10 @@
+# 兜底：所有文本统一 LF（CRLF 会导致 bash \ 续行断裂），
+# 二进制由 git 自动识别 + 下方显式标记双保险
+*       text=auto eol=lf
+
+# 二进制文件不转换
+*.whl   binary
+*.fpk   binary
+*.png   binary
+*.ico   binary
+*.tgz   binary

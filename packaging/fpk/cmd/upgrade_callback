@@ -16,11 +16,25 @@ need_deps=1
 if [ -x ".venv/bin/python" ] && .venv/bin/python -c 'import fastapi,uvicorn,httpx' >/dev/null 2>&1; then
   need_deps=0
 fi
+# 诊断留痕：定位「脚本找不到」类问题
+{
+  echo "[upgrade] $(date '+%F %T') PWD=$(pwd) FNDL_REPO_DIR=${FNDL_REPO_DIR}"
+  echo "[upgrade] deploy/ listing: $(ls deploy/ 2>&1 | tr '\n' ' ')"
+  echo "[upgrade] bootstrap_deps.sh exists: $(test -f deploy/bootstrap_deps.sh && echo YES || echo NO)"
+  echo "[upgrade] .venv python: $(test -x .venv/bin/python && echo YES || echo NO)  need_deps=${need_deps}"
+} >> "${FNDL_LOG}" 2>&1 || true
 if [ "$need_deps" = "1" ]; then
-  bash deploy/bootstrap_deps.sh || {
-    tail -n 14 "${FNDL_LOG}" >&2 2>/dev/null || true
-    fndl_fail "Python 运行环境准备失败（已尝试内置离线包与多个国内镜像），详见 ${FNDL_LOG}"
-  }
+  BOOT_LOG="$(mktemp /tmp/fndl-boot.XXXXXX 2>/dev/null || echo /tmp/fndl-boot.log)"
+  bash "${FNDL_REPO_DIR}/deploy/bootstrap_deps.sh" > "${BOOT_LOG}" 2>&1
+  BOOT_RC=$?
+  echo "[upgrade] bootstrap exit=${BOOT_RC}" >> "${FNDL_LOG}" 2>&1 || true
+  cat "${BOOT_LOG}" >> "${FNDL_LOG}" 2>&1 || true
+  if [ "${BOOT_RC}" != "0" ]; then
+    BOOT_TAIL="$(tail -n 8 "${BOOT_LOG}" 2>/dev/null | tr '\n' ' ' | tail -c 280)"
+    rm -f "${BOOT_LOG}" 2>/dev/null || true
+    fndl_fail "Python 运行环境准备失败（exit=${BOOT_RC}）：${BOOT_TAIL}"
+  fi
+  rm -f "${BOOT_LOG}" 2>/dev/null || true
 fi
 bash deploy/install.sh >> "${FNDL_LOG}" 2>&1 || {
   tail -n 12 "${FNDL_LOG}" >&2 || true
