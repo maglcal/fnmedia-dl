@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import config as cfgmod
+import filelock
 
 _FILE_LOCK = threading.Lock()
 
@@ -59,14 +60,16 @@ class QuotaTracker:
 
     def note_engine_create(self) -> None:
         """引擎通道成功创建任务：当日计数 +1。"""
-        with _FILE_LOCK:
+        # P0-2：threading.Lock 只护本进程；配额读-改-写整段进文件锁，
+        # 防升级重启窗口两进程并存时互相覆盖计数/标记。
+        with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             data["engine_creates"] = int(data.get("engine_creates", 0)) + 1
             self._save(data)
 
     def note_engine_quota_hit(self) -> None:
         """引擎通道撞每日配额：标记今日已满。"""
-        with _FILE_LOCK:
+        with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             data["engine_blocked"] = True
             self._save(data)

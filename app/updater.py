@@ -11,9 +11,15 @@
 安全边界：
   - 只接受官方 GitHub Releases 与「用户已配置镜像源」的 .fpk 地址
     （validate_asset_url，镜像前缀由 main 依配置传入）；
+  - 重定向逐跳手动跟随（≤5 跳）：跳点主机限「候选源主机 ∪ GitHub 资产
+    主机」白名单、scheme 限 http/https，防合法源 302 跳去任意主机绕过
+    地址校验；单文件下载上限 512MB（download_fpk）；
+  - SHA256 fail-closed：清单缺校验值直接拒绝下载（allow_unverified 仅
+    「用户手动输入地址」通道显式豁免）；
   - 只替换白名单条目（app/deploy/packaging/wheelhouse/VERSION 等），
     state/（配置、凭据、任务记录）与 .venv/ 永不触碰；
-  - 替换前整份备份到 <repo>/.update-backup/，失败即回滚；
+  - 替换前整份备份到 <repo>/.update-backup/，失败即回滚；替换/回滚均
+    经 staging 后改名顶替（_swap_in），不留半覆盖窗口；
   - requirements.txt 变更时才重建运行环境（离线 wheelhouse 优先）。
 """
 from __future__ import annotations
@@ -28,6 +34,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -36,6 +43,12 @@ from updatesrc import strip_ver
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GITHUB_REPO = "maglcal/fnmedia-dl"
 DOWNLOAD_URL_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
+# 重定向白名单主机：GitHub 下载链路（github.com → 资产主机）恒可信；
+# 镜像源主机由调用方按候选 URL 并入（download_fpk 内部再并本 URL 主机）。
+GITHUB_HOSTS = ("github.com", "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com")
+MAX_REDIRECTS = 5
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
 # 替换白名单：随新版本整体替换。state/ 与 .venv/ 永不在列（凭据/任务记录/运行环境）。
 REPLACE_ENTRIES = ("app", "deploy", "packaging", "wheelhouse",
@@ -163,63 +176,112 @@ def backup_entries(entries: tuple[str, ...] = REPLACE_ENTRIES) -> Path:
     return BACKUP_DIR
 
 
+def _swap_in(src: Path, dst: Path) -> None:
+    """staging 后原子改名顶替（P0-3）。
+
+    旧实现是「rmtree(dst) → copytree(src, dst)」——中间任何时刻挂掉/断电
+    都留下半覆盖目录，运行中的服务随即崩在残缺代码上。改为：
+    ① 整条目复制到旁路 staging（.名.fndl-new）；② 原 dst 改名挪到
+    .名.fndl-old；③ staging 改名顶替。改名是原子操作，任何时刻
+    dst 要么是旧版要么是完整新版。"""
+    staging = dst.parent / f".{dst.name}.fndl-new"
+    old = dst.parent / f".{dst.name}.fndl-old"
+    for p in (staging, old):
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            p.unlink()
+    if src.is_dir():
+        shutil.copytree(src, staging)
+    else:
+        shutil.copy2(src, staging)
+    if dst.exists():
+        os.replace(dst, old)          # 旧版完整挪开（rename 原子）
+    os.replace(staging, dst)          # 新版整体顶替（rename 原子）
+    for p in (old,):                  # 顶替成功后清掉旧版
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            p.unlink()
+
+
 def apply_tree(new_tree: Path) -> None:
-    """白名单替换：只动 REPLACE_ENTRIES 内条目，其余（state/.venv 等）绝不触碰。"""
+    """白名单替换：只动 REPLACE_ENTRIES 内条目，其余（state/.venv 等）绝不触碰。
+    每条目经 _swap_in 原子顶替，不留半覆盖窗口。"""
     for name in REPLACE_ENTRIES:
         src = new_tree / name
         if not src.exists():
             continue
-        dst = REPO_ROOT / name
-        if src.is_dir():
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy2(src, dst)
+        _swap_in(src, REPO_ROOT / name)
 
 
 def rollback() -> None:
-    """从 .update-backup/ 整体恢复白名单条目（替换失败后的兜底）。"""
+    """从 .update-backup/ 整体恢复白名单条目（替换失败后的兜底），
+    与 apply_tree 同用 _swap_in 原子顶替。"""
     for name in REPLACE_ENTRIES:
         bak = BACKUP_DIR / name
         if not bak.exists():
             continue
-        dst = REPO_ROOT / name
-        if dst.is_dir():
-            shutil.rmtree(dst)
-        elif dst.exists():
-            dst.unlink()
-        if bak.is_dir():
-            shutil.copytree(bak, dst)
-        else:
-            shutil.copy2(bak, dst)
+        _swap_in(bak, REPO_ROOT / name)
 
 
 # ------------------------------------------------------------ 下载
 
 def download_fpk(url: str, dest: Path,
-                 client: httpx.Client | None = None) -> int:
-    """流式下载 fpk 到 dest，过程回报进度；返回文件大小。"""
+                 client: httpx.Client | None = None,
+                 extra_hosts: tuple[str, ...] = ()) -> int:
+    """流式下载 fpk 到 dest，过程回报进度；返回文件大小。
+
+    P0-3 重定向加固：关掉自动重定向，手动逐跳跟随（≤5 跳）——
+    每跳 host 必须在白名单（本 URL 主机 ∪ extra_hosts ∪ GitHub 资产主机），
+    scheme 限 http/https；下载总量上限 512MB，防跳转钓鱼与超大文件灌盘。"""
     own_client = client is None
-    client = client or httpx.Client(timeout=120, follow_redirects=True,
+    allowed = {urlparse(url).hostname or "",
+               *(urlparse(u).hostname or "" for u in extra_hosts),
+               *GITHUB_HOSTS}
+    client = client or httpx.Client(timeout=120, follow_redirects=False,
                                     trust_env=True,
                                     headers={"user-agent": f"fnmedia-dl/{_read_version()}"})
     try:
-        with client.stream("GET", url) as resp:
-            if resp.status_code != 200:
-                raise UpdateError(f"下载失败：HTTP {resp.status_code}")
-            total = int(resp.headers.get("content-length") or 0)
-            done = 0
-            with open(dest, "wb") as fh:
-                for chunk in resp.iter_bytes(1 << 16):
-                    fh.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        pct = 5 + int(done * 75 / total)
-                        _set("downloading", min(pct, 80),
-                             f"下载中 {done >> 20}MB / {total >> 20}MB")
-                    else:
-                        _set("downloading", 5, f"下载中 {done >> 20}MB")
+        cur = url
+        hops = 0
+        while True:
+            with client.stream("GET", cur, follow_redirects=False) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    hops += 1
+                    if hops > MAX_REDIRECTS:
+                        raise UpdateError(
+                            f"下载失败：重定向超过 {MAX_REDIRECTS} 次")
+                    loc = resp.headers.get("location", "")
+                    nxt = urljoin(cur, loc)
+                    parsed = urlparse(nxt)
+                    if parsed.scheme not in ("http", "https"):
+                        raise UpdateError("下载失败：重定向到非 http(s) 地址，已拒绝")
+                    host = parsed.hostname or ""
+                    if host not in allowed:
+                        raise UpdateError(
+                            f"下载失败：重定向到白名单外主机 {host}，已拒绝")
+                    cur = nxt
+                    continue
+                if resp.status_code != 200:
+                    raise UpdateError(f"下载失败：HTTP {resp.status_code}")
+                total = int(resp.headers.get("content-length") or 0)
+                if total and total > MAX_DOWNLOAD_BYTES:
+                    raise UpdateError("下载失败：文件超过大小上限（512MB）")
+                done = 0
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_bytes(1 << 16):
+                        done += len(chunk)
+                        if done > MAX_DOWNLOAD_BYTES:
+                            raise UpdateError("下载失败：文件超过大小上限（512MB）")
+                        fh.write(chunk)
+                        if total:
+                            pct = 5 + int(done * 75 / total)
+                            _set("downloading", min(pct, 80),
+                                 f"下载中 {done >> 20}MB / {total >> 20}MB")
+                        else:
+                            _set("downloading", 5, f"下载中 {done >> 20}MB")
+                break
     finally:
         if own_client:
             client.close()
@@ -238,17 +300,28 @@ def _sha256_of(path: Path) -> str:
 
 def download_verified(urls: list[str], dest: Path,
                       sha256: str = "", expected_size: int = 0,
-                      client: httpx.Client | None = None) -> int:
+                      client: httpx.Client | None = None,
+                      allow_unverified: bool = False) -> int:
     """多候选下载并校验：逐候选「下载 → 校验大小/SHA256」，
     每候选最多重试 2 次（递增退避），失败或校验不符自动换下一个候选。
-    全部失败抛 UpdateError（含逐候选原因汇总）。返回文件大小。"""
+    全部失败抛 UpdateError（含逐候选原因汇总）。返回文件大小。
+
+    P0-3 fail-closed：sha256 为空且未显式 allow_unverified 时直接拒绝
+    下载——GitHub 资产的 sha256 从兄弟 .sha256 资产抓取、失败不阻断
+    （可能为空），空校验值继续下载等于把更新链暴露给中间人。
+    allow_unverified=True 仅限「用户手动输入下载地址」通道（人工点了
+    「更新」明确意图），自动更新链永不豁免。"""
+    if not sha256 and not allow_unverified:
+        raise UpdateError("拒绝下载：该更新源缺少 SHA256 校验值，"
+                          "无法验证包完整性（可稍后重试或换用官方源）")
     errors: list[str] = []
     switched = 0                      # 换源次数（成功后仍在进度里留痕，切换透明）
+    extra = tuple(urls)               # 重定向白名单并入全部候选源主机
     for idx, url in enumerate(urls, 1):
         tag = f"候选{idx}"
         for attempt in (1, 2):
             try:
-                size = download_fpk(url, dest, client=client)
+                size = download_fpk(url, dest, client=client, extra_hosts=extra)
                 if expected_size and size != expected_size:
                     raise UpdateError(
                         f"大小不符（{size} ≠ {expected_size} 字节）")
@@ -333,12 +406,15 @@ def _restart_service() -> bool:
 def start(url: str, version: str = "", *,
           fallback_urls: list[str] | None = None,
           sha256: str = "", expected_size: int = 0,
-          allowed_prefixes: list[str] | None = None) -> dict:
+          allowed_prefixes: list[str] | None = None,
+          allow_unverified: bool = False) -> dict:
     """启动后台更新线程（单例）。返回当前进度快照。
 
     url 为主下载候选（镜像源优先），fallback_urls 为回退候选（官方源兜底），
     两者按序组成下载候选列表；sha256/expected_size 为清单校验值（可空），
-    allowed_prefixes 为镜像源地址前缀（由 main 依配置传入）。"""
+    allowed_prefixes 为镜像源地址前缀（由 main 依配置传入）。
+    allow_unverified=True 仅限「用户手动输入下载地址」通道显式豁免
+    SHA256 fail-closed（自动更新链永不豁免）。"""
     global _thread
     candidates = [url, *(fallback_urls or [])]
     for u in candidates:
@@ -351,17 +427,21 @@ def start(url: str, version: str = "", *,
                       error="", from_version=_read_version(),
                       to_version=strip_ver(version or ""), done=False)
     _thread = threading.Thread(
-        target=_run, args=(candidates, sha256, expected_size), daemon=True)
+        target=_run, args=(candidates, sha256, expected_size),
+        kwargs={"allow_unverified": allow_unverified}, daemon=True)
     _thread.start()
     return progress()
 
 
-def _run(urls: list[str], sha256: str = "", expected_size: int = 0) -> None:
+def _run(urls: list[str], sha256: str = "", expected_size: int = 0,
+         allow_unverified: bool = False) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="fndl-update-"))
     fpk_path = workdir / "update.fpk"
     replaced = False
     try:
-        download_verified(urls, fpk_path, sha256, expected_size)   # 5..80%
+        # 5..80%
+        download_verified(urls, fpk_path, sha256, expected_size,
+                          allow_unverified=allow_unverified)
         _set("extracting", 82, "解包校验…")
         new_tree = extract_repo_tree(fpk_path, workdir)
         new_ver = _read_version(new_tree)

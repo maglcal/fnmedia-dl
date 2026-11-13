@@ -23,6 +23,7 @@ from backends import Backend, BackendError, build_backends
 from backends.base import TaskView
 from config import STATE_DIR
 import config as cfgmod
+import filelock
 import links as linksmod
 import quota as quotamod
 
@@ -52,7 +53,12 @@ class DownloadManager:
             self.cfg.setdefault("thunder_cloud", {}).update(conf)
             # 必须落盘：每个请求都会新建 DownloadManager，只改内存的话
             # device_id / 登录态 / 风控验证状态换个请求就全丢了。
-            cfgmod.save(self.cfg)
+            # P0-2：整段「读-改-写」进文件锁原子区间，避免与 config_put
+            # 等并发写互相覆盖。
+            def _apply(cur: dict) -> dict:
+                cur.setdefault("thunder_cloud", {}).update(conf)
+                return cur
+            cfgmod.update(_apply)
 
         return build_backends(self.cfg, self.client, persist_cloud)
 
@@ -64,24 +70,43 @@ class DownloadManager:
         except (OSError, ValueError):
             return []
 
-    def _save_records(self) -> None:
-        with self._lock:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = RECORDS_PATH.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.records, ensure_ascii=False, indent=1),
-                           encoding="utf-8")
-            tmp.replace(RECORDS_PATH)
+    def _write_records(self, records: list[dict]) -> None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = RECORDS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(records, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(RECORDS_PATH)
+
+    def _mutate_records(self, mutator) -> None:
+        """读-改-写 tasks.json 的原子区间（P0-2 并发竞态）。
+
+        DownloadManager 每请求新建、升级重启窗口可能两进程并存——只锁
+        「写」挡不住丢更新（两个请求各自读旧快照改完互相覆盖），必须把
+        「重读 → 改 → 写回」整段互斥；写回后同步 self.records。
+        mutator(records) 就地修改列表，不得再进 _mutate_records（锁不重入）。"""
+        with self._lock, filelock.locked(RECORDS_PATH):
+            records = self._load_records()
+            mutator(records)
+            self._write_records(records)
+            self.records = records
 
     def _record(self, backend: str, task_id: str, url: str, name: str,
                 directory: str) -> None:
-        self.records.append({
+        entry = {
             # id 统一字符串化：引擎可能返回整型 id，与 live 视图（str）不一致
             # 会导致 unified_tasks 匹配失败（同任务出「已清理」+重复行）。
             "backend": backend, "id": str(task_id), "url": url,
             "name": name, "dir": directory, "created_at": int(time.time()),
             "identity": linksmod.identity(url),
-        })
-        self._save_records()
+        }
+        self._mutate_records(lambda records: records.append(entry))
+
+    @staticmethod
+    def _filter_out(records: list[dict], backend: str, task_id: str) -> None:
+        """就地剔除指定任务的本地记录。"""
+        records[:] = [r for r in records
+                      if not (r.get("backend") == backend
+                              and str(r.get("id")) == str(task_id))]
 
     # ------------------------------------------------------------ 派发
 
@@ -254,10 +279,8 @@ class DownloadManager:
             impl.resume(task_id)
         elif action == "delete":
             impl.delete(task_id)
-            self.records = [r for r in self.records
-                            if not (r.get("backend") == backend
-                                    and str(r.get("id")) == str(task_id))]
-            self._save_records()
+            self._mutate_records(
+                lambda records: self._filter_out(records, backend, task_id))
         else:
             raise BackendError(f"未知操作：{action}")
 
@@ -298,10 +321,8 @@ class DownloadManager:
             impl.delete(task_id)
         except BackendError:
             pass
-        self.records = [r for r in self.records
-                        if not (r.get("backend") == backend
-                                and str(r.get("id")) == str(task_id))]
-        self._save_records()
+        self._mutate_records(
+            lambda records: self._filter_out(records, backend, task_id))
         info = linksmod.parse_line(url)
         directory = directory or self.cfg.get("default_dir") or None
         res = self.dispatch(info, backend=backend, directory=directory)

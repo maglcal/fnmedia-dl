@@ -45,8 +45,13 @@ def main() -> int:
 
     if args.http:
         host, _, port = args.http.rpartition(":")
+        host = host or "127.0.0.1"
+        # 回环监听 = 本机开发调试：豁免网关令牌校验（否则 curl 无法写）。
+        # 监听非回环地址（如 0.0.0.0）时要求真实令牌，不自动豁免。
+        if host in ("127.0.0.1", "localhost", "::1"):
+            os.environ.setdefault("FNDL_DEV_TRUST", "1")
         uvicorn.run("main:app", app_dir=str(APP_DIR),
-                    host=host or "127.0.0.1", port=int(port or 8787))
+                    host=host, port=int(port or 8787))
         return 0
 
     # ---- 生产形态：UDS + 桌面网关 ----

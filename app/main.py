@@ -101,17 +101,31 @@ async def _no_cache_ui(request, call_next):
 _MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
 
 
+def _dev_trust() -> bool:
+    """本地调试显式豁免（仅 --http 回环模式自动设置，或人工 FNDL_DEV_TRUST=1）。"""
+    return os.environ.get("FNDL_DEV_TRUST", "") == "1"
+
+
 @app.middleware("http")
 async def _admin_guard(request, call_next):
-    """管理接口鉴权（官方网关规范）：统一网关转发时注入 X-Trim-Userid/Isadmin/Username，
-    写操作只放行管理员（X-Trim-Isadmin: true）。
-    不信任客户端自带的 uid；无任何 X-Trim-* 头 = 未经网关（本地调试/兼容环境），放行。"""
+    """管理接口鉴权（P0-1 修复：fail-closed，官方网关规范 + 共享密钥）。
+
+    信任边界=网关注入的 X-Fndl-Auth 共享密钥（gwtoken：网关剥掉客户端
+    自带同名头后注入真值）。写操作无有效令牌一律 401——旧实现「无
+    X-Trim-* 头即放行」是信任漏洞（伪造头或裸连 socket 即可写），已废除。
+    通过令牌校验后，仍按官方网关规范放行管理员（X-Trim-Isadmin: true）。
+    本地调试：FNDL_DEV_TRUST=1 显式豁免（serve.py --http 回环模式自动设）。"""
     if request.method in _MUTATING:
-        headers = request.headers
-        via_gateway = any(k.startswith("x-trim-") for k in headers)
-        if via_gateway and headers.get("x-trim-isadmin", "").lower() != "true":
-            return JSONResponse(status_code=403,
-                                content={"detail": "仅管理员可执行此操作"})
+        if not _dev_trust():
+            import gwtoken
+            if not gwtoken.verify(request.headers.get(gwtoken.HEADER)):
+                return JSONResponse(status_code=401,
+                                    content={"detail": "未授权：缺少或无效的网关令牌"})
+            headers = request.headers
+            via_gateway = any(k.startswith("x-trim-") for k in headers)
+            if via_gateway and headers.get("x-trim-isadmin", "").lower() != "true":
+                return JSONResponse(status_code=403,
+                                    content={"detail": "仅管理员可执行此操作"})
     return await call_next(request)
 
 
@@ -347,9 +361,13 @@ def update_download(req: UpdateDownloadReq):
                   if (a.get("name") or "").endswith(".fpk")]
     asset = next((a for a in fpk_assets
                   if req.url and a.get("url") == req.url), None)
+    # 手动输入地址（P0-3）：无清单校验值，SHA256 fail-closed 的唯一豁免口——
+    # 用户亲手填地址并点「更新」= 明确意图；自动更新链（清单资产）永不豁免。
+    manual = False
     if asset is None and req.url:
         # 手动指定地址：无清单信息，仅做地址形状放行
         asset = {"url": req.url, "fallback_urls": [], "sha256": "", "size": 0}
+        manual = True
     if asset is None:
         asset = fpk_assets[0] if fpk_assets else {}
     url = asset.get("url") or ""
@@ -361,7 +379,8 @@ def update_download(req: UpdateDownloadReq):
             fallback_urls=asset.get("fallback_urls") or [],
             sha256=asset.get("sha256") or "",
             expected_size=int(asset.get("size") or 0),
-            allowed_prefixes=updatesrc.allowed_prefixes(cfgmod.load()))}
+            allowed_prefixes=updatesrc.allowed_prefixes(cfgmod.load()),
+            allow_unverified=manual)}
     except updmod.UpdateError as exc:
         raise HTTPException(400, str(exc))
 
@@ -513,31 +532,35 @@ class ConfigPut(BaseModel):
 
 @app.put("/api/config")
 def config_put(req: ConfigPut):
-    cur = cfgmod.load()
     incoming = req.config or {}
-    # 传入 ****** 的敏感字段表示“保持不变”，不覆盖
-    tc_in = incoming.get("thunder_cloud", {})
-    for key in ("password", "access_token", "refresh_token"):
-        if tc_in.get(key) == "******":
-            tc_in[key] = cur.get("thunder_cloud", {}).get(key, "")
-    if incoming.get("aria2", {}).get("secret") == "******":
-        incoming["aria2"]["secret"] = cur.get("aria2", {}).get("secret", "")
-    # update.sources 数组整体替换；其中 token 传 ****** 表示“保持不变”
-    upd_in = incoming.get("update", {})
-    if isinstance(upd_in, dict) and isinstance(upd_in.get("sources"), list):
-        cur_tokens = {s.get("name"): s.get("token", "")
-                      for s in cur.get("update", {}).get("sources", [])
-                      if isinstance(s, dict)}
-        for s in upd_in["sources"]:
-            if isinstance(s, dict) and s.get("token") == "******":
-                s["token"] = cur_tokens.get(s.get("name"), "")
-    # 分段合并而非整段替换：表单只带表单键，device_id / 登录令牌 /
-    # 风控验证状态（review_url/review_token）等隐藏键必须保留。
-    merged_cfg = {**cur, **incoming}
-    for section, vals in incoming.items():
-        if isinstance(vals, dict) and isinstance(cur.get(section), dict):
-            merged_cfg[section] = {**cur[section], **vals}
-    merged = cfgmod.save(merged_cfg)
+
+    def _merge_cfg(cur: dict) -> dict:
+        # 传入 ****** 的敏感字段表示“保持不变”，不覆盖
+        tc_in = incoming.get("thunder_cloud", {})
+        for key in ("password", "access_token", "refresh_token"):
+            if tc_in.get(key) == "******":
+                tc_in[key] = cur.get("thunder_cloud", {}).get(key, "")
+        if incoming.get("aria2", {}).get("secret") == "******":
+            incoming["aria2"]["secret"] = cur.get("aria2", {}).get("secret", "")
+        # update.sources 数组整体替换；其中 token 传 ****** 表示“保持不变”
+        upd_in = incoming.get("update", {})
+        if isinstance(upd_in, dict) and isinstance(upd_in.get("sources"), list):
+            cur_tokens = {s.get("name"): s.get("token", "")
+                          for s in cur.get("update", {}).get("sources", [])
+                          if isinstance(s, dict)}
+            for s in upd_in["sources"]:
+                if isinstance(s, dict) and s.get("token") == "******":
+                    s["token"] = cur_tokens.get(s.get("name"), "")
+        # 分段合并而非整段替换：表单只带表单键，device_id / 登录令牌 /
+        # 风控验证状态（review_url/review_token）等隐藏键必须保留。
+        merged_cfg = {**cur, **incoming}
+        for section, vals in incoming.items():
+            if isinstance(vals, dict) and isinstance(cur.get(section), dict):
+                merged_cfg[section] = {**cur[section], **vals}
+        return merged_cfg
+
+    # P0-2：读-改-写整段进文件锁原子区间（防与 persist_cloud 并发互覆盖）
+    merged = cfgmod.update(_merge_cfg)
     return cfgmod.redacted(merged)
 
 

@@ -18,6 +18,10 @@ from fastapi.testclient import TestClient            # noqa: E402
 
 import main                                          # noqa: E402
 
+# TestClient 直连绕过网关，无注入令牌可带——写请求走本地调试豁免开关
+# （FNDL_DEV_TRUST=1）。TestAdminGuard 会临时摘掉它测真实鉴权闸（P0-1）。
+os.environ.setdefault("FNDL_DEV_TRUST", "1")
+
 
 class TestAPI(unittest.TestCase):
     def setUp(self):
@@ -416,23 +420,58 @@ class TestUIPaths(unittest.TestCase):
 
 
 class TestAdminGuard(unittest.TestCase):
-    """写操作鉴权：网关转发（X-Trim-* 头）时仅管理员可写；无头直连放行兼容。"""
+    """写操作鉴权（P0-1 fail-closed）：无有效网关令牌一律 401；
+    令牌经网关（X-Trim-* 头）时仅管理员可写；FNDL_DEV_TRUST=1 显式豁免。"""
 
     def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        td = Path(self._td.name)
+        self._orig = (cfgmod.STATE_DIR, cfgmod.CONFIG_PATH)
+        cfgmod.STATE_DIR = td
+        cfgmod.CONFIG_PATH = td / "config.json"
+        # 本组测试走真实密钥闸：临时摘掉开发豁免，跑完恢复
+        self._dev = os.environ.pop("FNDL_DEV_TRUST", None)
+        self.addCleanup(self._restore)
         self.client = TestClient(main.app)
+        import gwtoken
+        self.token = gwtoken.load_or_create_token(td)
 
-    def test_mutating_without_gateway_headers_allowed(self):
+    def _restore(self):
+        (cfgmod.STATE_DIR, cfgmod.CONFIG_PATH) = self._orig
+        if self._dev is not None:
+            os.environ["FNDL_DEV_TRUST"] = self._dev
+        else:
+            os.environ.pop("FNDL_DEV_TRUST", None)
+        self._td.cleanup()
+
+    def test_mutating_without_token_rejected(self):
+        """裸写无令牌 → 401（旧实现「无头直连放行」是信任漏洞，已废除）。"""
         r = self.client.post("/api/parse", json={"text": ""})
-        self.assertNotEqual(r.status_code, 403)
+        self.assertEqual(r.status_code, 401)
 
-    def test_mutating_admin_allowed(self):
+    def test_mutating_with_wrong_token_rejected(self):
+        r = self.client.post("/api/parse", json={"text": ""},
+                             headers={"x-fndl-auth": "wrong-token"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_spoofed_admin_headers_rejected(self):
+        """伪造 X-Trim-Isadmin 但无有效令牌 → 401（不看头，先验令牌）。"""
         r = self.client.post("/api/parse", json={"text": ""},
                              headers={"x-trim-userid": "1000",
                                       "x-trim-isadmin": "true"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_mutating_admin_allowed(self):
+        r = self.client.post(
+            "/api/parse", json={"text": ""},
+            headers={"x-fndl-auth": self.token,
+                     "x-trim-userid": "1000", "x-trim-isadmin": "true"})
+        self.assertNotEqual(r.status_code, 401)
         self.assertNotEqual(r.status_code, 403)
 
     def test_mutating_non_admin_rejected(self):
-        hdrs = {"x-trim-userid": "1001", "x-trim-isadmin": "false"}
+        hdrs = {"x-fndl-auth": self.token,
+                "x-trim-userid": "1001", "x-trim-isadmin": "false"}
         cases = [
             ("post", "/api/parse", {"json": {"text": ""}}),
             ("put", "/api/config", {"json": {"config": {}}}),
@@ -442,6 +481,13 @@ class TestAdminGuard(unittest.TestCase):
             r = getattr(self.client, method)(path, headers=hdrs, **kw)
             self.assertEqual(r.status_code, 403, f"{method} {path}")
             self.assertIn("管理员", r.json()["detail"])
+
+    def test_dev_trust_env_bypasses(self):
+        """FNDL_DEV_TRUST=1 显式豁免（本地调试/测试专用）。"""
+        os.environ["FNDL_DEV_TRUST"] = "1"
+        self.addCleanup(os.environ.pop, "FNDL_DEV_TRUST", None)
+        r = self.client.post("/api/parse", json={"text": ""})
+        self.assertNotEqual(r.status_code, 401)
 
     def test_readonly_not_blocked(self):
         r = self.client.get("/api/health",

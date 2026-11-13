@@ -133,7 +133,7 @@ def _recv_body(client: socket.socket, partial: bytes, head: bytes) -> bytes | No
     return body[:length]
 
 
-def _rewrite_request(head: bytes) -> bytes:
+def _rewrite_request(head: bytes, auth_token: str = "") -> bytes:
     lines = head.split(b"\r\n")
     parts = lines[0].split()
     if len(parts) >= 2:
@@ -149,8 +149,10 @@ def _rewrite_request(head: bytes) -> bytes:
         lines[0] = b" ".join([method, target.encode("latin-1"), parts[2]])
 
     # 逐头重建：剥掉 hop-by-hop 头（Expect 由网关代答、Connection 强制
-    # close），其余原样保留；追加 Connection: close 保证单请求单连接。
-    drop = {b"expect", b"connection", b"keep-alive", b"proxy-connection"}
+    # close）与客户端自带的 X-Fndl-Auth（防伪造顶替网关注入值，审查 P0-1），
+    # 其余原样保留；追加 Connection: close 保证单请求单连接。
+    drop = {b"expect", b"connection", b"keep-alive", b"proxy-connection",
+            b"x-fndl-auth"}
     rebuilt = [lines[0]]
     for line in lines[1:]:
         if not line:
@@ -159,6 +161,8 @@ def _rewrite_request(head: bytes) -> bytes:
         if name in drop:
             continue
         rebuilt.append(line)
+    if auth_token:
+        rebuilt.append(f"X-Fndl-Auth: {auth_token}".encode("ascii"))
     rebuilt.append(b"Connection: close")
     return b"\r\n".join(rebuilt) + b"\r\n\r\n"
 
@@ -197,7 +201,8 @@ def _pump(src: socket.socket, dst: socket.socket, sent: list) -> None:
         pass
 
 
-def _handle(client: socket.socket, upstream_sock: Path) -> None:
+def _handle(client: socket.socket, upstream_sock: Path,
+            auth_token: str = "") -> None:
     """单请求单连接：读一条完整请求 → 剥前缀改写 → 转发 → 响应读到 EOF 回传。
 
     上游连接失败/响应超时必须显式回 502/504 JSON（_reply_error）；
@@ -229,7 +234,7 @@ def _handle(client: socket.socket, upstream_sock: Path) -> None:
                          "或在管理页点「自诊断」查看服务状态")
             return
         try:
-            remote.sendall(_rewrite_request(head) + body)
+            remote.sendall(_rewrite_request(head, auth_token) + body)
             # 只回传响应；不再从 client 盲泵数据到上游——同连接后续请求
             # 若被转发会绕过改写（404 事故原因），这里直接随连接关闭丢弃。
             _pump(remote, client, sent)
@@ -261,7 +266,12 @@ def _handle(client: socket.socket, upstream_sock: Path) -> None:
                     pass
 
 
-def serve(gateway_sock: Path, upstream_sock: Path) -> None:
+def serve(gateway_sock: Path, upstream_sock: Path,
+          state_dir: Path | None = None) -> None:
+    """启动网关。state_dir 为共享密钥所在目录（默认 upstream 同目录），
+    每条连接注入当前密钥（与 main._admin_guard 的校验端同源同值）。"""
+    import gwtoken
+
     gateway_sock.parent.mkdir(parents=True, exist_ok=True)
     try:
         gateway_sock.unlink()
@@ -269,19 +279,27 @@ def serve(gateway_sock: Path, upstream_sock: Path) -> None:
         pass
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(gateway_sock))
-    os.chmod(gateway_sock, 0o666)
+    # 0600 仅属主可连（审查 P0-1）：原 0666 让同机任意进程连入并伪造
+    # X-Trim-* 头。平台统一网关以 root/应用属主连接（同类应用 0755/0770
+    # 均正常工作），不受收紧影响；极老固件若连不上可临时
+    # FNDL_GATEWAY_SOCK_MODE=0o666 放开（会削弱防护，尽快反馈）。
+    mode = int(os.environ.get("FNDL_GATEWAY_SOCK_MODE", "0o600"), 0)
+    os.chmod(gateway_sock, mode)
     server.listen(64)
     print(f"[fndl-gateway] {gateway_sock} -> {upstream_sock}", flush=True)
     while True:
         client, _ = server.accept()
-        threading.Thread(target=_handle, args=(client, upstream_sock), daemon=True).start()
+        tok = gwtoken.load_or_create_token(state_dir or upstream_sock.parent)
+        threading.Thread(target=_handle,
+                         args=(client, upstream_sock, tok),
+                         daemon=True).start()
 
 
 def main(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv[1:]
     repo = Path(args[0]) if args else Path(__file__).resolve().parent.parent
     upstream = Path(args[1]) if len(args) > 1 else Path("/run/fnmedia-dl/app.sock")
-    serve(gateway_socket_path(repo), upstream)
+    serve(gateway_socket_path(repo), upstream, state_dir=repo / "state")
     return 0
 
 

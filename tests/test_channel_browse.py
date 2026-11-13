@@ -22,6 +22,9 @@ from fastapi.testclient import TestClient            # noqa: E402
 
 import main                                          # noqa: E402
 
+# TestClient 直连无网关令牌：写请求走本地调试豁免（P0-1 鉴权闸的显式开关）
+os.environ.setdefault("FNDL_DEV_TRUST", "1")
+
 
 POOL = {k: object() for k in ("thunder_cloud", "thunder_engine", "aria2")}
 

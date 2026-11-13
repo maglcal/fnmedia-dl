@@ -8,6 +8,8 @@ import os
 import threading
 from pathlib import Path
 
+import filelock
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = REPO_ROOT / "state"
 CONFIG_PATH = STATE_DIR / "config.json"
@@ -72,26 +74,46 @@ def _merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _load_unlocked() -> dict:
+    if CONFIG_PATH.is_file():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return _merge(DEFAULT_CONFIG, data)
+        except (OSError, ValueError):
+            pass
+    return copy.deepcopy(DEFAULT_CONFIG)
+
+
 def load() -> dict:
     with _lock:
-        if CONFIG_PATH.is_file():
-            try:
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-                return _merge(DEFAULT_CONFIG, data)
-            except (OSError, ValueError):
-                pass
-        return copy.deepcopy(DEFAULT_CONFIG)
+        return _load_unlocked()
+
+
+def _save_unlocked(cfg: dict) -> dict:
+    merged = _merge(DEFAULT_CONFIG, cfg)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_PATH)
+    return merged
 
 
 def save(cfg: dict) -> dict:
-    merged = _merge(DEFAULT_CONFIG, cfg)
-    with _lock:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = CONFIG_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, CONFIG_PATH)
-    return merged
+    with _lock, filelock.locked(CONFIG_PATH):
+        return _save_unlocked(cfg)
+
+
+def update(mutator) -> dict:
+    """读-改-写原子区间（P0-2 并发竞态）：文件锁内 load → mutator → save。
+
+    mutator(cur) 就地修改 cur 并返回（或返回新 dict）；返回最终落盘配置。
+    DownloadManager 每请求新建、升级窗口可能两进程并存——裸 load→save
+    会互相覆盖，必须整段互斥。mutator 内不得再调 save/update（锁不重入）。"""
+    with _lock, filelock.locked(CONFIG_PATH):
+        cur = _load_unlocked()
+        new = mutator(cur)
+        return _save_unlocked(new if new is not None else cur)
 
 
 def redacted(cfg: dict) -> dict:

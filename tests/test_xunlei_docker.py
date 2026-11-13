@@ -15,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 import config as cfgmod                              # noqa: E402
 import xunlei_docker as xd                           # noqa: E402
 
+# 部署接口为写操作：TestClient 直连无网关令牌，走本地调试豁免（P0-1）
+os.environ.setdefault("FNDL_DEV_TRUST", "1")
+
 
 class XdBase(unittest.TestCase):
     """公共夹具：状态/配置落临时目录，共享目录用环境变量注入。"""

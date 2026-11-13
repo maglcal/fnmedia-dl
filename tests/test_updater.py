@@ -222,7 +222,7 @@ class TestDownloadVerified(unittest.TestCase):
         self._tmp.cleanup()
 
     def _stub_download(self, impl):
-        def fake(url, dest, client=None):
+        def fake(url, dest, client=None, extra_hosts=()):
             self.calls.append(url)
             return impl(url, dest)
         updater.download_fpk = fake
@@ -233,7 +233,8 @@ class TestDownloadVerified(unittest.TestCase):
             return 5
         self._stub_download(impl)
         size = updater.download_verified(
-            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5)
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5,
+            allow_unverified=True)
         self.assertEqual(size, 5)
         self.assertEqual(self.calls, ["http://a/x.fpk"])
 
@@ -245,7 +246,8 @@ class TestDownloadVerified(unittest.TestCase):
             return 5
         self._stub_download(impl)
         updater.download_verified(
-            ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest,
+            allow_unverified=True)
         self.assertIn("http://b/x.fpk", self.calls)
 
     def test_sha256_mismatch_switches_candidate(self):
@@ -265,7 +267,8 @@ class TestDownloadVerified(unittest.TestCase):
             return 2 if "http://a/" in url else 5
         self._stub_download(impl)
         updater.download_verified(
-            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5)
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest, expected_size=5,
+            allow_unverified=True)
         self.assertIn("http://b/x.fpk", self.calls)
 
     def test_all_fail_raises_with_summary(self):
@@ -274,7 +277,8 @@ class TestDownloadVerified(unittest.TestCase):
         self._stub_download(impl)
         with self.assertRaises(updater.UpdateError) as cm:
             updater.download_verified(
-                ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+                ["http://a/x.fpk", "http://b/x.fpk"], self.dest,
+                allow_unverified=True)
         msg = str(cm.exception)
         self.assertIn("所有下载候选均失败", msg)
         self.assertIn("候选1", msg)
@@ -290,7 +294,8 @@ class TestDownloadVerified(unittest.TestCase):
             return 3
         self._stub_download(impl)
         updater.download_verified(
-            ["http://a/x.fpk", "http://b/x.fpk"], self.dest)
+            ["http://a/x.fpk", "http://b/x.fpk"], self.dest,
+            allow_unverified=True)
         self.assertIn("http://b/x.fpk", self.calls)
 
 
@@ -372,11 +377,11 @@ class TestFallbackSwitchNotice(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(updater, "download_fpk", side_effect=impl), \
              mock.patch.object(updater.time, "sleep"):
-            updater.download_verified(urls, self.dest)
+            updater.download_verified(urls, self.dest, allow_unverified=True)
         return updater.progress()
 
     def test_switch_notice_persists_after_success(self):
-        def impl(url, dest, client=None):
+        def impl(url, dest, client=None, extra_hosts=()):
             if "http://a/" in url:
                 raise updater.UpdateError("下载失败：HTTP 502")
             dest.write_bytes(b"ok!")
@@ -387,7 +392,7 @@ class TestFallbackSwitchNotice(unittest.TestCase):
         self.assertIn("1 次", p["detail"])             # 成功后留痕计数
 
     def test_no_switch_keeps_plain_detail(self):
-        def impl(url, dest, client=None):
+        def impl(url, dest, client=None, extra_hosts=()):
             dest.write_bytes(b"ok!")
             return 3
 
@@ -447,6 +452,252 @@ class TestRestartService(unittest.TestCase):
         with mock.patch.dict("os.environ", env, clear=True), \
              mock.patch.object(updater.shutil, "which", return_value=None):
             self.assertFalse(updater._restart_service())
+
+
+class TestFailClosedSha256(unittest.TestCase):
+    """P0-3 fail-closed：空 sha256 直接拒绝下载，仅手动通道显式豁免。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.dest = Path(self._td.name) / "a.fpk"
+        self.called = False
+        self._orig = updater.download_fpk
+
+        def fake(url, dest, client=None, extra_hosts=()):
+            self.called = True
+            dest.write_bytes(b"pkg")
+            return 3
+        updater.download_fpk = fake
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        updater.download_fpk = self._orig
+        self._td.cleanup()
+
+    def test_empty_sha256_rejected_without_exemption(self):
+        with self.assertRaises(updater.UpdateError) as cm:
+            updater.download_verified(["http://a/x.fpk"], self.dest)
+        msg = str(cm.exception)
+        self.assertIn("拒绝下载", msg)
+        self.assertIn("SHA256", msg)
+        self.assertFalse(self.called, "fail-closed 必须在下载前拒绝")
+        self.assertFalse(self.dest.exists())
+
+    def test_allow_unverified_exemption_passes(self):
+        size = updater.download_verified(
+            ["http://a/x.fpk"], self.dest, allow_unverified=True)
+        self.assertEqual(size, 3)
+        self.assertTrue(self.called)
+
+    def test_nonempty_sha256_proceeds(self):
+        good = hashlib.sha256(b"pkg").hexdigest()
+        size = updater.download_verified(
+            ["http://a/x.fpk"], self.dest, sha256=good)
+        self.assertEqual(size, 3)
+
+
+class _FakeResp:
+    """下载打桩响应：可作 context manager，headers 走小写键。"""
+
+    def __init__(self, status_code, headers=None, chunks=()):
+        self.status_code = status_code
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+        self._chunks = list(chunks)
+
+    def iter_bytes(self, n):
+        for c in self._chunks:
+            yield c
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    """按 URL 预置响应序列的假 httpx.Client（只实现 stream/close）。"""
+
+    def __init__(self, routes: dict):
+        self.routes = {u: list(seq) for u, seq in routes.items()}
+        self.requested: list[str] = []
+
+    def stream(self, method, url, follow_redirects=True):
+        self.requested.append(url)
+        seq = self.routes.get(url)
+        if not seq:
+            raise updater.httpx.ConnectError(f"no route: {url}")
+        return seq.pop(0)
+
+    def close(self):
+        pass
+
+
+class TestDownloadFpkRedirectPolicy(unittest.TestCase):
+    """P0-3 下载闸：重定向白名单/跳数上限/非 http(s) 拒绝/大小上限。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.dest = Path(self._td.name) / "a.fpk"
+        with updater._lock:
+            updater._state.update(stage="idle", percent=0, detail="", error="",
+                                 done=False)
+        self.addCleanup(self._td.cleanup)
+
+    def test_redirect_to_off_whitelist_host_rejected(self):
+        client = _FakeClient({
+            "http://a/x.fpk": [
+                _FakeResp(302, {"location": "http://evil.example.com/y"})],
+        })
+        with self.assertRaises(updater.UpdateError) as cm:
+            updater.download_fpk("http://a/x.fpk", self.dest, client=client)
+        self.assertIn("白名单外主机", str(cm.exception))
+        self.assertNotIn("evil.example.com", client.requested[1:]
+                         if len(client.requested) > 1 else [])
+
+    def test_redirect_to_extra_host_allowed(self):
+        client = _FakeClient({
+            "http://a/x.fpk": [
+                _FakeResp(302, {"location": "http://b/x.fpk"})],
+            "http://b/x.fpk": [
+                _FakeResp(200, {"content-length": "5"}, [b"hello"])],
+        })
+        size = updater.download_fpk("http://a/x.fpk", self.dest, client=client,
+                                    extra_hosts=("http://b/x.fpk",))
+        self.assertEqual(size, 5)
+        self.assertEqual(self.dest.read_bytes(), b"hello")
+        self.assertEqual(client.requested, ["http://a/x.fpk", "http://b/x.fpk"])
+
+    def test_redirect_to_github_host_allowed(self):
+        # GitHub 资产主机永远在白名单（release 跳转 objects.githubusercontent.com）
+        target = "https://objects.githubusercontent.com/y"
+        client = _FakeClient({
+            "http://a/x.fpk": [_FakeResp(302, {"location": target})],
+            target: [_FakeResp(200, {}, [b"ok"])],
+        })
+        size = updater.download_fpk("http://a/x.fpk", self.dest, client=client)
+        self.assertEqual(size, 2)
+
+    def test_relative_redirect_stays_on_own_host(self):
+        client = _FakeClient({
+            "http://a/x.fpk": [_FakeResp(302, {"location": "/y"})],
+            "http://a/y": [_FakeResp(200, {}, [b"ok!"])],
+        })
+        size = updater.download_fpk("http://a/x.fpk", self.dest, client=client)
+        self.assertEqual(size, 3)
+        self.assertEqual(client.requested, ["http://a/x.fpk", "http://a/y"])
+
+    def test_too_many_redirects_rejected(self):
+        routes = {}
+        for i in range(updater.MAX_REDIRECTS + 2):
+            routes[f"http://a/r{i}"] = [
+                _FakeResp(302, {"location": f"/r{i + 1}"})]
+        client = _FakeClient(routes)
+        with self.assertRaises(updater.UpdateError) as cm:
+            updater.download_fpk("http://a/r0", self.dest, client=client)
+        self.assertIn("重定向超过", str(cm.exception))
+
+    def test_non_http_scheme_rejected(self):
+        for loc in ("ftp://a/y", "file:///etc/passwd", "gopher://a/y"):
+            client = _FakeClient({
+                "http://a/x.fpk": [_FakeResp(302, {"location": loc})],
+            })
+            with self.assertRaises(updater.UpdateError) as cm:
+                updater.download_fpk("http://a/x.fpk", self.dest, client=client)
+            self.assertIn("非 http(s)", str(cm.exception), loc)
+
+    def test_content_length_over_limit_rejected(self):
+        over = updater.MAX_DOWNLOAD_BYTES + 1
+        client = _FakeClient({
+            "http://a/x.fpk": [_FakeResp(200, {"content-length": str(over)})],
+        })
+        with self.assertRaises(updater.UpdateError) as cm:
+            updater.download_fpk("http://a/x.fpk", self.dest, client=client)
+        self.assertIn("大小上限", str(cm.exception))
+
+    def test_streamed_overflow_rejected_without_content_length(self):
+        # content-length 缺失时靠流式计数兜底
+        from unittest import mock
+        client = _FakeClient({
+            "http://a/x.fpk": [_FakeResp(200, {}, [b"12345", b"67890"])],
+        })
+        with mock.patch.object(updater, "MAX_DOWNLOAD_BYTES", 8):
+            with self.assertRaises(updater.UpdateError) as cm:
+                updater.download_fpk("http://a/x.fpk", self.dest, client=client)
+        self.assertIn("大小上限", str(cm.exception))
+
+
+class TestSwapInAtomic(unittest.TestCase):
+    """P0-3 原子顶替：staging 改名替换，全程无半覆盖、无残留中间文件。"""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.addCleanup(self._td.cleanup)
+
+    def _residue(self, name: str) -> list[str]:
+        return [p.name for p in self.tmp.iterdir()
+                if p.name in (f".{name}.fndl-new", f".{name}.fndl-old")]
+
+    def test_file_replaced_without_residue(self):
+        dst = self.tmp / "app.py"
+        dst.write_text("old")
+        src = self.tmp / "src.py"
+        src.write_text("new")
+        updater._swap_in(src, dst)
+        self.assertEqual(dst.read_text(), "new")
+        self.assertEqual(self._residue("app.py"), [])
+
+    def test_dir_replaced_without_residue(self):
+        dst = self.tmp / "webui"
+        dst.mkdir()
+        (dst / "index.html").write_text("old")
+        src = self.tmp / "new_webui"
+        src.mkdir()
+        (src / "index.html").write_text("new")
+        updater._swap_in(src, dst)
+        self.assertEqual((dst / "index.html").read_text(), "new")
+        self.assertEqual(self._residue("webui"), [])
+
+    def test_fresh_target_created(self):
+        src = self.tmp / "src.py"
+        src.write_text("new")
+        dst = self.tmp / "fresh.py"
+        updater._swap_in(src, dst)
+        self.assertEqual(dst.read_text(), "new")
+        self.assertEqual(self._residue("fresh.py"), [])
+
+    def test_stale_staging_and_old_cleared(self):
+        # 上次中断残留的 staging/old 会被清掉而不是叠加成垃圾
+        dst = self.tmp / "app.py"
+        dst.write_text("old")
+        (self.tmp / ".app.py.fndl-new").write_text("stale")
+        (self.tmp / ".app.py.fndl-old").write_text("stale")
+        src = self.tmp / "src.py"
+        src.write_text("new")
+        updater._swap_in(src, dst)
+        self.assertEqual(dst.read_text(), "new")
+        self.assertEqual(self._residue("app.py"), [])
+
+    def test_apply_tree_touches_whitelist_only(self):
+        from unittest import mock
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        (repo / "app").mkdir()
+        (repo / "app" / "main.py").write_text("old")
+        (repo / "state").mkdir()
+        (repo / "state" / "keep.txt").write_text("keep")
+        new_tree = self.tmp / "new_tree"
+        (new_tree / "app").mkdir(parents=True)
+        (new_tree / "app" / "main.py").write_text("new")
+        with mock.patch.object(updater, "REPO_ROOT", repo), \
+             mock.patch.object(updater, "REPLACE_ENTRIES", ("app",)):
+            updater.apply_tree(new_tree)
+        self.assertEqual((repo / "app" / "main.py").read_text(), "new")
+        self.assertEqual((repo / "state" / "keep.txt").read_text(), "keep")
+        self.assertEqual(
+            [p.name for p in repo.iterdir()
+             if p.name in (".app.fndl-new", ".app.fndl-old")], [])
 
 
 if __name__ == "__main__":

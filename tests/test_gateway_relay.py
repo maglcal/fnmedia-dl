@@ -55,11 +55,13 @@ def _upstream_shim(upstream: FakeSocket):
     )
 
 
-def _run_handle(client: FakeSocket, upstream: FakeSocket) -> None:
+def _run_handle(client: FakeSocket, upstream: FakeSocket,
+                auth_token: str = "") -> None:
     orig = webui_gateway.socket
     webui_gateway.socket = _upstream_shim(upstream)
     try:
-        webui_gateway._handle(client, Path("/fake/upstream.sock"))
+        webui_gateway._handle(client, Path("/fake/upstream.sock"),
+                              auth_token=auth_token)
     finally:
         webui_gateway.socket = orig
 
@@ -99,6 +101,55 @@ class TestRewrite(unittest.TestCase):
             _req("POST", PREFIX + "/api/x",
                  headers="Expect: 100-continue\r\n"))
         self.assertNotIn(b"expect", out.lower())
+
+
+class TestAuthHeaderRewrite(unittest.TestCase):
+    """P0-1：客户端自带 X-Fndl-Auth 必须被剥离，网关只注入自己的真值。"""
+
+    def test_client_supplied_auth_stripped(self):
+        out = webui_gateway._rewrite_request(
+            _req("POST", PREFIX + "/api/tasks", b"{}",
+                 headers="X-Fndl-Auth: forged\r\n"))
+        self.assertNotIn(b"forged", out)
+        self.assertNotIn(b"x-fndl-auth", out.lower())
+
+    def test_client_supplied_auth_case_insensitive(self):
+        out = webui_gateway._rewrite_request(
+            _req("POST", PREFIX + "/api/tasks", b"{}",
+                 headers="x-FnDl-AuTh: forged2\r\n"))
+        self.assertNotIn(b"forged2", out)
+        self.assertNotIn(b"fndl-auth", out.lower())
+
+    def test_gateway_token_injected(self):
+        out = webui_gateway._rewrite_request(
+            _req("POST", PREFIX + "/api/tasks", b"{}"),
+            auth_token="tok123")
+        self.assertIn(b"X-Fndl-Auth: tok123", out)
+
+    def test_forged_replaced_by_real_token(self):
+        out = webui_gateway._rewrite_request(
+            _req("POST", PREFIX + "/api/tasks", b"{}",
+                 headers="X-Fndl-Auth: forged\r\n"),
+            auth_token="realtok")
+        self.assertNotIn(b"forged", out)
+        self.assertIn(b"X-Fndl-Auth: realtok", out)
+        self.assertEqual(out.count(b"X-Fndl-Auth"), 1)
+
+    def test_empty_token_injects_nothing(self):
+        out = webui_gateway._rewrite_request(
+            _req("GET", PREFIX + "/api/config"),
+            auth_token="")
+        self.assertNotIn(b"fndl-auth", out.lower())
+
+    def test_end_to_end_upstream_sees_gateway_token_only(self):
+        client = FakeSocket([
+            _req("POST", PREFIX + "/api/tasks", b"{}",
+                 headers="X-Fndl-Auth: forged\r\n")])
+        upstream = FakeSocket([RESPONSE])
+        _run_handle(client, upstream, auth_token="realtok")
+        self.assertIn(b"X-Fndl-Auth: realtok", upstream.sent)
+        self.assertNotIn(b"forged", upstream.sent)
+        self.assertEqual(upstream.sent.count(b"X-Fndl-Auth"), 1)
 
 
 class TestRelay(unittest.TestCase):
