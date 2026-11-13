@@ -1035,7 +1035,7 @@ async function refreshVersionNotes() {
   try {
     const r = await API.get("/api/update/changelog");
     notesBox.hidden = false;
-    notesBox.innerHTML = `<b>v${esc(r.version || r.current || "")} 更新内容：</b><br>`
+    notesBox.innerHTML = `<div class="nl-head">v${esc(r.version || r.current || "")} 更新内容：</div>`
       + (r.text ? _renderNotes(r.text) : '<span class="hint">（暂无更新内容记录）</span>');
   } catch {
     notesBox.hidden = true;
@@ -1070,7 +1070,7 @@ on("#updateCheckBtn", "click", async () => {
       // 0.1.39.1：展示最新版本的修改项（此前只有版本号一行，更新内容看不到）
       if (notesBox && r.notes) {
         notesBox.hidden = false;
-        notesBox.innerHTML = `<b>v${esc(r.latest)} 更新内容：</b><br>` + _renderNotes(r.notes);
+        notesBox.innerHTML = `<div class="nl-head">v${esc(r.latest)} 更新内容：</div>` + _renderNotes(r.notes);
       }
     } else {
       $("#updateRunBtn").hidden = true;
@@ -1355,17 +1355,38 @@ on("#btnQueueSave", "click", async () => {
    「稍后更新」→ 关弹窗，当天同版本不再弹。 */
 
 function _renderNotes(md) {
-  // 极简 markdown → HTML：先转义防 XSS，再转换常见标记
-  let s = esc(md || "");
-  s = s.replace(/^### (.+)$/gm, "<h4>$1</h4>")
-       .replace(/^## (.+)$/gm, "<h4>$1</h4>")
-       .replace(/^# (.+)$/gm, "<h4>$1</h4>")
-       .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-       .replace(/^[-*] (.+)$/gm, "<li>$1</li>")
-       .replace(/(<li>.*<\/li>)(\n(?!<li>))/gs, "$1<br>")
-       .replace(/\n\n/g, "<br><br>")
-       .replace(/\n/g, "<br>");
-  return s;
+  // 极简 markdown → HTML：先转义防 XSS，再按块转换。
+  // 2026-11-13 间距美化：①归一 CRLF——\r 曾被 pre-wrap 当换行二次折行，
+  // 空档翻倍；②空行只作分块边界，不再生成 <br><br>；③标题/引用/列表各自
+  // 成块（真 <ul>/<blockquote>），行距由 CSS 统一收紧，消除叠出的大空档。
+  const lines = esc(md || "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let inList = false;
+  const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+  const inline = (t) => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) { closeList(); continue; }
+    let m;
+    if ((m = line.match(/^#{1,6}\s+(.+)$/))) {
+      closeList();
+      out.push(`<h4>${inline(m[1])}</h4>`);
+    } else if ((m = line.match(/^&gt;\s*(.*)$/))) {
+      closeList();
+      out.push(`<blockquote>${inline(m[1])}</blockquote>`);
+    } else if ((m = line.match(/^[-*]\s+(.+)$/))) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) {
+      closeList();
+      out.push("<hr>");
+    } else {
+      closeList();
+      out.push(`<p>${inline(line)}</p>`);
+    }
+  }
+  closeList();
+  return out.join("");
 }
 
 function dailyCheck() {
