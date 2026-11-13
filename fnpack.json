@@ -1,0 +1,39 @@
+{
+  "schema_version": "2",
+  "source_info": {
+    "name": "批量下载助手 · 官方源",
+    "author": "许诺"
+  },
+  "apps": {
+    "fnmedia-dl": {
+      "display_name": "批量下载助手",
+      "desc": "NAS 多通道下载管理工具：批量解析磁力 / thunder / 直链 / 种子链接，三通道派发自动降级（迅雷远程 P2SP → 迅雷下载引擎 → aria2），统一任务面板（进度/速度/启停/删除），另含任务队列与每日定时派发、下载查重、一键部署 Docker 版迅雷、一键在线更新与自诊断。仅管理下载任务，不提供任何内容源。<br>很庆幸曾经遇见你，遗憾的是只是遇见你——许诺",
+      "platform": ["all"],
+      "categories": ["系统工具"],
+      "icon_url": "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/packaging/fpk/ICON_512.PNG",
+      "readme_url": "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/README.md",
+      "bug_report_url": "https://github.com/maglcal/fnmedia-dl/issues",
+      "maintainer": "许诺",
+      "maintainer_url": "https://github.com/maglcal/fnmedia-dl",
+      "run_as": "package",
+      "install_type": "",
+      "is_docker": false,
+      "service_port": "",
+      "releases": {
+        "0.1.41": {
+          "changelog": "启动加载页（四步动画）；安装/升级环境准备修复（CRLF 根因三层修复）；依赖引导加固（离线 wheelhouse 全架构、venv 清理）；失败诊断增强（报错弹窗直接带退出码与错误内容）。",
+          "updated_at": "2026-11-12T10:23:00+08:00",
+          "os_min_version": "1.2.0",
+          "packages": {
+            "all": {
+              "download_url": "https://github.com/maglcal/fnmedia-dl/releases/download/main-v0.1.41/fnmedia-dl-main-v0.1.41.fpk",
+              "sha256": "db499346b2940a032d814ce70068a957c236bef745e10ba68f87c4d60b98fa0c",
+              "size": 25382963,
+              "updated_at": "2026-11-12T10:23:00+08:00"
+            }
+          }
+        }
+      }
+    }
+  }
+}
