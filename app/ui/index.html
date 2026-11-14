@@ -337,6 +337,16 @@
   <section id="tab-settings" class="panel">
     <div class="card">
       <div class="card-head">
+        <h2>匿名使用统计</h2>
+      </div>
+      <div class="row-inline dir-tools">
+        <label class="check"><input type="checkbox" id="statsEnabled"><span>参与匿名统计</span></label>
+      </div>
+      <p class="hint">参与后，应用将匿名上报安装 / 更新 / 每日打开三类使用事件，用于了解整体使用情况。上报内容仅包含：事件类型、机器码哈希（加盐哈希，不可反查设备，跨应用无法关联）、软件版本、日期；不含 IP、设备名称、下载任务、链接与任何凭据。默认关闭；可随时开启或关闭，关闭后立即停止上报。</p>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
         <h2>通道管理</h2>
         <span class="hint">只用迅雷就把其余通道取消勾选隐藏，随时可恢复</span>
       </div>
@@ -539,7 +549,7 @@
         <li>软件版本：<b id="aboutVersionText">加载中…</b></li>
         <li>项目主页：<a href="https://github.com/maglcal/fnmedia-dl"
             target="_blank" rel="noreferrer">github.com/maglcal/fnmedia-dl</a></li>
-        <li>数据与凭据仅保存在本机，不上传任何第三方服务器。</li>
+        <li>任务数据与凭据仅保存在本机。匿名使用统计默认关闭，开启后仅上报事件类型、机器码哈希、软件版本与日期至开发者自建统计服务（不含 IP、任务与凭据），可在「通道设置」中随时开启或关闭。</li>
         <li>本插件为个人自用的第三方实现，与迅雷官方无关。</li>
         <li class="sign">很庆幸曾经遇见你，遗憾的是只是遇见你——许诺</li>
       </ul>

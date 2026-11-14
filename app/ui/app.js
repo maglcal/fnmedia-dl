@@ -456,6 +456,8 @@ async function loadConfig() {
     $("#a2Url").value = a2.rpc_url || "";
     $("#a2Secret").value = a2.secret || "";
     $("#a2Dir").value = a2.dir || "";
+    const stats = cfg.stats || {};
+    $("#statsEnabled").checked = !!stats.enabled;
   } catch (e) {
     toast("配置加载失败：" + e.message);
   }
@@ -464,6 +466,23 @@ async function loadConfig() {
   loadXdStatus();
   loadChips();   // 同步刷新引擎配额行（#teQuota 在本页）
 }
+
+/* ---------------- 设置：匿名使用统计开关 ----------------
+   即时生效（不并入「保存全部设置」）：切换即 PUT /api/config，body 仅带
+   stats.enabled（config 分段合并，不碰 endpoint 等其余键）。失败 toast 并
+   loadConfig() 回滚 UI 到服务端状态。 */
+on("#statsEnabled", "change", async (ev) => {
+  const cb = ev.target;
+  try {
+    await API.send("/api/config", "PUT", {
+      config: { stats: { enabled: cb.checked } },
+    });
+    toast(cb.checked ? "✓ 已开启匿名统计" : "✓ 已关闭匿名统计，已停止上报");
+  } catch (e) {
+    toast("保存失败：" + e.message);
+    loadConfig();  // 回滚到服务端状态
+  }
+});
 
 /* 目录与授权：共享目录、已授权目录、目录检测 */
 let shareDirCached = "";
