@@ -64,6 +64,16 @@ DEFAULT_CONFIG: dict = {
         "timeout": 15,                  # 单次请求超时（秒）
         "retries": 2,                   # 单个源的请求尝试次数
     },
+    # 匿名使用统计（默认关，详见《fnmedia-dl 统计上报客户端接入规格》）：
+    # enabled  = 「参与匿名统计」开关；false = 不采集不上传（零足迹）。
+    # endpoint = 统计服务根地址（不含路径），上报 POST {endpoint}/collect；
+    #            留空 = 只本地统计不上报（开发/离线形态）。
+    # 真实地址由打包链在安装/初始化时注入 state/config.json（D-7）；
+    # 公开源码/默认配置/文档一律 stats.example.com 示例，此处保持空串。
+    "stats": {
+        "enabled": False,
+        "endpoint": "",
+    },
 }
 
 _lock = threading.Lock()

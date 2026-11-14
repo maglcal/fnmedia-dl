@@ -57,6 +57,7 @@ from pydantic import BaseModel
 
 import config as cfgmod
 import links as linksmod
+import stats as statsmod
 import taskqueue as tqmod
 import updatesrc
 import updater as updmod
@@ -396,6 +397,9 @@ class BackendTestReq(BaseModel):
 
 @app.get("/api/backends")
 def backends_status():
+    # open 埋点钩子（统计上报规格 §4.4）：管理页首载必经 loadChips()，后端路由
+    # 埋点（浏览器预取/缓存不算打开）；每日本机最多一条，fire-and-forget。
+    statsmod.on_manage_page_open()
     mgr = _manager()
     disabled = set(mgr.cfg.get("disabled_backends") or [])
     out = {}
@@ -533,8 +537,12 @@ class ConfigPut(BaseModel):
 @app.put("/api/config")
 def config_put(req: ConfigPut):
     incoming = req.config or {}
+    seen: dict = {}
 
     def _merge_cfg(cur: dict) -> dict:
+        # 统计开关关→开 视同一次管理页打开并触发 sync（统计上报规格 §7.1），
+        # 先在锁内记下变更前 stats 块，锁外回调 stats 模块（锁不重入）。
+        seen["stats_before"] = dict(cur.get("stats") or {})
         # 传入 ****** 的敏感字段表示“保持不变”，不覆盖
         tc_in = incoming.get("thunder_cloud", {})
         for key in ("password", "access_token", "refresh_token"):
@@ -561,6 +569,9 @@ def config_put(req: ConfigPut):
 
     # P0-2：读-改-写整段进文件锁原子区间（防与 persist_cloud 并发互覆盖）
     merged = cfgmod.update(_merge_cfg)
+    # 锁外回调：统计开关关→开触发 sync + 视同打开；endpoint 变化唤醒上报
+    statsmod.on_config_changed(seen.get("stats_before") or {},
+                               merged.get("stats") or {})
     return cfgmod.redacted(merged)
 
 
@@ -881,6 +892,13 @@ def queue_settings(req: QueueSettingsReq):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True, **q.snapshot()}
+
+
+@app.on_event("startup")
+def _stats_start():
+    """统计上报客户端（统计上报规格 §8-5）：启动 sync 补计 install/update
+    （startup 不判 open）+ 上报闸可用时拉起上报线程。fire-and-forget。"""
+    statsmod.on_startup()
 
 
 @app.on_event("startup")
