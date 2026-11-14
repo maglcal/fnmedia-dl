@@ -43,16 +43,20 @@ DEFAULT_CONFIG: dict = {
         "user_id": "",
     },
     # 在线更新源：按序尝试，第一个可用为准；下载失败自动换下一个源。
+    # 默认 Gitee 国内镜像仓（发行版）优先、GitHub 官方源兜底——镜像仓
+    # 未建/未同步/异常时自动落入 GitHub 并透明提示，不误报「无更新」。
     # 个人镜像源（type=repobox）属**私有配置**——在本机 state/config.json 的
     # update.sources 里按下列形状自行添加（排最前优先），勿把个人镜像地址
     # 写进公开源码/默认配置/安装包：
     #   {"name": "repobox", "type": "repobox",
     #    "base_url": "https://your-repo.example.com", "repo": "<仓库名>", "token": ""}
     # repobox raw 清单/资产公开可读无需 token（token 仅同步写入用）；
-    # base_url 留空自动跳过。
-    # github = 官方源（镜像源连不上/超时/报错时自动切换并提示）
+    # base_url 留空自动跳过。只想单源的用户删掉多余条目，并在 update 段
+    # 写 "sources_v": 2 跳过老配置迁移。
     "update": {
         "sources": [
+            {"name": "gitee", "type": "gitee",
+             "repo": "maglcal/fnmedia-dl"},
             {"name": "github", "type": "github",
              "repo": "maglcal/fnmedia-dl"},
         ],
@@ -74,14 +78,35 @@ def _merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _migrate_update_sources(cfg: dict) -> dict:
+    """update.sources 老配置迁移（sources_v=2）：出厂单 github 源 →
+    前置 gitee 国内镜像源。只对「出厂默认形状」触发；用户改过 sources
+    的原样保留（仅盖版本戳）。sources_v 版本戳**不进 DEFAULT_CONFIG**——
+    进了默认配置 merge 后恒为 2，迁移永不触发。"""
+    upd = cfg.get("update")
+    if not isinstance(upd, dict):
+        return cfg
+    ver = upd.get("sources_v")
+    if isinstance(ver, (int, float)) and ver >= 2:
+        return cfg
+    srcs = upd.get("sources") or []
+    old_default = [{"name": "github", "type": "github",
+                    "repo": "maglcal/fnmedia-dl"}]
+    if srcs == old_default:
+        upd["sources"] = [{"name": "gitee", "type": "gitee",
+                           "repo": "maglcal/fnmedia-dl"}, *srcs]
+    upd["sources_v"] = 2
+    return cfg
+
+
 def _load_unlocked() -> dict:
     if CONFIG_PATH.is_file():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            return _merge(DEFAULT_CONFIG, data)
+            return _migrate_update_sources(_merge(DEFAULT_CONFIG, data))
         except (OSError, ValueError):
             pass
-    return copy.deepcopy(DEFAULT_CONFIG)
+    return _migrate_update_sources(copy.deepcopy(DEFAULT_CONFIG))
 
 
 def load() -> dict:
@@ -90,7 +115,7 @@ def load() -> dict:
 
 
 def _save_unlocked(cfg: dict) -> dict:
-    merged = _merge(DEFAULT_CONFIG, cfg)
+    merged = _migrate_update_sources(_merge(DEFAULT_CONFIG, cfg))
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -578,6 +578,25 @@ class TestDownloadFpkRedirectPolicy(unittest.TestCase):
         size = updater.download_fpk("http://a/x.fpk", self.dest, client=client)
         self.assertEqual(size, 2)
 
+    def test_redirect_to_foruda_gitee_host_allowed(self):
+        # Gitee 资产下载链恒可信：gitee.com → attach_files → foruda.gitee.com
+        # （实测两级跳转，foruda 是 Gitee 附件 CDN 主机）
+        target = "https://foruda.gitee.com/attach_file?token=t"
+        client = _FakeClient({
+            "https://gitee.com/a/x.fpk": [
+                _FakeResp(302, {"location": "/attach_files/y"})],
+            "https://gitee.com/attach_files/y": [
+                _FakeResp(302, {"location": target})],
+            target: [_FakeResp(200, {}, [b"ok"])],
+        })
+        size = updater.download_fpk("https://gitee.com/a/x.fpk", self.dest,
+                                    client=client)
+        self.assertEqual(size, 2)
+        self.assertEqual(client.requested,
+                         ["https://gitee.com/a/x.fpk",
+                          "https://gitee.com/attach_files/y",
+                          target])
+
     def test_relative_redirect_stays_on_own_host(self):
         client = _FakeClient({
             "http://a/x.fpk": [_FakeResp(302, {"location": "/y"})],

@@ -11,9 +11,9 @@
 安全边界：
   - 只接受官方 GitHub Releases 与「用户已配置镜像源」的 .fpk 地址
     （validate_asset_url，镜像前缀由 main 依配置传入）；
-  - 重定向逐跳手动跟随（≤5 跳）：跳点主机限「候选源主机 ∪ GitHub 资产
-    主机」白名单、scheme 限 http/https，防合法源 302 跳去任意主机绕过
-    地址校验；单文件下载上限 512MB（download_fpk）；
+  - 重定向逐跳手动跟随（≤5 跳）：跳点主机限「候选源主机 ∪ GitHub/Gitee
+    资产主机」白名单、scheme 限 http/https，防合法源 302 跳去任意主机
+    绕过地址校验；单文件下载上限 512MB（download_fpk）；
   - SHA256 fail-closed：清单缺校验值直接拒绝下载（allow_unverified 仅
     「用户手动输入地址」通道显式豁免）；
   - 只替换白名单条目（app/deploy/packaging/wheelhouse/VERSION 等），
@@ -47,6 +47,9 @@ DOWNLOAD_URL_PREFIX = f"https://github.com/{GITHUB_REPO}/releases/download/"
 # 镜像源主机由调用方按候选 URL 并入（download_fpk 内部再并本 URL 主机）。
 GITHUB_HOSTS = ("github.com", "objects.githubusercontent.com",
                 "release-assets.githubusercontent.com")
+# Gitee 下载链路（gitee.com → attach_files → foruda.gitee.com 附件 CDN）
+# 同样恒可信（实测两级跳转，foruda 是 Gitee 附件分发主机）。
+GITEE_HOSTS = ("gitee.com", "foruda.gitee.com")
 MAX_REDIRECTS = 5
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
@@ -233,12 +236,13 @@ def download_fpk(url: str, dest: Path,
     """流式下载 fpk 到 dest，过程回报进度；返回文件大小。
 
     P0-3 重定向加固：关掉自动重定向，手动逐跳跟随（≤5 跳）——
-    每跳 host 必须在白名单（本 URL 主机 ∪ extra_hosts ∪ GitHub 资产主机），
-    scheme 限 http/https；下载总量上限 512MB，防跳转钓鱼与超大文件灌盘。"""
+    每跳 host 必须在白名单（本 URL 主机 ∪ extra_hosts ∪ GitHub/Gitee
+    资产主机），scheme 限 http/https；下载总量上限 512MB，防跳转钓鱼
+    与超大文件灌盘。"""
     own_client = client is None
     allowed = {urlparse(url).hostname or "",
                *(urlparse(u).hostname or "" for u in extra_hosts),
-               *GITHUB_HOSTS}
+               *GITHUB_HOSTS, *GITEE_HOSTS}
     client = client or httpx.Client(timeout=120, follow_redirects=False,
                                     trust_env=True,
                                     headers={"user-agent": f"fnmedia-dl/{_read_version()}"})

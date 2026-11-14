@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""更新源解析：多源检查 + 下载候选（自建 RepoBox 镜像优先，GitHub 兜底）。
+"""更新源解析：多源检查 + 下载候选（Gitee 国内镜像优先，GitHub 兜底）。
 
 背景：GitHub Releases 在国内访问慢/超时。发行资产由 tools/sync_repobox.py
 自动同步到自建 RepoBox（raw 直链国内快），插件优先从镜像检查与下载，
@@ -7,7 +7,8 @@
 
 config 的 update 段：
   sources   [{name, type, ...}] 按序尝试，第一个可用为准。
-            type=repobox（base_url 留空自动跳过）| github。
+            type=gitee（国内优先，Gitee 镜像仓发行版）| repobox
+            （base_url 留空自动跳过）| github（官方兜底）。
   timeout   单次请求超时秒（默认 15）
   retries   单个源的请求尝试次数（默认 2，间隔递增）
 
@@ -22,6 +23,7 @@ import time
 import httpx
 
 GITHUB_API = "https://api.github.com"
+GITEE_API = "https://gitee.com/api/v5"
 
 
 class SourceError(RuntimeError):
@@ -42,6 +44,9 @@ def resolve_sources(cfg: dict) -> list[dict]:
             if not base:
                 continue                      # 未配域名 → 跳过（保持旧版行为）
             out.append({**s, "base_url": base})
+        elif typ == "gitee":
+            if s.get("repo"):
+                out.append(dict(s))
         elif typ == "github":
             if s.get("repo"):
                 out.append(dict(s))
@@ -54,6 +59,8 @@ def allowed_prefixes(cfg: dict) -> list[str]:
     for s in resolve_sources(cfg):
         if s.get("type") == "repobox":
             out.append(f"{s['base_url']}/raw/{s.get('repo') or 'fnmedia-dl'}/")
+        elif s.get("type") == "gitee":
+            out.append(f"https://gitee.com/{s['repo']}/releases/download/")
     return out
 
 
@@ -96,12 +103,14 @@ def _ver_newer(a: str, b: str) -> bool:
 
 def _get(client: httpx.Client, url: str, *, headers: dict,
          timeout: float, retries: int,
-         ok_status: tuple[int, ...] = (200,)) -> httpx.Response:
+         ok_status: tuple[int, ...] = (200,),
+         follow_redirects: bool = False) -> httpx.Response:
     """GET + 重试：网络类错误/非预期状态码按 attempts 重试，间隔递增。"""
     last = "请求失败"
     for attempt in range(max(1, int(retries))):
         try:
-            resp = client.get(url, headers=headers, timeout=timeout)
+            resp = client.get(url, headers=headers, timeout=timeout,
+                              follow_redirects=follow_redirects)
             if resp.status_code not in ok_status:
                 raise SourceError(f"HTTP {resp.status_code}")
             return resp
@@ -113,6 +122,28 @@ def _get(client: httpx.Client, url: str, *, headers: dict,
 
 
 # ------------------------------------------------------------ 源适配
+
+def _fill_sib_sha256(assets: list[dict], client: httpx.Client,
+                     timeout: float) -> None:
+    """发行配套 .sha256 资产 → 回填各 fpk 资产哈希（失败不阻断）。
+
+    GitHub/Gitee 的资产下载地址都会 302 到 CDN 资产主机（实测 release
+    资产恒 302），抓哈希文本必须跟随跳转，否则生产里抓空、fail-closed
+    直接拒绝下载；哈希文本被跳转顶掉最坏只造成校验不符（fail-closed），
+    不影响 fpk 本体逐跳白名单的下载闸。"""
+    for asset in assets:
+        if asset["name"].endswith(".fpk"):
+            sib = next((x for x in assets
+                        if x["name"] == asset["name"] + ".sha256"), None)
+            if sib and sib["url"]:
+                try:
+                    text = _get(client, sib["url"], headers={},
+                                timeout=timeout, retries=1,
+                                follow_redirects=True).text
+                    asset["sha256"] = (text.strip().split() or [""])[0].lower()
+                except SourceError:
+                    pass
+
 
 def _fetch_repobox(src: dict, client: httpx.Client, *,
                    timeout: float, retries: int, current: str) -> dict:
@@ -173,18 +204,7 @@ def _fetch_github(src: dict, client: httpx.Client, *,
                "size": int(a.get("size") or 0),
                "sha256": ""}
               for a in (data.get("assets") or []) if isinstance(a, dict)]
-    # 发行配套 .sha256 资产：读哈希供下载后校验（失败不阻断）
-    for asset in assets:
-        if asset["name"].endswith(".fpk"):
-            sib = next((x for x in assets
-                        if x["name"] == asset["name"] + ".sha256"), None)
-            if sib and sib["url"]:
-                try:
-                    text = _get(client, sib["url"], headers={},
-                                timeout=timeout, retries=1).text
-                    asset["sha256"] = (text.strip().split() or [""])[0].lower()
-                except SourceError:
-                    pass
+    _fill_sib_sha256(assets, client, timeout)
     tag = str(data.get("tag_name") or "").strip()
     return {"version": strip_ver(tag), "tag": tag,
             "notes": data.get("body") or "",
@@ -193,7 +213,47 @@ def _fetch_github(src: dict, client: httpx.Client, *,
             "assets": assets}
 
 
-_FETCHERS = {"repobox": _fetch_repobox, "github": _fetch_github}
+def _fetch_gitee(src: dict, client: httpx.Client, *,
+                 timeout: float, retries: int, current: str) -> dict:
+    """Gitee 发行版（国内镜像仓）：响应形状近 GitHub，但 release 无
+    html_url（代码合成）、资产无 size 字段（置 0，下载走跳过大小校验）。
+
+    404 / 缺 tag_name 一律按「源不可用」抛 SourceError 落入下一源——
+    Gitee 是镜像角色：镜像仓未建/未公开/未同步时不能把「空清单」误报成
+    「无更新」，必须让检查继续落到 GitHub 兜底源。"""
+    repo = src["repo"]
+    headers = {"user-agent": f"fnmedia-dl/{current}"}
+    if src.get("token"):
+        headers["Authorization"] = f"token {src['token']}"
+    resp = _get(client, f"{GITEE_API}/repos/{repo}/releases/latest",
+                headers=headers, timeout=timeout, retries=retries,
+                ok_status=(200, 404))
+    if resp.status_code == 404:
+        raise SourceError("镜像仓不可用或暂无发布版本")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise SourceError("响应不是合法 JSON")
+    if not isinstance(data, dict):
+        raise SourceError("响应格式异常")
+    tag = str(data.get("tag_name") or "").strip()
+    if not tag or not strip_ver(tag):
+        raise SourceError("发行版缺少 tag_name 或版本号为空")
+    assets = [{"name": a.get("name") or "",
+               "url": a.get("browser_download_url") or "",
+               "size": int(a.get("size") or 0),
+               "sha256": ""}
+              for a in (data.get("assets") or []) if isinstance(a, dict)]
+    _fill_sib_sha256(assets, client, timeout)
+    return {"version": strip_ver(tag), "tag": tag,
+            "notes": data.get("body") or "",
+            "html_url": data.get("html_url")
+            or f"https://gitee.com/{repo}/releases/tag/{tag}",
+            "assets": assets}
+
+
+_FETCHERS = {"repobox": _fetch_repobox, "github": _fetch_github,
+             "gitee": _fetch_gitee}
 
 
 # ------------------------------------------------------------ 归一化
@@ -201,7 +261,7 @@ _FETCHERS = {"repobox": _fetch_repobox, "github": _fetch_github}
 def _syntactic_url(src: dict, tag: str, name: str) -> str:
     """按约定推导某资产在该源上的直链（用作下载回退候选）。
     布局约定：RepoBox 同步脚本存 releases/{tag}/{name}（tools/sync_repobox.py），
-    GitHub 为 releases/download/{tag}/{name}。"""
+    GitHub/Gitee 为 releases/download/{tag}/{name}。"""
     if not name or ".." in name or not tag:
         return ""
     if src.get("type") == "repobox":
@@ -209,6 +269,9 @@ def _syntactic_url(src: dict, tag: str, name: str) -> str:
                 f"/releases/{tag}/{name}")
     if src.get("type") == "github":
         return (f"https://github.com/{src['repo']}/releases/"
+                f"download/{tag}/{name}")
+    if src.get("type") == "gitee":
+        return (f"https://gitee.com/{src['repo']}/releases/"
                 f"download/{tag}/{name}")
     return ""
 
