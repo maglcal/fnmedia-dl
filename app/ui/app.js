@@ -1356,14 +1356,41 @@ on("#btnQueueSave", "click", async () => {
 
 function _renderNotes(md) {
   // 极简 markdown → HTML：先转义防 XSS，再按块转换。
-  // 2026-11-13 间距美化：①归一 CRLF——\r 曾被 pre-wrap 当换行二次折行，
-  // 空档翻倍；②空行只作分块边界，不再生成 <br><br>；③标题/引用/列表各自
-  // 成块（真 <ul>/<blockquote>），行距由 CSS 统一收紧，消除叠出的大空档。
+  // 2026-11-13 间距美化：①归一 CRLF；②空行只作分块边界；③标题/引用/列表
+  // 各自成块（真 <ul>/<blockquote>）。
+  // 2026-11-14 续行并入（0.1.41.4）：源文件为可读性硬换行（50~60 字一行），
+  // 此前每行渲染成独立块 → 文本列停在源换行处、右侧大片空白（假"半宽"）。
+  // 现按 markdown 段落语义：换行只是软换行，续行并入当前 <li>/<p>，
+  // 由 CSS 按容器宽度自适应折行。
   const lines = esc(md || "").replace(/\r\n?/g, "\n").split("\n");
   const out = [];
   let inList = false;
-  const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+  let mode = "";                       // "" | "p" | "li"（当前续行要并入的块）
+  let buf = [];
   const inline = (t) => t.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+  // 软换行拼接：中英/中数边界补一个空格，其余直接相接（"、"+"「" 不插空格）
+  const _cjk = (c) => /[\u3400-\u4dbf\u4e00-\u9fff]/.test(c);
+  const _alnum = (c) => /[A-Za-z0-9]/.test(c);
+  const joinSoft = (parts) => {
+    let s = parts[0] || "";
+    for (let i = 1; i < parts.length; i++) {
+      const t = parts[i] || "";
+      const a = s.slice(-1), b = t.slice(0, 1);
+      const gap = ((_alnum(a) && (_alnum(b) || _cjk(b)))
+                || (_cjk(a) && _alnum(b))) ? " " : "";
+      s += gap + t;
+    }
+    return s;
+  };
+  const flush = () => {
+    if (mode === "li") out.push(`<li>${inline(joinSoft(buf))}</li>`);
+    else if (mode === "p") out.push(`<p>${inline(joinSoft(buf))}</p>`);
+    buf = []; mode = "";
+  };
+  const closeList = () => {
+    flush();
+    if (inList) { out.push("</ul>"); inList = false; }
+  };
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) { closeList(); continue; }
@@ -1375,14 +1402,16 @@ function _renderNotes(md) {
       closeList();
       out.push(`<blockquote>${inline(m[1])}</blockquote>`);
     } else if ((m = line.match(/^[-*]\s+(.+)$/))) {
+      flush();                          // 新列表项先收上一项，但不闭合 <ul>
       if (!inList) { out.push("<ul>"); inList = true; }
-      out.push(`<li>${inline(m[1])}</li>`);
+      mode = "li"; buf = [m[1]];
     } else if (/^(-{3,}|\*{3,}|_{3,})$/.test(line)) {
       closeList();
       out.push("<hr>");
+    } else if (mode) {
+      buf.push(line);                   // 续行并入当前块
     } else {
-      closeList();
-      out.push(`<p>${inline(line)}</p>`);
+      mode = "p"; buf = [line];
     }
   }
   closeList();
