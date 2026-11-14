@@ -30,8 +30,17 @@ _IS_WIN = sys.platform == "win32"
 def locked(path: Path, timeout: float = _TIMEOUT):
     """互斥访问 path 对应的 .lock 伴生文件（不碰数据文件本身）。"""
     lock_path = Path(str(path) + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except PermissionError as exc:
+        # 0.1.41.2 事故教训：root 身份写 state 会留下 root 属主 0600 的
+        # 锁文件/目录，服务用户打不开 → 所有写配置路径全挂。报错要说人话。
+        raise PermissionError(
+            f"无法打开状态文件锁 {lock_path}（权限不足）。"
+            "多为 state 目录/文件属主不是服务用户（root 身份写入过 state）；"
+            "修复属主后重试"
+        ) from exc
     try:
         _acquire(fd, timeout)
         try:

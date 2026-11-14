@@ -208,7 +208,14 @@ def run(version: str = "") -> dict:
     """执行全链路自诊断 → {"ok", "version", "steps": [...]}。
     ok = 关键步骤全绿（api-pan 对照是信息性步骤，不计入 ok；
     「设备 API 发现」单独失败但同链路后续步骤成功时按瞬态处理，不计异常）。"""
-    cfg = cfgmod.load()
+    try:
+        cfg = cfgmod.load()
+    except cfgmod.ConfigError as exc:
+        # 0.1.41.3：配置读不到（属主/权限错乱）要在自诊断亮红步说真因，
+        # 不能让整个诊断接口 500、用户只见一片红无从下手。
+        return {"ok": False, "version": version,
+                "steps": [{"step": "配置加载", "ok": False, "ms": 0,
+                           "detail": str(exc)}]}
     steps: list[dict] = []
 
     # ---- A 服务端配置面

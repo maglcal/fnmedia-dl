@@ -43,4 +43,21 @@ fndl_sync_paths() {
     echo "FNDL_DATA_DIR=${_data}"
     echo "FNDL_ACCESSIBLE_PATHS=${TRIM_DATA_ACCESSIBLE_PATHS:-}"
   } > "${_out}.tmp" 2>/dev/null && mv -f "${_out}.tmp" "${_out}" 2>/dev/null || true
+  chmod 0644 "${_out}" 2>/dev/null || true
+  fndl_heal_state
+}
+# state 属主自愈（0.1.41.3 事故防御）：生命周期脚本以 root 跑，root 写
+# state（paths.env / config.json / 锁文件）后必须把属主交还服务用户，
+# 否则服务读写全挂——配置"丢失"、锁文件 Permission denied。幂等可重复。
+# 只处理 state 顶层条目（xunlei-data 等子目录内容归容器管理，不递归）。
+fndl_heal_state() {
+  [ -n "${FNDL_REPO_DIR}" ] || return 0
+  local _st="${FNDL_REPO_DIR}/state"
+  [ -d "${_st}" ] || return 0
+  chown fnmedia-dl:fnmedia-dl "${_st}" 2>/dev/null || true
+  local _f
+  for _f in "${_st}"/* "${_st}"/.[!.]* "${_st}"/..?*; do
+    [ -e "${_f}" ] || continue
+    chown fnmedia-dl:fnmedia-dl "${_f}" 2>/dev/null || true
+  done
 }

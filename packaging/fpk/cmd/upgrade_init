@@ -22,7 +22,20 @@ fi
 BACKUP_DIR="${TRIM_TEMP_UPGRADE_FOLDER:-${TRIM_PKGVAR:-/tmp}}/fnmedia-dl-upgrade-backup"
 rm -rf "${BACKUP_DIR}"; mkdir -p "${BACKUP_DIR}"
 if [ -d "${FNDL_REPO_DIR}/state" ]; then
+  # 备份失败必须中止升级（0.1.41.2 事故：|| true 吞错 → App Center 重建
+  # repo 后 state 全丢且无人知晓）。升级尚未替换文件，中止 = 数据完好。
   tar --ignore-failed-read -czf "${BACKUP_DIR}/state.tar.gz" \
-    -C "${FNDL_REPO_DIR}" state >> "${FNDL_LOG}" 2>&1 || true
+    -C "${FNDL_REPO_DIR}" state >> "${FNDL_LOG}" 2>&1 \
+    || fndl_fail "升级前备份配置/任务记录失败，已中止升级以保护数据（详见 ${FNDL_LOG}）"
+  [ -s "${BACKUP_DIR}/state.tar.gz" ] \
+    || fndl_fail "升级前状态备份为空（state.tar.gz），已中止升级以保护数据"
+  # 第二份备份落持久区（TRIM_PKGVAR）：防 TRIM_TEMP_UPGRADE_FOLDER 两阶段
+  # 路径不一致 / 临时目录被清导致恢复时找不到备份。保留最近两份。
+  if [ -n "${TRIM_PKGVAR:-}" ]; then
+    _pb="${TRIM_PKGVAR}/fnmedia-dl-state-backup"
+    mkdir -p "${_pb}" 2>/dev/null || true
+    [ -f "${_pb}/state.tar.gz" ] && mv -f "${_pb}/state.tar.gz" "${_pb}/state.tar.gz.1" 2>/dev/null || true
+    cp -f "${BACKUP_DIR}/state.tar.gz" "${_pb}/state.tar.gz" 2>/dev/null || true
+  fi
 fi
 exit 0

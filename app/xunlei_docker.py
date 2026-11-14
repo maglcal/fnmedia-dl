@@ -62,6 +62,34 @@ def _state_file() -> Path:
     return Path(cfgmod.STATE_DIR) / "xunlei-deploy.json"
 
 
+def _heal_state_owner() -> None:
+    """root 身份写 state 后把属主交还服务用户（0.1.41.3 事故防御）。
+
+    install_callback 以 root 跑本脚本，cfgmod.save() 会写出 root 属主
+    0600 的 config.json / config.json.lock——服务用户读不到配置（登录
+    信息"丢失"）、打不开锁（所有写路径 Permission denied）。只处理
+    state 顶层条目（xunlei-data 等子目录内容归容器管理，不递归）。"""
+    if getattr(os, "geteuid", lambda: -1)() != 0:
+        return
+    try:
+        import grp
+        import pwd
+        uid = pwd.getpwnam("fnmedia-dl").pw_uid
+        gid = grp.getgrnam("fnmedia-dl").gr_gid
+    except (ImportError, KeyError):
+        return
+    try:
+        st_dir = Path(cfgmod.STATE_DIR)
+        os.chown(st_dir, uid, gid)
+        for p in st_dir.iterdir():
+            try:
+                os.chown(p, uid, gid)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def progress() -> dict:
     st = {"stage": "idle", "percent": 0, "detail": "", "error": "",
           "done": False, "pid": 0}
@@ -91,6 +119,7 @@ def _set(stage: str | None = None, percent: int | None = None,
         os.replace(tmp, _state_file())
     except OSError:
         pass
+    _heal_state_owner()
     return st
 
 
@@ -286,6 +315,7 @@ def _configure(dl_dir: Path) -> None:
     if dl_dir.name and not (te.get("dir") or "").strip():
         te["dir"] = "/xunlei/downloads"
     cfgmod.save(cfg)
+    _heal_state_owner()
 
 
 # ------------------------------------------------------------ 面板就绪

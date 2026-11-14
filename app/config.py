@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -68,6 +69,14 @@ DEFAULT_CONFIG: dict = {
 _lock = threading.Lock()
 
 
+class ConfigError(RuntimeError):
+    """配置文件无法读取（权限/属主错乱等），区别于「文件不存在」。
+
+    0.1.41.2 事故教训：读失败被静默吞成默认配置，把「读不到」伪装成
+    「用户没配置过」（登录信息凭空"丢失"），且后续 save() 会用默认值
+    覆盖真实配置。必须大声失败，把真因露给用户。"""
+
+
 def _merge(base: dict, override: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in (override or {}).items():
@@ -100,13 +109,26 @@ def _migrate_update_sources(cfg: dict) -> dict:
 
 
 def _load_unlocked() -> dict:
-    if CONFIG_PATH.is_file():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            return _migrate_update_sources(_merge(DEFAULT_CONFIG, data))
-        except (OSError, ValueError):
-            pass
-    return _migrate_update_sources(copy.deepcopy(DEFAULT_CONFIG))
+    try:
+        text = CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _migrate_update_sources(copy.deepcopy(DEFAULT_CONFIG))
+    except OSError as exc:
+        # 权限/IO 失败 ≠ 文件不存在：真实配置可能完好躺在盘上，只是读不到。
+        # 回退默认配置会让用户误以为数据丢失，且 save() 会覆盖真实配置。
+        raise ConfigError(
+            f"无法读取配置文件 {CONFIG_PATH}（{exc.strerror or exc}）。"
+            "多为 state 目录或文件属主不是服务用户（root 身份写入过 state）；"
+            "修复属主后重试，配置数据不会丢失"
+        ) from exc
+    try:
+        data = json.loads(text)
+    except ValueError:
+        # 文件损坏（非权限问题）：回退默认配置，但必须留痕
+        print(f"[fnmedia-dl] 配置文件损坏，已回退默认配置：{CONFIG_PATH}",
+              file=sys.stderr)
+        return _migrate_update_sources(copy.deepcopy(DEFAULT_CONFIG))
+    return _migrate_update_sources(_merge(DEFAULT_CONFIG, data))
 
 
 def load() -> dict:
