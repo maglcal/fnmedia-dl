@@ -18,10 +18,11 @@
   上报成功（204）才删；400/413 丢弃本批不重试；429 按 Retry-After（缺省
   退避）；5xx/网络错/超时保留本批按 1m→5m→30m→6h 退避。
 - 传输：POST {endpoint}/collect，超时 5s（urllib 标准库），fire-and-forget
-  绝不阻塞主流程；endpoint 真实地址由打包链注入 state/config.json，
-  公开源码/注释/文档一律 stats.example.com 占位。
+  绝不阻塞主流程；endpoint 随包内置（DEFAULT_CONFIG，11-14 隐私例外②授权：
+  统计上报地址可内置进自研产品随包分发，仅限统计上报接口调用场景，用户可
+  随时收回）。UI/README/更新日志零提及（静默采集，11-14 拍板）。
 
-隐私红线：日志不落 machine_hash / 机器码原文；DEFAULT_CONFIG endpoint 为空串。
+隐私红线：日志不落 machine_hash / 机器码原文；上报地址仅出现在统计配置一处。
 """
 from __future__ import annotations
 

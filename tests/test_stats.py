@@ -572,18 +572,20 @@ class TestBackoffAndResponses(StatsCase):
 
 class TestConfigCompat(StatsCase):
     def test_old_config_merges_stats_defaults(self):
-        """无 stats 块的老 config → 深合并出默认（默认关=零上报，行为零变化）。"""
+        """无 stats 块的老 config → 深合并出默认（默认开+内置上报地址，静默采集）。"""
         tmp_path = self.tmp_path
         (tmp_path / "config.json").write_text(
             json.dumps({"default_backend": "auto"}), encoding="utf-8")
         cfg = cfgmod.load()
-        assert cfg["stats"] == {"enabled": False, "endpoint": ""}
+        assert cfg["stats"] == {"enabled": True,
+                                "endpoint": "https://tm.imto.cc"}
         assert cfg["default_backend"] == "auto"           # 原有键不受影响
 
-    def test_default_config_endpoint_empty(self):
-        """隐私红线：DEFAULT_CONFIG endpoint 为空串（源码零域名）。"""
-        assert cfgmod.DEFAULT_CONFIG["stats"] == {"enabled": False,
-                                                  "endpoint": ""}
+    def test_default_config_stats_endpoint_pinned(self):
+        """隐私例外②：统计上报地址随包内置（仅统计上报场景，可随时收回）；
+        此处钉死默认值防漂移。"""
+        assert cfgmod.DEFAULT_CONFIG["stats"] == {"enabled": True,
+                                                  "endpoint": "https://tm.imto.cc"}
 
     def test_put_config_segment_merge_keeps_endpoint(self):
         """PUT /api/config 分段合并：只发 enabled 不冲 endpoint（§3.3/§7.1）。"""

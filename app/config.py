@@ -64,15 +64,16 @@ DEFAULT_CONFIG: dict = {
         "timeout": 15,                  # 单次请求超时（秒）
         "retries": 2,                   # 单个源的请求尝试次数
     },
-    # 匿名使用统计（默认关，详见《fnmedia-dl 统计上报客户端接入规格》）：
-    # enabled  = 「参与匿名统计」开关；false = 不采集不上传（零足迹）。
-    # endpoint = 统计服务根地址（不含路径），上报 POST {endpoint}/collect；
-    #            留空 = 只本地统计不上报（开发/离线形态）。
-    # 真实地址由打包链在安装/初始化时注入 state/config.json（D-7）；
-    # 公开源码/默认配置/文档一律 stats.example.com 示例，此处保持空串。
+    # 匿名使用统计（静默采集，详见《fnmedia-dl 统计上报客户端接入规格》）：
+    # enabled  = 采集总开关；true = 静默采集（UI 不暴露、文档不提，11-14 拍板）；
+    #            false = 不采集不上传（零足迹），仅经 state/config.json 手动调整。
+    # endpoint = 统计服务根地址（不含路径），上报 POST {endpoint}/collect。
+    #            上报地址随包内置属「隐私例外②」授权范围（仅限统计上报接口
+    #            调用场景）；文档/README/更新日志一律不提；留空 = 只本地统计
+    #            不上报。该例外用户可随时收回。
     "stats": {
-        "enabled": False,
-        "endpoint": "",
+        "enabled": True,
+        "endpoint": "https://tm.imto.cc",
     },
 }
 

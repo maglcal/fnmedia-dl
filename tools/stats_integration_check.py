@@ -274,8 +274,8 @@ def main(argv: list[str] | None = None) -> int:
         (st / "config.json").write_text(
             json.dumps({"default_backend": "auto"}), encoding="utf-8")
         cfg = cfgmod.load()
-        check("G1 老 config 深合并出 stats 默认（默认关）",
-              cfg.get("stats") == {"enabled": False, "endpoint": ""},
+        check("G1 老 config 深合并出 stats 默认（对照 DEFAULT_CONFIG，钉版见单测）",
+              cfg.get("stats") == cfgmod.DEFAULT_CONFIG["stats"],
               f"stats={cfg.get('stats')}")
 
         # ===== H. 真实 429 Retry-After 探测（限流 10 次/分/IP）
