@@ -20,6 +20,19 @@
       "is_docker": false,
       "service_port": "",
       "releases": {
+        "0.1.42": {
+          "changelog": "安全加固（鉴权 fail-closed、跨进程文件锁、更新链 SHA256 校验与原子替换）；更新源接入 Gitee 国内镜像（优先）；升级后配置丢失/无法登录修复；升级备份/恢复加固；更新内容渲染与排版修复；内部优化与稳定性改进。",
+          "updated_at": "2026-11-14T21:30:00+08:00",
+          "os_min_version": "1.2.0",
+          "packages": {
+            "all": {
+              "download_url": "https://github.com/maglcal/fnmedia-dl/releases/download/main-v0.1.42/fnmedia-dl-main-v0.1.42.fpk",
+              "sha256": "4d65015063f6ab067d005030c4051f6cb34e7c84b340a15c52dcdc381ca562b1",
+              "size": 25417696,
+              "updated_at": "2026-11-14T21:30:00+08:00"
+            }
+          }
+        },
         "0.1.41": {
           "changelog": "启动加载页（四步动画）；安装/升级环境准备修复（CRLF 根因三层修复）；依赖引导加固（离线 wheelhouse 全架构、venv 清理）；失败诊断增强（报错弹窗直接带退出码与错误内容）。",
           "updated_at": "2026-11-12T10:23:00+08:00",
