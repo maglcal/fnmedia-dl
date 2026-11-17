@@ -140,6 +140,38 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(links[0]["kind"], "magnet")
         self.assertTrue(links[0]["dispatchable"])
 
+    @staticmethod
+    def _torrent_bytes() -> tuple[bytes, str]:
+        import hashlib
+        info_raw = (b"d6:lengthi12345e4:name4:test"
+                    b"12:piece lengthi16384e6:pieces20:" + b"\x00" * 20 + b"e")
+        data = b"d4:info" + info_raw + b"e"
+        return data, hashlib.sha1(info_raw).hexdigest()
+
+    def test_parse_torrent_upload(self):
+        """种子上传解析：字节进，磁力出（info 哈希归一）。"""
+        data, expect = self._torrent_bytes()
+        r = self.client.post("/api/parse/torrent?name=demo.torrent",
+                             content=data)
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["kind"], "torrent")
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["meta"]["infohash"], expect)
+        self.assertTrue(body["url"].startswith("magnet:?xt=urn:btih:" + expect))
+
+    def test_parse_torrent_upload_corrupt(self):
+        r = self.client.post("/api/parse/torrent?name=bad.torrent",
+                             content=b"not a torrent")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("种子文件", body["reason"])
+
+    def test_parse_torrent_upload_too_big(self):
+        r = self.client.post("/api/parse/torrent", content=b"x" * (11 * 1024 * 1024))
+        self.assertEqual(r.status_code, 413)
+
     def test_create_tasks(self):
         good = FakeBackend("aria2", "aria2")
         self._patch_backends({"aria2": good})

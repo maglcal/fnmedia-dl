@@ -115,6 +115,58 @@ class TestTorrentFile(unittest.TestCase):
     def test_corrupt(self):
         self.assertIsNone(links.torrent_infohash(b"not a torrent"))
 
+    def _make_torrent_with_trackers(self) -> tuple[bytes, str]:
+        def bs(s: str) -> bytes:
+            b = s.encode("utf-8")
+            return str(len(b)).encode() + b":" + b
+        info_raw = (b"d6:lengthi12345e4:name4:test"
+                    b"12:piece lengthi16384e6:pieces20:" + b"\x00" * 20 + b"e")
+        a = bs("udp://tracker.example.com:80/announce")
+        b2 = bs("http://t2.example.com/announce")
+        top = (b"d8:announce" + a +
+               b"13:announce-listll" + a + b"el" + b2 + b"ee" +
+               b"4:info" + info_raw + b"e")
+        return top, hashlib.sha1(info_raw).hexdigest()
+
+    def test_trackers_extracted(self):
+        """announce/announce-list 归一进磁力 tr= 参数（0.1.42.1）。"""
+        data, expect = self._make_torrent_with_trackers()
+        info = links.parse_torrent_bytes(data, "demo.torrent")
+        self.assertTrue(info.ok)
+        self.assertEqual(info.meta["infohash"], expect)
+        self.assertEqual(info.meta["trackers"],
+                         ["udp://tracker.example.com:80/announce",
+                          "http://t2.example.com/announce"])
+        self.assertIn("tr=udp%3A%2F%2Ftracker.example.com%3A80%2Fannounce",
+                      info.url)
+
+    def test_parse_bytes_name_from_info(self):
+        data, _ = self._make_torrent()
+        info = links.parse_torrent_bytes(data, "随便.torrent")
+        self.assertEqual(info.display, "test")   # info.name 优先于文件名
+
+    def test_parse_line_local_path(self):
+        """本地 .torrent 路径接线：parse_line 直出归一磁力（0.1.42.1）。"""
+        import tempfile
+        data, expect = self._make_torrent()
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "demo.torrent"
+            p.write_bytes(data)
+            info = links.parse_line(str(p))
+        self.assertTrue(info.ok)
+        self.assertEqual(info.kind, "torrent")
+        self.assertTrue(info.url.startswith("magnet:?xt=urn:btih:" + expect))
+
+    def test_parse_line_missing_path(self):
+        info = links.parse_line("/no/such/file.torrent")
+        self.assertFalse(info.ok)
+        self.assertIn("无法读取种子文件", info.reason)
+
+    def test_split_path_with_space_kept_whole(self):
+        """含空格的 .torrent 路径整行成条，不被盲拆（0.1.42.1）。"""
+        got = links.parse_text("/vol1/电影/my torrent file.torrent")
+        self.assertEqual(len(got), 1)
+
 
 class TestParseText(unittest.TestCase):
     HEX = "0123456789abcdef0123456789abcdef01234567"

@@ -195,6 +195,56 @@ def torrent_infohash(data: bytes) -> str | None:
         return None
 
 
+def _torrent_trackers(top: dict) -> list[str]:
+    """提取 announce / announce-list 的 tracker 地址（保序去重，上限 20 条）。"""
+    out: list[str] = []
+
+    def _push(v: object) -> None:
+        if isinstance(v, bytes):
+            s = v.decode("utf-8", errors="replace").strip()
+            if s.startswith(("http://", "https://", "udp://", "wss://")):
+                if s not in out:
+                    out.append(s)
+        elif isinstance(v, list):
+            for item in v:
+                _push(item)
+
+    _push(top.get(b"announce"))
+    _push(top.get(b"announce-list"))
+    return out[:20]
+
+
+def parse_torrent_bytes(data: bytes, source: str = "") -> LinkInfo:
+    """种子文件字节 → 提取 info 哈希/名称/tracker → 归一化为 magnet。
+
+    source 仅用于报错提示与 meta 记录（本地路径或上传文件名）。"""
+    if not data:
+        return LinkInfo(kind="torrent", url=source, ok=False,
+                        reason="种子文件为空")
+    digest = torrent_infohash(data)
+    if not digest:
+        return LinkInfo(kind="torrent", url=source, ok=False,
+                        reason="种子文件损坏或缺少 info 字段（不是有效的 .torrent）")
+    name = (source or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    name = name[:-8] if name.lower().endswith(".torrent") else name
+    trackers: list[str] = []
+    try:
+        top, _ = _bdecode(data, 0)
+        if isinstance(top, dict):
+            info = top.get(b"info", {})
+            raw_name = info.get(b"name") if isinstance(info, dict) else None
+            if isinstance(raw_name, bytes):
+                name = raw_name.decode("utf-8", errors="replace") or name
+            trackers = _torrent_trackers(top)
+    except (ValueError, _BencodeError, AttributeError):
+        pass
+    magnet = magnet_from_infohash(digest, dn=name, trackers=trackers)
+    return LinkInfo(kind="torrent", url=magnet, display=name,
+                    meta={"infohash": digest, "trackers": trackers,
+                          "source_file": source,
+                          "resolved_magnet": magnet})
+
+
 def parse_torrent_file(path: str | Path) -> LinkInfo:
     p = Path(path)
     try:
@@ -202,22 +252,7 @@ def parse_torrent_file(path: str | Path) -> LinkInfo:
     except OSError as exc:
         return LinkInfo(kind="torrent", url=str(p), ok=False,
                         reason=f"无法读取种子文件：{exc}")
-    digest = torrent_infohash(data)
-    if not digest:
-        return LinkInfo(kind="torrent", url=str(p), ok=False,
-                        reason="种子文件损坏或缺少 info 字段")
-    name = p.stem
-    try:
-        top, _ = _bdecode(data, 0)
-        raw_name = top.get(b"info", {}).get(b"name")  # type: ignore[union-attr]
-        if isinstance(raw_name, bytes):
-            name = raw_name.decode("utf-8", errors="replace") or name
-    except (ValueError, _BencodeError, AttributeError):
-        pass
-    magnet = magnet_from_infohash(digest, dn=name)
-    return LinkInfo(kind="torrent", url=magnet, display=name,
-                    meta={"infohash": digest, "source_file": str(p),
-                          "resolved_magnet": magnet})
+    return parse_torrent_bytes(data, str(p))
 
 
 def magnet_from_infohash(infohash: str, dn: str = "", trackers: list[str] | None = None) -> str:
@@ -281,6 +316,9 @@ def parse_line(line: str) -> LinkInfo:
         return parse_ed2k(url)
     if low.startswith(("http://", "https://", "ftp://")):
         return parse_direct(url)
+    if low.endswith(".torrent"):
+        # 本地种子文件路径（NAS 绝对路径/相对路径）→ 提取 info 哈希归一为磁力
+        return parse_torrent_file(url)
     return LinkInfo(kind="unknown", url=url, ok=False,
                     reason="无法识别的链接协议（支持 magnet/thunder/http/ftp/ed2k/.torrent）")
 
@@ -316,6 +354,11 @@ def split_links(text: str) -> list[str]:
                 if seg:
                     chunks.append(seg)
         else:
+            # 无协议前缀的整行 .torrent 路径按单条处理（路径可含空格，
+            # 盲拆会截断）；其余才按分隔符兜底拆
+            if line.lower().endswith(".torrent"):
+                chunks.append(line)
+                continue
             for seg in re.split(r"[\s,;，；、]+", line):
                 if seg.strip():
                     chunks.append(seg.strip())

@@ -24,6 +24,7 @@
   GET  /api/fs/paths         共享目录 / 已授权目录清单
   GET  /api/fs/check         目录可用性检测（存在 + 可写探针）
   POST /api/parse            批量链接解析
+  POST /api/parse/torrent    种子文件上传解析（.torrent 字节 → 归一磁力）
   POST /api/tasks            批量派发下载
   GET  /api/tasks            统一任务列表
   POST /api/history/check    下载历史查重（是否下载过某链接）
@@ -50,7 +51,7 @@ import time
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -748,6 +749,22 @@ class ParseReq(BaseModel):
 @app.post("/api/parse")
 def parse_links(req: ParseReq):
     return {"links": [li.to_dict() for li in linksmod.parse_text(req.text)]}
+
+
+# 种子文件上传上限（正常 .torrent 远小于此；防恶意大包）
+_TORRENT_MAX = 10 * 1024 * 1024
+
+
+@app.post("/api/parse/torrent")
+async def parse_torrent_upload(request: Request, name: str = ""):
+    """种子文件上传解析：.torrent 原始字节 → 提取 info 哈希/名称/tracker →
+    归一化为磁力。返回与 /api/parse 单条同构的 LinkInfo dict，前端把
+    url（磁力）追加进解析框随批量流程派发。"""
+    data = await request.body()
+    if len(data) > _TORRENT_MAX:
+        raise HTTPException(413, "种子文件过大（上限 10MB）")
+    info = linksmod.parse_torrent_bytes(data, name or "upload.torrent")
+    return info.to_dict()
 
 
 class TaskCreateReq(BaseModel):

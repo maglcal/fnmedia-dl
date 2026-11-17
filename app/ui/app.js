@@ -128,6 +128,47 @@ on("#btnParse", "click", async () => {
   }
 });
 
+/* ---------------- 种子文件上传（0.1.42.1） ----------------
+   拖入解析框或点按钮选 .torrent → 后端提取信息哈希/名称/tracker
+   归一为磁力 → 追加进解析框随批量流程派发。 */
+async function addTorrentFiles(files) {
+  const list = Array.from(files || []).filter((f) => /\.torrent$/i.test(f.name));
+  if (!list.length) return toast("请选择 .torrent 种子文件");
+  let ok = 0;
+  for (const f of list) {
+    try {
+      const buf = await f.arrayBuffer();
+      const r = await fetch(
+        API._rel(`api/parse/torrent?name=${encodeURIComponent(f.name)}`), {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: buf,
+        });
+      if (!r.ok) throw new Error(await errText(r));
+      const info = await r.json();
+      if (!info.ok) throw new Error(info.reason || "解析失败");
+      const ta = $("#linkInput");
+      ta.value = (ta.value ? ta.value.replace(/\s+$/, "") + "\n" : "") + info.url;
+      ok++;
+    } catch (e) {
+      toast(`种子「${f.name}」解析失败：${e.message}`);
+    }
+  }
+  if (ok) toast(`✓ 已解析 ${ok} 个种子并加入列表，点「解析链接」确认后下载`);
+}
+on("#btnTorrent", "click", () => $("#torrentFile").click());
+on("#torrentFile", "change", (e) => {
+  addTorrentFiles(e.target.files);
+  e.target.value = "";
+});
+on("#linkInput", "dragover", (e) => e.preventDefault());
+on("#linkInput", "drop", (e) => {
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.files.length) {
+    addTorrentFiles(e.dataTransfer.files);
+  }
+});
+
 function renderParse(links) {
   const card = $("#parseCard");
   card.hidden = false;

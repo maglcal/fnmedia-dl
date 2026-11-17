@@ -16,8 +16,8 @@ NAS 多通道下载管理工具（fnOS 第三方应用）。批量解析磁力 /
 ## 功能
 
 - **链接解析**：magnet（hex/base32 信息哈希、dn、tracker）、thunder://（AA/ZZ 套壳解码）、
-  http/ftp 直链、.torrent URL 与本地种子文件（bencode 解析 info 哈希，归一化为 magnet）；
-  ed2k 解析结构供展示、暂不派发
+  http/ftp 直链、.torrent 种子文件（拖入/上传/粘贴本地路径，bencode 解析 info 哈希与
+  tracker 归一化为 magnet）与 .torrent 下载链接；ed2k 解析结构供展示、暂不派发
 - **批量派发**：一次粘贴多条链接混排，逐条解析、逐条派发，结果逐条回报
 - **自动降级**：auto 模式按「迅雷远程 → 迅雷引擎 → aria2」顺序尝试，通道不可用或创建
   失败自动落下一个通道

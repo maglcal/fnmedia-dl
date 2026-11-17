@@ -229,10 +229,12 @@
     <div class="card">
       <div class="card-head">
         <h2>粘贴下载链接</h2>
-        <span class="hint">每行一条，也可混排逗号分隔</span>
+        <span class="hint">每行一条，也可混排逗号分隔；.torrent 种子文件可拖入解析框或点按钮上传</span>
       </div>
       <textarea id="linkInput" rows="7" spellcheck="false"
         placeholder="magnet:?xt=urn:btih:…&#10;thunder://…&#10;https://example.com/file.iso"></textarea>
+      <input type="file" id="torrentFile" accept=".torrent,application/x-bittorrent"
+        multiple hidden>
       <div class="kind-legend">
         <span class="kind magnet">magnet</span>
         <span class="kind thunder">thunder</span>
@@ -241,6 +243,7 @@
         <span class="kind ed2k">ed2k 仅解析</span>
       </div>
       <div class="actions">
+        <button id="btnTorrent" class="btn ghost">上传种子文件</button>
         <button id="btnParse" class="btn ghost">解析链接</button>
         <button id="btnDispatch" class="btn primary">开始下载</button>
       </div>
