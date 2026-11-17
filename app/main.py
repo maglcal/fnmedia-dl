@@ -918,6 +918,13 @@ def _stats_start():
     statsmod.on_startup()
 
 
+@app.on_event("shutdown")
+def _stats_stop():
+    """进程退出前停上报线程：释放 stats.db 连接，干净退场（Windows 下
+    被占用的文件无法删除，残留句柄会挡住 state 清理/备份操作）。"""
+    statsmod.shutdown()
+
+
 @app.on_event("startup")
 def _queue_worker_start():
     """队列定时派发守护线程：每 30s 检查一次，到点且当天未跑过则派发待发项。"""

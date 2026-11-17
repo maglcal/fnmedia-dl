@@ -17,6 +17,7 @@ from test_dispatch import FakeBackend                # noqa: E402
 from fastapi.testclient import TestClient            # noqa: E402
 
 import main                                          # noqa: E402
+import stats as statsmod                             # noqa: E402
 
 # TestClient 直连绕过网关，无注入令牌可带——写请求走本地调试豁免开关
 # （FNDL_DEV_TRUST=1）。TestAdminGuard 会临时摘掉它测真实鉴权闸（P0-1）。
@@ -38,6 +39,7 @@ class TestAPI(unittest.TestCase):
     def tearDown(self):
         (downloader.STATE_DIR, downloader.RECORDS_PATH,
          cfgmod.STATE_DIR, cfgmod.CONFIG_PATH) = self._orig
+        statsmod.shutdown()   # 停上报线程：Windows 下句柄占用会挡临时目录删除
         self._td.cleanup()
 
     def _patch_backends(self, pool: dict):
@@ -474,6 +476,7 @@ class TestAdminGuard(unittest.TestCase):
             os.environ["FNDL_DEV_TRUST"] = self._dev
         else:
             os.environ.pop("FNDL_DEV_TRUST", None)
+        statsmod.shutdown()   # 停上报线程：Windows 下句柄占用会挡临时目录删除
         self._td.cleanup()
 
     def test_mutating_without_token_rejected(self):
@@ -540,6 +543,7 @@ class TestDailyCheck(unittest.TestCase):
 
     def tearDown(self):
         cfgmod.STATE_DIR, cfgmod.CONFIG_PATH = self._orig
+        statsmod.shutdown()   # 停上报线程：Windows 下句柄占用会挡临时目录删除
         self._td.cleanup()
 
     @staticmethod
@@ -690,6 +694,7 @@ class TestUpdateStatusChangelog(unittest.TestCase):
 
     def tearDown(self):
         cfgmod.STATE_DIR, cfgmod.CONFIG_PATH = self._orig
+        statsmod.shutdown()   # 停上报线程：Windows 下句柄占用会挡临时目录删除
         self._td.cleanup()
 
     def test_status_empty_state(self):

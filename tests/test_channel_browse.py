@@ -21,6 +21,7 @@ from backends.drive_core import DriveCore             # noqa: E402
 from fastapi.testclient import TestClient            # noqa: E402
 
 import main                                          # noqa: E402
+import stats as statsmod                             # noqa: E402
 
 # TestClient 直连无网关令牌：写请求走本地调试豁免（P0-1 鉴权闸的显式开关）
 os.environ.setdefault("FNDL_DEV_TRUST", "1")
@@ -112,6 +113,7 @@ class TestBrowseAPI(unittest.TestCase):
     def tearDown(self):
         (downloader.STATE_DIR, downloader.RECORDS_PATH,
          cfgmod.STATE_DIR, cfgmod.CONFIG_PATH) = self._orig
+        statsmod.shutdown()   # 停上报线程：Windows 下句柄占用会挡临时目录删除
         self._td.cleanup()
 
     def _patch_paths(self, share, granted):

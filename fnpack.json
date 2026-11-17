@@ -20,6 +20,19 @@
       "is_docker": false,
       "service_port": "",
       "releases": {
+        "0.1.43": {
+          "changelog": "种子文件支持：.torrent 文件可拖入解析框或点「上传种子文件」按钮选择（支持多个），自动提取信息哈希、文件名与 tracker 归一为磁力随批量流程派发；NAS 上已有的种子文件可粘贴完整路径；内部优化与稳定性改进。",
+          "updated_at": "2026-11-17T22:50:00+08:00",
+          "os_min_version": "1.2.0",
+          "packages": {
+            "all": {
+              "download_url": "https://github.com/maglcal/fnmedia-dl/releases/download/main-v0.1.43/fnmedia-dl-main-v0.1.43.fpk",
+              "sha256": "a6bbb9852f0df325cea60bc0d84fa595a4e2a6032aac20fb656c12a751733511",
+              "size": 25419989,
+              "updated_at": "2026-11-17T22:50:00+08:00"
+            }
+          }
+        },
         "0.1.42": {
           "changelog": "安全加固（鉴权 fail-closed、跨进程文件锁、更新链 SHA256 校验与原子替换）；更新源接入 Gitee 国内镜像（优先）；升级后配置丢失/无法登录修复；升级备份/恢复加固；更新内容渲染与排版修复；内部优化与稳定性改进。",
           "updated_at": "2026-11-14T21:30:00+08:00",

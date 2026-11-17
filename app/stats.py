@@ -452,6 +452,7 @@ def flush_once() -> dict:
 # ---------------------------------------------------------------- 上报线程（daemon）
 
 _wake = threading.Event()
+_stop = threading.Event()
 _worker_guard = threading.Lock()
 _worker: threading.Thread | None = None
 
@@ -461,9 +462,25 @@ def _ensure_worker() -> None:
     with _worker_guard:
         if _worker is not None and _worker.is_alive():
             return
+        _stop.clear()                     # shutdown 后可再拉起（kick 即新生命周期）
         _worker = threading.Thread(target=_worker_loop, daemon=True,
                                    name="stats-reporter")
         _worker.start()
+
+
+def shutdown() -> None:
+    """停止后台上报线程并等待其退出（幂等；之后 kick 可再拉起）。
+
+    测试 teardown / 进程退出前调用：确保没有线程持有 stats.db 连接——
+    Windows 下被占用的文件删不掉，曾致临时目录清理间歇性报
+    WinError 32（测试偶发 error 的根因）。"""
+    global _worker
+    _stop.set()
+    _wake.set()                           # 唤醒等待中的循环以便检查 _stop
+    with _worker_guard:
+        w, _worker = _worker, None
+    if w is not None and w.is_alive() and w is not threading.current_thread():
+        w.join(timeout=5)
 
 
 def kick() -> None:
@@ -481,7 +498,7 @@ def _worker_loop() -> None:
     """入队后唤醒立即尝试 + 失败按退避定时重试；daemon 线程随上报闸首次
     可用启动（kick），关闸空闲不删行（D-5）。"""
     global _fail_count
-    while True:
+    while not _stop.is_set():
         _wake.clear()
         try:
             res = flush_once()

@@ -139,6 +139,7 @@ class StatsCase(unittest.TestCase):
         self.addCleanup(self._mp.undo)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(statsmod.shutdown)   # LIFO 先执行：停上报线程再删临时目录
         self.tmp_path = Path(self._tmp.name)
         self.kicked = []
         self._mp.setattr(cfgmod, "STATE_DIR", self.tmp_path)
@@ -675,3 +676,22 @@ class TestWorkerLifecycle(StatsCase):
         assert w1 is not None and w1.daemon and w1.is_alive()
         statsmod._ensure_worker()
         assert statsmod._worker is w1                      # 不重复拉起
+
+    def test_shutdown_stops_and_kick_restarts(self):
+        """shutdown 停线程+join（幂等），之后 kick 可再拉起（0.1.43）。
+        回归背景：Windows 下后台线程持有 stats.db 时临时目录删除报
+        WinError 32，测试偶发 error 的根因。"""
+        monkeypatch = self._mp
+        _save_cfg(True, ENDPOINT)
+        monkeypatch.setattr(statsmod, "kick", REAL_KICK)   # 恢复真身
+        _stub_post(monkeypatch, [(204, None)] * 3)
+        statsmod.on_toggle_on()                            # 拉起真线程
+        w1 = statsmod._worker
+        assert w1 is not None and w1.is_alive()
+        statsmod.shutdown()
+        assert not w1.is_alive()                           # 已停（join 等到退出）
+        assert statsmod._worker is None
+        statsmod.shutdown()                                # 幂等：重复调用无异常
+        statsmod.kick()                                    # 新生命周期可再拉起
+        w2 = statsmod._worker
+        assert w2 is not None and w2.is_alive() and w2 is not w1
