@@ -32,6 +32,13 @@ class SourceError(RuntimeError):
 
 # ------------------------------------------------------------ 工具
 
+def _safe_int(v) -> int:
+    """清单字段容错转 int：非数字/空一律按 0 处理，不让 ValueError 逃逸。"""
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
 def resolve_sources(cfg: dict) -> list[dict]:
     """取有效更新源（按配置序）：未配置 / 未知类型的源自动跳过。"""
     out: list[dict] = []
@@ -140,7 +147,11 @@ def _fill_sib_sha256(assets: list[dict], client: httpx.Client,
                     text = _get(client, sib["url"], headers={},
                                 timeout=timeout, retries=1,
                                 follow_redirects=True).text
-                    asset["sha256"] = (text.strip().split() or [""])[0].lower()
+                    cand = (text.strip().split() or [""])[0].lower()
+                    # 形状校验：必须是 64 位十六进制；HTML 错误页首词不采信
+                    if (len(cand) == 64
+                            and all(c in "0123456789abcdef" for c in cand)):
+                        asset["sha256"] = cand
                 except SourceError:
                     pass
 
@@ -169,7 +180,7 @@ def _fetch_repobox(src: dict, client: httpx.Client, *,
         assets.append({
             "name": a.get("name") or path.rsplit("/", 1)[-1],
             "url": f"{base}/raw/{repo}/{path}",
-            "size": int(a.get("size") or 0),
+            "size": _safe_int(a.get("size")),
             "sha256": str(a.get("sha256") or "").lower(),
         })
     return {"version": strip_ver(str(data.get("version") or "")),
@@ -190,7 +201,14 @@ def _fetch_github(src: dict, client: httpx.Client, *,
                 headers=headers, timeout=timeout, retries=retries,
                 ok_status=(200, 404))
     if resp.status_code == 404:
-        # 仓库尚无 release：不是错误，给出「暂无发布版本」的空清单
+        # releases/latest 的 404 有两种语义，必须区分：
+        # 仓库不存在（被删/改名）→ 源不可用，不能误报「无更新」；
+        # 仓库存在但尚无 release → 「暂无发布版本」的空清单。
+        repo_resp = _get(client, f"{GITHUB_API}/repos/{repo}",
+                         headers=headers, timeout=timeout, retries=1,
+                         ok_status=(200, 404))
+        if repo_resp.status_code == 404:
+            raise SourceError(f"GitHub 仓库不存在或不可访问：{repo}")
         return {"version": "", "tag": "",
                 "notes": "仓库暂无发布版本",
                 "html_url": f"https://github.com/{repo}/releases",
@@ -201,7 +219,7 @@ def _fetch_github(src: dict, client: httpx.Client, *,
         raise SourceError("响应不是合法 JSON")
     assets = [{"name": a.get("name") or "",
                "url": a.get("browser_download_url") or "",
-               "size": int(a.get("size") or 0),
+               "size": _safe_int(a.get("size")),
                "sha256": ""}
               for a in (data.get("assets") or []) if isinstance(a, dict)]
     _fill_sib_sha256(assets, client, timeout)
@@ -241,7 +259,7 @@ def _fetch_gitee(src: dict, client: httpx.Client, *,
         raise SourceError("发行版缺少 tag_name 或版本号为空")
     assets = [{"name": a.get("name") or "",
                "url": a.get("browser_download_url") or "",
-               "size": int(a.get("size") or 0),
+               "size": _safe_int(a.get("size")),
                "sha256": ""}
               for a in (data.get("assets") or []) if isinstance(a, dict)]
     _fill_sib_sha256(assets, client, timeout)

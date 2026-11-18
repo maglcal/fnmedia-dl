@@ -47,7 +47,14 @@ class Aria2(Backend):
             raise BackendError(f"aria2 连接失败：{exc}") from exc
         if resp.status_code >= 400:
             raise BackendError(f"aria2 HTTP {resp.status_code}")
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            # 代理劫持/网关错误页等非 JSON 响应并入 BackendError 体系，
+            # 让 add()/list_tasks() 走 auto 降级链而非 500 逃逸
+            raise BackendError("aria2 响应不是合法 JSON") from exc
+        if not isinstance(data, dict):
+            raise BackendError("aria2 响应形状异常（非 JSON 对象）")
         if "error" in data:
             err = data["error"]
             raise BackendError(f"aria2 错误 {err.get('code')}: {err.get('message')}")
@@ -74,8 +81,12 @@ class Aria2(Backend):
         d = directory or self.dir
         if d:
             options["dir"] = d
-        if name and url.startswith("magnet:"):
-            options["bt-save-metadata"] = "true"
+        if name:
+            if url.startswith("magnet:"):
+                options["bt-save-metadata"] = "true"
+            else:
+                # 直链用 out 落实「重命名后下载」（磁力多文件流不适用 out）
+                options["out"] = name
         try:
             gid = self._rpc("aria2.addUri", [[url], options])
         except BackendError as exc:
@@ -126,3 +137,9 @@ class Aria2(Backend):
             self._rpc("aria2.remove", [task_id])
         except BackendError:
             self._rpc("aria2.forceRemove", [task_id])
+        # 清掉 stopped 结果记录，防止已删任务在 tellStopped 里堆积
+        # （幂等；任务不在结果表时报错，忽略即可）
+        try:
+            self._rpc("aria2.removeDownloadResult", [task_id])
+        except BackendError:
+            pass

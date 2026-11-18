@@ -309,7 +309,7 @@ class TestEventShape(StatsCase):
         for ev in events:
             assert re.fullmatch(r"[0-9a-f]{32}", ev["machine_hash"])
             assert ev["client_date"] == "2026-11-14"          # 事件产生日定格
-            assert ev["ts"] == "2026-11-14T10:30:05+08:00"    # ISO 8601 本地偏移
+            assert ev["ts"] == "2026-11-14T02:30:05+00:00"    # 统一 UTC（Y20）
         payload = json.loads(calls[0][1])
         assert set(payload) == {"app_id", "events", "client"}
         assert payload["app_id"] == "fnmedia-dl"
@@ -371,7 +371,7 @@ class TestSyncTransitions(StatsCase):
         assert statsmod._sync() == 1                      # install
         assert statsmod._sync() == 0                      # 一生一次，不重复
         assert [r[1] for r in _outbox()] == ["install"]
-        assert _meta()["installed_at"] == T0.isoformat(timespec="seconds")
+        assert _meta()["installed_at"] == "2026-11-14T02:30:05+00:00"  # 统一 UTC
         assert _meta()["last_version"] == statsmod.VERSION
 
     def test_update_on_version_jump_and_no_repeat(self):

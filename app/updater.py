@@ -111,6 +111,7 @@ def validate_asset_url(url: str, extra_prefixes: list[str] | None = None) -> boo
     """只放行官方 GitHub Releases 与「已配置镜像源」的 .fpk 下载地址。"""
     allowed = [DOWNLOAD_URL_PREFIX, *(extra_prefixes or [])]
     return (isinstance(url, str)
+            and urlparse(url).scheme in ("https", "http")  # 禁 file:/ftp: 等
             and any(url.startswith(p) for p in allowed if p)
             and url.endswith(".fpk")
             and ".." not in url)
@@ -430,10 +431,12 @@ def start(url: str, version: str = "", *,
         _state.update(stage="downloading", percent=0, detail="准备下载…",
                       error="", from_version=_read_version(),
                       to_version=strip_ver(version or ""), done=False)
-    _thread = threading.Thread(
-        target=_run, args=(candidates, sha256, expected_size),
-        kwargs={"allow_unverified": allow_unverified}, daemon=True)
-    _thread.start()
+        # 线程创建+赋值+start 全在锁内，堵 TOCTOU：
+        # 两并发请求都通过 is_alive() 检查后各起一个更新线程的窗口
+        _thread = threading.Thread(
+            target=_run, args=(candidates, sha256, expected_size),
+            kwargs={"allow_unverified": allow_unverified}, daemon=True)
+        _thread.start()
     return progress()
 
 

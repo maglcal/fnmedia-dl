@@ -48,6 +48,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import httpx
@@ -358,7 +359,15 @@ def update_download(req: UpdateDownloadReq):
 
     下载地址来自检查结果（镜像源优先），并带齐其余源的回退候选——
     下载失败/校验不符时自动重试并换源（updater.download_verified）。"""
-    info = update_check()
+    info = {"assets": []}
+    if req.url:
+        # 手动地址不依赖清单；更新源全挂时不应把手动更新连坐挡死（502）
+        try:
+            info = update_check()
+        except HTTPException:
+            info = {"assets": []}
+    else:
+        info = update_check()
     fpk_assets = [a for a in info.get("assets", [])
                   if (a.get("name") or "").endswith(".fpk")]
     asset = next((a for a in fpk_assets
@@ -538,6 +547,10 @@ class ConfigPut(BaseModel):
 @app.put("/api/config")
 def config_put(req: ConfigPut):
     incoming = req.config or {}
+    # 配置段必须是对象（传字符串会让合并逻辑 AttributeError → 500 而非 400）
+    for section in ("thunder_cloud", "aria2", "update", "stats"):
+        if section in incoming and not isinstance(incoming[section], dict):
+            raise HTTPException(400, f"配置段 {section} 必须是对象")
     seen: dict = {}
 
     def _merge_cfg(cur: dict) -> dict:
@@ -546,7 +559,8 @@ def config_put(req: ConfigPut):
         seen["stats_before"] = dict(cur.get("stats") or {})
         # 传入 ****** 的敏感字段表示“保持不变”，不覆盖
         tc_in = incoming.get("thunder_cloud", {})
-        for key in ("password", "access_token", "refresh_token"):
+        for key in ("password", "access_token", "refresh_token",
+                    "creditkey", "device_id"):
             if tc_in.get(key) == "******":
                 tc_in[key] = cur.get("thunder_cloud", {}).get(key, "")
         if incoming.get("aria2", {}).get("secret") == "******":
@@ -653,9 +667,19 @@ def _within(child: str, parent: str) -> bool:
 
 
 def _crumbs(root: str, path: str) -> list[dict]:
-    """面包屑：根 → … → 当前目录（首项是根本身）。"""
+    """面包屑：根 → … → 当前目录（首项是根本身）。
+    相对段按目录边界截取（防 /vol1/lnk 前缀误吞 /vol1/lnk2）；
+    根/路径含软链别名时用 realpath 同源判定兜底，避免整段错位。"""
     out = [{"name": root.rstrip("/") or root, "path": root}]
-    rel = path[len(root):] if root and path.startswith(root) else path
+    rsep = root.rstrip("/")
+    rel = ""
+    if root and (path == rsep or path.startswith(rsep + "/")):
+        rel = path[len(rsep):]
+    elif root and path:
+        r_real = os.path.normpath(os.path.realpath(root))
+        p_real = os.path.normpath(os.path.realpath(path))
+        if p_real == r_real or p_real.startswith(r_real + os.sep):
+            rel = p_real[len(r_real):]
     acc = root.rstrip("/")
     for seg in [s for s in rel.replace("\\", "/").split("/") if s]:
         acc = f"{acc}/{seg}"
@@ -760,9 +784,14 @@ async def parse_torrent_upload(request: Request, name: str = ""):
     """种子文件上传解析：.torrent 原始字节 → 提取 info 哈希/名称/tracker →
     归一化为磁力。返回与 /api/parse 单条同构的 LinkInfo dict，前端把
     url（磁力）追加进解析框随批量流程派发。"""
-    data = await request.body()
-    if len(data) > _TORRENT_MAX:
-        raise HTTPException(413, "种子文件过大（上限 10MB）")
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > _TORRENT_MAX:
+            raise HTTPException(413, "种子文件过大（上限 10MB）")
+        chunks.append(chunk)
+    data = b"".join(chunks)
     info = linksmod.parse_torrent_bytes(data, name or "upload.torrent")
     return info.to_dict()
 
@@ -889,10 +918,16 @@ class QueueRunReq(BaseModel):
 
 @app.post("/api/queue/run")
 def queue_run(req: QueueRunReq | None = None):
-    """立即派发全部待发项。backend 沿用界面通道选择（缺省 auto 降级链）。"""
+    """立即派发全部待发项。backend 沿用界面通道选择（缺省 auto 降级链）。
+    手动派发属显式用户动作：连搁置（suspended）项一并重试。"""
     mgr = _manager()
     q = _queue()
-    results = q.run_now(_queue_dispatch(mgr, (req.backend if req else "auto")))
+    try:
+        results = q.run_now(
+            _queue_dispatch(mgr, (req.backend if req else "auto")),
+            retry_suspended=True)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
     return {"ok": True, "results": results, **q.snapshot()}
 
 
@@ -937,11 +972,14 @@ def _queue_worker_start():
                     continue
                 mgr = _manager()
                 q.tick(_queue_dispatch(mgr))
-            except Exception:  # noqa: BLE001 - 后台线程绝不因异常退出
-                pass
+            except Exception as exc:  # noqa: BLE001 - 后台线程绝不因异常退出
+                print(f"[fnmedia-dl] 队列定时派发异常：{exc}", file=sys.stderr)
     threading.Thread(target=_loop, daemon=True, name="queue-ticker").start()
 
 
 @app.exception_handler(Exception)
 async def unhandled(_, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": f"内部错误：{exc}"})
+    # 不向客户端回显异常原文（防路径/内部细节泄漏，也断掉属性注入素材）；
+    # traceback 只进服务端日志
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+    return JSONResponse(status_code=500, content={"detail": "内部错误，请查看服务日志"})

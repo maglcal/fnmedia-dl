@@ -135,8 +135,16 @@ def _load_unlocked() -> dict:
     try:
         data = json.loads(text)
     except ValueError:
-        # 文件损坏（非权限问题）：回退默认配置，但必须留痕
-        print(f"[fnmedia-dl] 配置文件损坏，已回退默认配置：{CONFIG_PATH}",
+        # 文件损坏（非权限问题）：回退默认配置，但必须留痕——
+        # 原文件改名 config.json.broken 保留损坏现场取证，
+        # 防止下一次 save 把损坏现场覆盖掉
+        broken = CONFIG_PATH.parent / (CONFIG_PATH.name + ".broken")
+        try:
+            CONFIG_PATH.replace(broken)
+            note = f"，原文件已备份到 {broken}"
+        except OSError:
+            note = "（损坏现场备份失败）"
+        print(f"[fnmedia-dl] 配置文件损坏，已回退默认配置：{CONFIG_PATH}{note}",
               file=sys.stderr)
         return _migrate_update_sources(copy.deepcopy(DEFAULT_CONFIG))
     return _migrate_update_sources(_merge(DEFAULT_CONFIG, data))
@@ -178,7 +186,8 @@ def redacted(cfg: dict) -> dict:
     """对外展示用：隐去密码与令牌。"""
     out = copy.deepcopy(cfg)
     tc = out.get("thunder_cloud", {})
-    for key in ("password", "access_token", "refresh_token"):
+    for key in ("password", "access_token", "refresh_token",
+                "creditkey", "device_id"):
         if tc.get(key):
             tc[key] = "******"
     if out.get("aria2", {}).get("secret"):

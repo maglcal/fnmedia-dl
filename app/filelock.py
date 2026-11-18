@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import sys
 import time
@@ -51,6 +52,17 @@ def locked(path: Path, timeout: float = _TIMEOUT):
         os.close(fd)
 
 
+def _is_lock_conflict(exc: OSError) -> bool:
+    """锁冲突（可重试）vs 永久性错误（应立即抛）。
+    POSIX 非阻塞 flock 冲突抛 BlockingIOError；Windows msvcrt.locking
+    冲突为 winerror 33（ERROR_LOCK_VIOLATION）/ errno EACCES。"""
+    if isinstance(exc, BlockingIOError):
+        return True
+    if getattr(exc, "winerror", None) == 33:
+        return True
+    return exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK)
+
+
 def _acquire(fd: int, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     while True:
@@ -63,7 +75,10 @@ def _acquire(fd: int, timeout: float) -> None:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
-        except OSError:
+        except OSError as exc:
+            if not _is_lock_conflict(exc):
+                # 永久性错误（EBADF/ENOMEM 等）立即抛，不掩盖真因
+                raise
             if time.monotonic() >= deadline:
                 raise TimeoutError("获取文件锁超时（另一进程长时间占用状态文件）")
             time.sleep(0.05)

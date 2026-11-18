@@ -18,6 +18,9 @@ LOG="${FNDL_LOG:-/tmp/fnmedia-dl.log}"
 # 双日志：主日志 + /tmp 兜底（FNDL_LOG 不可写或未导出时仍留痕）
 TRACE="/tmp/fnmedia-dl-bootstrap-trace.log"
 log(){ echo "[deps] $*" >> "$LOG" 2>&1 || true; echo "[deps] $*" >> "$TRACE" 2>&1 || true; }
+# URL 脱敏：剥掉 userinfo 段（FNDL_PIP_INDEX 可内嵌 https://user:pass@host，
+# 凭据不得落 /tmp/fnmedia-dl.log 与 trace 日志）
+redact_url(){ printf '%s' "$1" | sed -E 's#(https?://)[^/@]+@#\1#'; }
 
 # ---- 诊断头：无论成败都在日志开头留痕，下次失败一眼定案 ----
 log "===== 依赖引导开始 $(date '+%F %T') ====="
@@ -118,13 +121,13 @@ fi
 if [ "$offline_ok" != "1" ]; then
   installed=0
   for idx in "${PIP_MIRRORS[@]}"; do
-    log "在线安装尝试：$idx"
+    log "在线安装尝试：$(redact_url "$idx")"
     if "$PIP" install "${PIP_BASE[@]}" \
-         --index-url "$idx" --trusted-host "$(echo "$idx" | awk -F/ '{print $3}')" \
-         "${CORE_PKGS[@]}" >> "$LOG" 2>&1; then
-      installed=1; log "在线安装成功（$idx）"; break
+         --index-url "$idx" --trusted-host "$(echo "$idx" | awk -F/ '{print $3}' | sed 's#.*@##')" \
+         "${CORE_PKGS[@]}" 2>&1 | sed -E 's#(https?://)[^/@]+@#\1#' >> "$LOG"; then
+      installed=1; log "在线安装成功（$(redact_url "$idx")）"; break
     fi
-    log "源失败：$idx"
+    log "源失败：$(redact_url "$idx")"
   done
   [ "$installed" = "1" ] || { log "FAIL exit=3 在线安装全部镜像失败（离线也未成功）"; echo "依赖在线安装全部失败（已尝试内置离线包与多个镜像）" >&2; exit 3; }
 fi

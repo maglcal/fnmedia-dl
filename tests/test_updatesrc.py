@@ -318,18 +318,33 @@ class TestCheck(unittest.TestCase):
         fpk = next(a for a in d["assets"] if a["name"].endswith(".fpk"))
         self.assertEqual(fpk["sha256"], "cd" * 32)
 
-    def test_github_404_empty_manifest(self):
+    def test_github_no_release_empty_manifest(self):
         cfg = {"update": {"sources": [
             {"name": "g", "type": "github", "repo": "maglcal/fnmedia-dl"}]}}
 
         def handler(req: httpx.Request) -> httpx.Response:
-            return httpx.Response(404)
+            # 仓库存在但尚无 release：releases/latest 404、仓库本体 200
+            if req.url.path.endswith("/releases/latest"):
+                return httpx.Response(404)
+            return httpx.Response(200, json={"full_name": "maglcal/fnmedia-dl"})
 
         d = updatesrc.check(cfg, "0.1.0", client=_client(handler))
         self.assertTrue(d["ok"])
         self.assertFalse(d["has_update"])
         self.assertEqual(d["assets"], [])
         self.assertIn("暂无发布", d["notes"])
+
+    def test_github_repo_missing_raises(self):
+        # 仓库被删/改名（全部 404）：报「源不可用」，不能误报「无更新」
+        cfg = {"update": {"sources": [
+            {"name": "g", "type": "github", "repo": "maglcal/fnmedia-dl"}]}}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            return httpx.Response(404)
+
+        with self.assertRaises(updatesrc.SourceError) as cm:
+            updatesrc.check(cfg, "0.1.0", client=_client(handler))
+        self.assertIn("maglcal/fnmedia-dl", str(cm.exception))
 
     def test_all_sources_fail_raises(self):
         def handler(req: httpx.Request) -> httpx.Response:

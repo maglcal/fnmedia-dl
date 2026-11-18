@@ -150,8 +150,14 @@ class _BencodeError(ValueError):
     pass
 
 
-def _bdecode(data: bytes, pos: int = 0) -> tuple[object, int]:
+_MAX_BDECODE_DEPTH = 100   # 深嵌套种子防护，防 RecursionError 裸崩
+
+
+def _bdecode(data: bytes, pos: int = 0,
+             depth: int = 0) -> tuple[object, int]:
     """最小 bencode 解码器，返回 (值, 结束位置)。"""
+    if depth > _MAX_BDECODE_DEPTH:
+        raise _BencodeError("bencode 嵌套过深")
     if pos >= len(data):
         raise _BencodeError("unexpected end")
     ch = data[pos:pos + 1]
@@ -162,15 +168,15 @@ def _bdecode(data: bytes, pos: int = 0) -> tuple[object, int]:
         pos += 1
         out = []
         while data[pos:pos + 1] != b"e":
-            val, pos = _bdecode(data, pos)
+            val, pos = _bdecode(data, pos, depth + 1)
             out.append(val)
         return out, pos + 1
     if ch == b"d":
         pos += 1
         out = {}
         while data[pos:pos + 1] != b"e":
-            key, pos = _bdecode(data, pos)
-            val, pos = _bdecode(data, pos)
+            key, pos = _bdecode(data, pos, depth + 1)
+            val, pos = _bdecode(data, pos, depth + 1)
             out[key] = val
         return out, pos + 1
     if ch.isdigit():
@@ -182,16 +188,29 @@ def _bdecode(data: bytes, pos: int = 0) -> tuple[object, int]:
 
 
 def torrent_infohash(data: bytes) -> str | None:
-    """计算 .torrent 的 info 哈希（SHA1 of 原始 bencoded info 字典）。"""
+    """计算 .torrent 的 info 哈希（SHA1 of 原始 bencoded info 字典）。
+
+    info 字节区间在解析顶层 dict 时直接记录（值起点~结束位置），不再用
+    data.index(b"4:info") 反向定位——种子里任何字符串值（如文件名）含
+    「4:info」都会定位错位、算出错误 infohash。"""
     try:
-        top, _ = _bdecode(data, 0)
-        if not isinstance(top, dict) or b"info" not in top:
+        if data[:1] != b"d":
             return None
-        # 重新定位 info 值的原始字节区间
-        pos = data.index(b"4:info") + len(b"4:info")
-        _, end = _bdecode(data, pos)
-        return hashlib.sha1(data[pos:end]).hexdigest()
-    except (ValueError, _BencodeError):
+        pos = 1
+        info_span: tuple[int, int] | None = None
+        has_info = False
+        while data[pos:pos + 1] != b"e":
+            key, pos = _bdecode(data, pos)
+            start = pos
+            _, pos = _bdecode(data, pos)
+            if key == b"info":
+                has_info = True
+                info_span = (start, pos)
+        if not has_info or info_span is None:
+            return None
+        start, end = info_span
+        return hashlib.sha1(data[start:end]).hexdigest()
+    except (ValueError, _BencodeError, RecursionError):
         return None
 
 

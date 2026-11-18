@@ -19,6 +19,13 @@ while [ $# -gt 0 ]; do
 done
 [ -n "${STAGE}" ] || STAGE="${FPK_DIR}/.build/fpk"
 
+# 防误删（Y28）：--stage-only 指定的目录同样必须位于 .build/ 之下，
+# 杜绝 rm -rf 打到任意路径（dev 工具误用风险）
+case "${STAGE}/" in
+  "${FPK_DIR}/.build/"*) : ;;
+  *) echo "ERROR: stage 目录必须位于 ${FPK_DIR}/.build/ 之下（拒绝 rm -rf）：${STAGE}" >&2; exit 1 ;;
+esac
+
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/app/repo" "${STAGE}/app/ui"
 
@@ -68,9 +75,10 @@ count = 0
 for f in root.rglob('*'):
     if not f.is_file():
         continue
-    if f.suffix.lower() not in TEXT_EXT and f.parent.name != 'cmd':
-        # 无扩展名文本（wizard/install、config/resource、ui/config、LICENSE 等）
-        # 用 UTF-8 可解码性判定；二进制（wheel/PNG）均带扩展名不会进来
+    if f.suffix.lower() not in TEXT_EXT:
+        # 无扩展名文本（wizard/install、config/resource、ui/config、LICENSE、
+        # cmd/* 等）用 UTF-8 可解码性判定（二进制误入 cmd/ 不再被字节级破坏）；
+        # 二进制（wheel/PNG）均带扩展名不会进来
         try:
             f.read_bytes().decode('utf-8')
         except (UnicodeDecodeError, OSError):
@@ -107,15 +115,20 @@ except OSError:
     pass
 sections, cur, lines = [], None, []
 for line in text.splitlines():
-    m = re.match(r"^##\s+\**\s*(?:main-)?v?([0-9][^\s*]*)", line)
+    # 支持 v0.2.0 / main-v0.2.0 / [0.2.0]（keep-a-changelog）/ 标题带冒号摘要
+    m = re.match(r"^##\s+\**\s*(?:main-)?v?\[?([0-9][^\]\s*]*)(?:\])?", line)
     if m:
         if cur is not None:
             sections.append((cur, "\n".join(lines).strip()))
-        cur, lines = m.group(1), []
+        cur, lines = m.group(1).rstrip(":："), []
     elif cur is not None:
         lines.append(line)
 if cur is not None:
     sections.append((cur, "\n".join(lines).strip()))
+# 断言提取命中：CHANGELOG 非空却一段都没解析出来 = 标题格式变了，
+# 必须 fail-loud，不许静默回退「首段当变更」
+if text.strip() and not sections:
+    raise SystemExit("[fpk] CHANGELOG 标题无法解析（未提取到任何版本段），请检查格式")
 body = ""
 for ver, b in sections:
     if ver == version:
@@ -155,11 +168,29 @@ chmod +x "${STAGE}"/cmd/*
 echo "[fpk] 组装完成: ${STAGE} (version=${VERSION})"
 [ "${STAGE_ONLY}" -eq 1 ] && exit 0
 
+# fnpack 官方 CDN 产物钉死哈希（Y30 供应链信任）：换版本必须同步更新；
+# 空 = 该架构无已钉死产物 → 禁止自动下载，须 --fnpack 显式提供
+FNPACK_SHA256_AMD64="54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93"
+FNPACK_SHA256_ARM64=""
+
 if [ -z "${FNPACK_BIN}" ]; then
   if command -v fnpack >/dev/null 2>&1; then FNPACK_BIN="$(command -v fnpack)"; else
     case "$(uname -m)" in x86_64) A=amd64;; aarch64|arm64) A=arm64;; *) echo "不支持的架构" >&2; exit 1;; esac
+    case "${A}" in amd64) EXP="${FNPACK_SHA256_AMD64}";; *) EXP="${FNPACK_SHA256_ARM64}";; esac
+    [ -n "${EXP}" ] || { echo "ERROR: 架构 ${A} 无已钉死哈希的 fnpack 产物，请用 --fnpack 显式指定" >&2; exit 1; }
     FNPACK_BIN="${REPO_ROOT}/.tools/fnpack"; mkdir -p "$(dirname "${FNPACK_BIN}")"
-    [ -x "${FNPACK_BIN}" ] || curl -fsSL -o "${FNPACK_BIN}" "https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-${A}"
+    fetch=1
+    if [ -f "${FNPACK_BIN}" ] && [ "$(sha256sum "${FNPACK_BIN}" | awk '{print $1}')" = "${EXP}" ]; then
+      fetch=0   # 缓存产物也验一遍，验过才复用
+    fi
+    if [ "${fetch}" = 1 ]; then
+      curl -fsSL -o "${FNPACK_BIN}" "https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-${A}"
+      GOT="$(sha256sum "${FNPACK_BIN}" | awk '{print $1}')"
+      if [ "${GOT}" != "${EXP}" ]; then
+        rm -f "${FNPACK_BIN}"
+        echo "ERROR: fnpack 下载 SHA256 不符（${GOT}），已删除，拒绝出包" >&2; exit 1
+      fi
+    fi
     chmod +x "${FNPACK_BIN}"
   fi
 fi

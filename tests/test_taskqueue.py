@@ -148,5 +148,52 @@ class TestQueueSchedule(QueueTestBase):
         self.assertFalse(self.q.should_run(now="00:00"))
 
 
+class TestQueueFailCapAndGuard(QueueTestBase):
+    def test_suspend_after_max_fails(self):
+        self.q.add(["https://x/a.iso"])
+        for _ in range(taskqueue.MAX_FAILS):
+            results = self.q.run_now(fail_dispatch)
+            self.assertEqual([r["ok"] for r in results], [False])
+        item = self.q.snapshot()["items"][0]
+        self.assertEqual(item["status"], "suspended")
+        self.assertEqual(item["fail_count"], taskqueue.MAX_FAILS)
+        # 搁置后定时派发不再重试
+        self.assertEqual(self.q.run_now(ok_dispatch), [])
+        self.q.set_settings(enabled=True, time_str="00:05")
+        self.assertFalse(self.q.should_run(now="23:59"))
+
+    def test_manual_retry_revives_suspended(self):
+        self.q.add(["https://x/a.iso"])
+        for _ in range(taskqueue.MAX_FAILS):
+            self.q.run_now(fail_dispatch)
+        results = self.q.run_now(ok_dispatch, retry_suspended=True)
+        self.assertEqual([r["ok"] for r in results], [True])
+        item = self.q.snapshot()["items"][0]
+        self.assertEqual(item["status"], "done")
+        self.assertEqual(item["fail_count"], 0)
+
+    def test_dispatch_single_flight(self):
+        self.q.add(["https://x/a.iso"])
+        with taskqueue._DISPATCH_GUARD:
+            with self.assertRaises(RuntimeError):
+                self.q.run_now(ok_dispatch)
+        # 撞车不影响后续派发
+        results = self.q.run_now(ok_dispatch)
+        self.assertEqual([r["ok"] for r in results], [True])
+
+    def test_item_removed_mid_dispatch_dropped(self):
+        added = self.q.add(["https://x/a.iso"])
+        removed_id = added[0]["id"]
+
+        def dispatch_and_remove(url, directory):
+            self.q.remove(removed_id)
+            return {"ok": True, "backend": "aria2"}
+
+        results = self.q.run_now(dispatch_and_remove)
+        self.assertTrue(results[0]["ok"])
+        # 回写按 id 匹配：已移除项不会复活
+        self.assertEqual(self.q.snapshot()["items"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

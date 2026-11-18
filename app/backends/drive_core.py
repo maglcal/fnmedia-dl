@@ -173,7 +173,8 @@ def _norm_dir(path: str) -> str:
 def _folder_path(folder: dict) -> str:
     """drive/v1/files 目录项的真实路径：
     params.RealPath 优先，AliasPath 兜底；键名大小写防御。"""
-    params = folder.get("params") or {}
+    params = folder.get("params")
+    params = params if isinstance(params, dict) else {}
     for key in ("RealPath", "realPath", "real_path",
                 "AliasPath", "aliasPath", "alias_path"):
         v = _norm_dir(str(params.get(key) or ""))
@@ -229,7 +230,9 @@ class DriveCore:
                              params={"type": "user#runner"}, timeout=8)
         out = []
         for t in data.get("tasks", []):
-            target = (t.get("params") or {}).get("target", "").strip()
+            _p = t.get("params")
+            target = (_p.get("target", "").strip()
+                      if isinstance(_p, dict) else "")
             if target:
                 out.append({"target": target, "name": t.get("name") or target})
         return out
@@ -799,14 +802,18 @@ def task_to_view(backend: str, t: dict):
     size = scalar_int(t.get("file_size"), 0) or None
     done = scalar_int(t.get("status_size"), 0)
     progress = t.get("progress")
-    if isinstance(progress, (int, float)):
+    if size:
+        # 字节数口径最可靠，优先自算（progress 语义多口径，
+        # 0-1 比率与 0-100 百分比无法无歧义区分，仅作兜底）
+        pct = done * 100.0 / size
+    elif isinstance(progress, (int, float)):
         pct = float(progress)
         pct = pct if pct <= 100 else pct / 100.0  # 兼容千分比等异常值按 100 封顶
-    elif size:
-        pct = done * 100.0 / size
     else:
         pct = 0.0
-    name = t.get("name") or t.get("file_name") or (t.get("params") or {}).get("url", "")[:80]
+    _params = t.get("params")
+    _url = (_params.get("url", "") if isinstance(_params, dict) else "")
+    name = t.get("name") or t.get("file_name") or _url[:80]
     return TaskView(
         backend=backend,
         id=str(t.get("id", "")),
@@ -815,6 +822,6 @@ def task_to_view(backend: str, t: dict):
         progress=max(0.0, min(100.0, pct)),
         speed=None,
         size=size,
-        url=(t.get("params") or {}).get("url", ""),
+        url=_url,
         message=t.get("message") or "",
     )

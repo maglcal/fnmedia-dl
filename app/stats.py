@@ -214,10 +214,15 @@ def _enqueue_event(conn: sqlite3.Connection, type_: str, version: str,
         (type_, version or "", from_version, today, ts))
 
 
+def _ts_str(dt: datetime.datetime) -> str:
+    """outbox 排序/比较用时间戳：统一存 UTC（带 +00:00）。
+    本地偏移 isoformat 字符串比较在系统时区变更后排序会偏差（Y20）。"""
+    return dt.astimezone(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
 def _prune(conn: sqlite3.Connection, now: datetime.datetime) -> None:
     """队列上限 1000 条 / 30 天：超限删最旧行（入队与每次 flush 前检查）。"""
-    cutoff = (now - datetime.timedelta(days=QUEUE_MAX_AGE_DAYS)
-              ).isoformat(timespec="seconds")
+    cutoff = _ts_str(now - datetime.timedelta(days=QUEUE_MAX_AGE_DAYS))
     conn.execute("DELETE FROM outbox WHERE ts < ?", (cutoff,))
     (n,) = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()
     if n > QUEUE_MAX_ROWS:
@@ -242,7 +247,7 @@ def _sync(include_open: bool = False) -> int:
         return 0
     now = _now()
     today = now.date().isoformat()
-    ts = now.isoformat(timespec="seconds")
+    ts = _ts_str(now)
     count = 0
     with _db_lock, _db() as conn:
         meta = _meta_get(conn)
@@ -271,7 +276,7 @@ def _touch_open() -> int:
         return 0
     now = _now()
     today = now.date().isoformat()
-    ts = now.isoformat(timespec="seconds")
+    ts = _ts_str(now)
     with _db_lock, _db() as conn:
         meta = _meta_get(conn)
         if meta.get("last_open_date") == today:
@@ -388,11 +393,14 @@ def _retry_after(headers) -> float | None:
 
 def _post(url: str, body: bytes) -> tuple[int, float | None]:
     """POST {endpoint}/collect（urllib 标准库，超时 5s，仅 Content-Type 头）。
-    返回 (HTTP 状态码, Retry-After 秒或 None)；网络错误/超时抛 OSError 系。"""
+    返回 (HTTP 状态码, Retry-After 秒或 None)；网络错误/超时抛 OSError 系。
+    ProxyHandler({}) 强制直连：不吃系统代理环境变量（与 downloader 的
+    trust_env=False 策略一致，NAS 残留代理变量会绕境外触发风控）。"""
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=POST_TIMEOUT) as resp:
+        with opener.open(req, timeout=POST_TIMEOUT) as resp:
             return getattr(resp, "status", 204), _retry_after(resp.headers)
     except urllib.error.HTTPError as exc:
         return exc.code, _retry_after(exc.headers)
@@ -452,33 +460,38 @@ def flush_once() -> dict:
 # ---------------------------------------------------------------- 上报线程（daemon）
 
 _wake = threading.Event()
-_stop = threading.Event()
 _worker_guard = threading.Lock()
 _worker: threading.Thread | None = None
+_stop: threading.Event | None = None   # 当前上报线程的终止事件（每代独立）
 
 
 def _ensure_worker() -> None:
-    global _worker
+    global _worker, _stop
     with _worker_guard:
         if _worker is not None and _worker.is_alive():
             return
-        _stop.clear()                     # shutdown 后可再拉起（kick 即新生命周期）
-        _worker = threading.Thread(target=_worker_loop, daemon=True,
-                                   name="stats-reporter")
+        # 每代独立终止事件：旧线程睡醒后绝不会因 _stop 被清而复活，
+        # 杜绝 shutdown(join 超时) + kick 双线程并发 flush（O4-①）
+        stop = threading.Event()
+        _stop = stop
+        _worker = threading.Thread(target=_worker_loop, args=(stop,),
+                                   daemon=True, name="stats-reporter")
         _worker.start()
 
 
 def shutdown() -> None:
-    """停止后台上报线程并等待其退出（幂等；之后 kick 可再拉起）。
+    """停止后台上报线程并等待其退出（幂等；之后 kick 可再拉起新代）。
 
     测试 teardown / 进程退出前调用：确保没有线程持有 stats.db 连接——
     Windows 下被占用的文件删不掉，曾致临时目录清理间歇性报
     WinError 32（测试偶发 error 的根因）。"""
-    global _worker
-    _stop.set()
-    _wake.set()                           # 唤醒等待中的循环以便检查 _stop
+    global _worker, _stop
     with _worker_guard:
         w, _worker = _worker, None
+        stop, _stop = _stop, None
+    if stop is not None:
+        stop.set()                        # 本代终态，不可复用
+    _wake.set()                           # 唤醒等待中的循环以便检查终止事件
     if w is not None and w.is_alive() and w is not threading.current_thread():
         w.join(timeout=5)
 
@@ -494,12 +507,18 @@ def kick() -> None:
         pass
 
 
-def _worker_loop() -> None:
+def _worker_loop(stop: threading.Event) -> None:
     """入队后唤醒立即尝试 + 失败按退避定时重试；daemon 线程随上报闸首次
-    可用启动（kick），关闸空闲不删行（D-5）。"""
+    可用启动（kick），关闸空闲不删行（D-5）。
+
+    等待一律走 _wake.wait（可被 kick/shutdown 立即唤醒）：退避期也能被
+    on_config_changed 的「立即尝试」叫醒（O4-②，此前 time.sleep 最长 6h
+    唤不醒）。"""
     global _fail_count
-    while not _stop.is_set():
+    while not stop.is_set():
         _wake.clear()
+        if stop.is_set():     # 堵 clear 与 set 交错的丢唤醒窗口
+            break
         try:
             res = flush_once()
         except Exception:  # noqa: BLE001 - 后台线程绝不因异常退出
@@ -509,6 +528,6 @@ def _worker_loop() -> None:
         if action in ("sent", "dropped"):
             continue                    # 队列还有存量 → 立即下一批
         if action in ("retry", "error"):
-            time.sleep(max(float(res.get("sleep") or 60), 1.0))
+            _wake.wait(max(float(res.get("sleep") or 60), 1.0))
             continue
         _wake.wait(IDLE_POLL)           # idle / gate-closed：等唤醒或轮询兜底

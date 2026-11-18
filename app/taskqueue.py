@@ -6,8 +6,13 @@
 配额重置后自动吃掉额度，不用手动挤配额；也可随时「立即派发」手动放行。
 
 状态文件 state/queue.json：
-  {"items": [{"id","url","name","directory","added_at","status","error","backend"}],
+  {"items": [{"id","url","name","directory","added_at","status","error","backend",
+              "fail_count"}],
    "settings": {"enabled": false, "time": "00:05", "last_run": ""}}
+
+status 取值：queued（待派发）/ failed（派发失败，会自动重试）/
+suspended（连续失败 MAX_FAILS 次自动搁置，仅手动「立即派发」会重试）/
+done（已派发）。
 
 注意：文件名不能叫 queue.py——app 目录在 sys.path 首位，会遮蔽标准库
 queue 模块把 threading/anyio 等依赖带崩。
@@ -22,13 +27,16 @@ import uuid
 from pathlib import Path
 
 import config as cfgmod
+import filelock
 import links as linksmod
 
 _FILE_LOCK = threading.Lock()
+_DISPATCH_GUARD = threading.Lock()   # 派发单飞：tick 与手动「立即派发」不并发
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 DEFAULT_TIME = "00:05"
 PENDING = ("queued", "failed")
+MAX_FAILS = 5   # 连续失败次数上限，达到后自动搁置（suspended）
 
 
 class TaskQueue:
@@ -63,7 +71,7 @@ class TaskQueue:
     def add(self, urls: list[str], *, directory: str | None = None) -> list[dict]:
         """链接入队（状态 queued），返回新增项。"""
         added: list[dict] = []
-        with _FILE_LOCK:
+        with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             for url in urls:
                 url = (url or "").strip()
@@ -85,7 +93,7 @@ class TaskQueue:
 
     def remove(self, item_id: str) -> bool:
         """移除队列项，返回是否命中。"""
-        with _FILE_LOCK:
+        with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             before = len(data["items"])
             data["items"] = [i for i in data["items"] if i.get("id") != item_id]
@@ -97,7 +105,7 @@ class TaskQueue:
         t = (time_str or "").strip() or DEFAULT_TIME
         if not _TIME_RE.match(t):
             raise ValueError("时间格式应为 HH:MM（如 00:05）")
-        with _FILE_LOCK:
+        with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             data["settings"]["enabled"] = bool(enabled)
             data["settings"]["time"] = t
@@ -111,37 +119,68 @@ class TaskQueue:
 
     # ------------------------------------------------------------ 派发
 
-    def run_now(self, dispatch_fn) -> list[dict]:
+    def run_now(self, dispatch_fn, *, retry_suspended: bool = False) -> list[dict]:
         """立即派发所有待发项（queued/failed），返回逐项结果。
 
         dispatch_fn(url, directory) → 派发结果 dict（至少含 ok 字段）。
-        已派发成功（done）的项跳过；失败项保留在队列可再次派发/手动移除。"""
-        results: list[dict] = []
-        with _FILE_LOCK:
-            data = self._load()
-            for item in data["items"]:
-                if item.get("status") not in PENDING:
-                    continue
+        已派发成功（done）的项跳过；失败项保留在队列可再次派发/手动移除，
+        连续失败 MAX_FAILS 次自动搁置（suspended），定时派发不再重试，
+        仅手动（retry_suspended=True）会再试。
+
+        并发语义（O3）：网络派发不持文件锁——锁内只做快照与结果回写两段
+        短临界区，慢派发不再拖住 snapshot/add 等队列 API；派发整体单飞，
+        与 tick 或另一次手动派发撞车时直接报错不排队。"""
+        if not _DISPATCH_GUARD.acquire(blocking=False):
+            raise RuntimeError("已有派发任务正在进行，请稍后再试")
+        try:
+            # 短锁①：快照待发项（拷贝出临界区）
+            with _FILE_LOCK, filelock.locked(self.path):
+                data = self._load()
+                want = ("queued", "failed", "suspended") if retry_suspended \
+                    else PENDING
+                pending = [dict(i) for i in data["items"]
+                           if i.get("status") in want]
+            # 网络派发（无锁）：逐项执行，单项失败不阻断整批
+            results: list[dict] = []
+            outcomes: dict[str, tuple[bool, str, str]] = {}
+            for item in pending:
                 try:
                     res = dispatch_fn(item.get("url", ""),
                                       item.get("directory") or None) or {}
                 except Exception as exc:  # noqa: BLE001 - 单项失败不阻断整批
                     res = {"ok": False, "error": str(exc)}
-                if res.get("ok"):
-                    item["status"] = "done"
-                    item["backend"] = res.get("backend", "")
-                    item["error"] = ""
-                else:
-                    item["status"] = "failed"
-                    item["error"] = str(res.get("error") or "派发失败")
+                ok = bool(res.get("ok"))
+                error = "" if ok else str(res.get("error") or "派发失败")
+                outcomes[item.get("id", "")] = (ok, res.get("backend", ""), error)
                 results.append({
                     "id": item.get("id", ""), "url": item.get("url", ""),
-                    "ok": bool(res.get("ok")),
+                    "ok": ok,
                     "backend": res.get("backend", ""),
-                    "error": item.get("error", ""),
+                    "error": error,
                 })
-            self._save(data)
-        return results
+            # 短锁②：结果按 id 回写（派发期间被移除的项直接丢弃）
+            with _FILE_LOCK, filelock.locked(self.path):
+                data = self._load()
+                for it in data["items"]:
+                    oc = outcomes.get(it.get("id"))
+                    if not oc:
+                        continue
+                    ok, backend, error = oc
+                    if ok:
+                        it["status"] = "done"
+                        it["backend"] = backend
+                        it["error"] = ""
+                        it["fail_count"] = 0
+                    else:
+                        fails = int(it.get("fail_count") or 0) + 1
+                        it["fail_count"] = fails
+                        it["status"] = ("suspended" if fails >= MAX_FAILS
+                                        else "failed")
+                        it["error"] = error
+                self._save(data)
+            return results
+        finally:
+            _DISPATCH_GUARD.release()
 
     def should_run(self, now: str | None = None) -> bool:
         """是否到了今天定时派发的点（启用 + 有待发项 + 到点 + 当天未跑过）。"""
@@ -161,8 +200,12 @@ class TaskQueue:
         """定时检查：到点则派发待发项并记录今日已跑；未到点返回 None。"""
         if not self.should_run():
             return None
-        results = self.run_now(dispatch_fn)
-        with _FILE_LOCK:
+        try:
+            results = self.run_now(dispatch_fn)
+        except RuntimeError:
+            # 派发单飞撞车：另一路派发正在进行（其中也会覆盖待发项），跳过本轮
+            return None
+        with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             data["settings"]["last_run"] = time.strftime("%Y-%m-%d")
             self._save(data)

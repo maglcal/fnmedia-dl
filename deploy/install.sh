@@ -29,8 +29,10 @@ if id -u "$APP_USER" >/dev/null 2>&1 && getent group docker >/dev/null 2>&1; the
   usermod -aG docker "$APP_USER" 2>/dev/null || true
 fi
 
-# 渲染绝对路径（用户不存在则去掉 User=/Group=，root 兜底）
-sed -e "s#@ROOT@#$ROOT#g" "$SRC_IN" > "$DST"
+# 渲染绝对路径（用户不存在则去掉 User=/Group=，root 兜底）。
+# ROOT 转义 sed 替换串特殊字符（\ & #）：安装路径含这些字符时不再断裂/注入
+ROOT_ESC="$(printf '%s' "$ROOT" | sed -e 's/[\\&#]/\\&/g')"
+sed -e "s#@ROOT@#$ROOT_ESC#g" "$SRC_IN" > "$DST"
 if id -u "$APP_USER" >/dev/null 2>&1; then
   # 服务进程需写 state/、.update-backup/、重建 .venv，并在应用根目录建网关 socket
   chown -R "$APP_USER:$APP_GROUP" "$ROOT"

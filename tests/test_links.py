@@ -115,6 +115,21 @@ class TestTorrentFile(unittest.TestCase):
     def test_corrupt(self):
         self.assertIsNone(links.torrent_infohash(b"not a torrent"))
 
+    def test_infohash_decoy_4info_in_value(self):
+        # 顶层更早的键值含「4:info」字节时，旧实现 data.index 反向定位会
+        # 错位算出错误 infohash；必须按解析时记录的字节区间切片
+        info_raw = (b"d6:lengthi12345e4:name4:test"
+                    b"12:piece lengthi16384e6:pieces20:" + b"\x00" * 20 + b"e")
+        data = b"d4:name9:x4:infoyz4:info" + info_raw + b"e"
+        self.assertEqual(links.torrent_infohash(data),
+                         hashlib.sha1(info_raw).hexdigest())
+
+    def test_infohash_deep_nesting_guard(self):
+        # 恶意深嵌套触发的是受控 _BencodeError（返回 None），
+        # 不是 RecursionError 裸崩
+        deep = b"d4:info" + b"l" * 2000 + b"e" * 2000 + b"e"
+        self.assertIsNone(links.torrent_infohash(deep))
+
     def _make_torrent_with_trackers(self) -> tuple[bytes, str]:
         def bs(s: str) -> bytes:
             b = s.encode("utf-8")

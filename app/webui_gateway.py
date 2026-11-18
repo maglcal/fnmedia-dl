@@ -136,7 +136,9 @@ def _recv_body(client: socket.socket, partial: bytes, head: bytes) -> bytes | No
 def _rewrite_request(head: bytes, auth_token: str = "") -> bytes:
     lines = head.split(b"\r\n")
     parts = lines[0].split()
-    if len(parts) >= 2:
+    # 重写需要完整请求行（方法/目标/版本）；恰 2 段的畸形请求行不重写，
+    # 防 parts[2] IndexError 把网关线程裸崩掉
+    if len(parts) >= 3:
         method, target = parts[0], parts[1].decode("latin-1")
         path = target.split("?", 1)[0]
         query = target[len(path):]  # "" 或 "?..."

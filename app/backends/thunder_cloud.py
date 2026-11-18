@@ -30,9 +30,11 @@ from .base import Backend, BackendError, ParsedResource, TaskView
 from .drive_core import (DriveCore, _agg_tries, _clip_timeout, _dbg,
                          task_to_view)
 
-XLUSER_BASE = "https://xluser-ssl.xunlei.com"
+# 官方域名可经环境变量覆盖（改域名/走代理不用改源码）：
+# XLUSER_BASE_URL / XLDRIVE_API_URL
+XLUSER_BASE = os.environ.get("XLUSER_BASE_URL") or "https://xluser-ssl.xunlei.com"
 XLUSER_API = XLUSER_BASE + "/v1"
-DRIVE_API = "https://api-pan.xunlei.com/drive/v1"
+DRIVE_API = os.environ.get("XLDRIVE_API_URL") or "https://api-pan.xunlei.com/drive/v1"
 
 # 迅雷开放平台客户端应用参数（协议常量，
 # 所有第三方实现共用同一组，非用户私有凭据；登录协议必需，无法移除）。
@@ -1011,8 +1013,9 @@ class ThunderCloud(Backend):
             conf_t = (self.conf.get("target") or "").strip()
             online = [t["target"] for t in targets]
             if conf_t and online and conf_t not in online:
+                # 与 _target_of 的 0.1.28 语义一致：配置值优先、不擅自改道
                 detail += (f"；⚠ 配置的目标设备 {conf_t[:12]}… 已不在线，"
-                           f"任务将改发到 {online[0][:12]}…（可在设置里更新目标设备）")
+                           f"派发将失败（不会自动改发），请在设置里更新目标设备")
             return {"configured": True, "reachable": bool(targets), "detail": detail}
         except BackendError as exc:
             return {"configured": True, "reachable": False, "detail": str(exc)}

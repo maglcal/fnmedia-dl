@@ -112,7 +112,7 @@ async function loadChips() {
         : "";
     }
   } catch (e) {
-    $("#backendChips").innerHTML = `<div class="chip bad" title="${e.message}">通道状态获取失败</div>`;
+    $("#backendChips").innerHTML = `<div class="chip bad" title="${esc(e.message)}">通道状态获取失败</div>`;
   }
 }
 
@@ -277,9 +277,9 @@ function renderTasks(tasks, backendErrors) {
         ${t.message ? `<div class="task-url">${esc(t.message)}</div>` : ""}
       </td>
       <td>${esc(t.backend)}</td>
-      <td><span class="state ${t.state}">${STATE_TEXT[t.state] || t.state}</span></td>
+      <td><span class="state ${esc(t.state)}">${Object.prototype.hasOwnProperty.call(STATE_TEXT, t.state) ? STATE_TEXT[t.state] : esc(t.state)}</span></td>
       <td>
-        <div class="progress"><div class="state-${t.state}" style="width:${Math.min(100, t.progress || 0)}%"></div></div>
+        <div class="progress"><div class="state-${esc(t.state)}" style="width:${Math.min(100, t.progress || 0)}%"></div></div>
         <div class="progress-text"><span>${(t.progress || 0).toFixed(1)}%</span><span>${fmtSize(t.size)}</span></div>
       </td>
       <td>${fmtSpeed(t.speed)}</td>
@@ -820,8 +820,7 @@ $$("button[data-test]").forEach((btn) => {
 on("#tcLoginBtn", "click", async () => {
   $("#tcLoginBtn").disabled = true;
   try {
-    $("#btnSaveCfg").click();
-    await new Promise((r) => setTimeout(r, 300));
+    await saveConfig();
     const st = await API.send("/api/backends/test", "POST", { backend: "thunder_cloud" });
     cardStatus($("#tcLoginBtn"), (st.reachable ? "✓ " : "✗ ") + st.detail, st.reachable);
     loadChips();
@@ -1105,7 +1104,7 @@ on("#updateCheckBtn", "click", async () => {
       const notice = r.notice
         ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "";
       st.innerHTML = notice +
-        `发现新版本 <b>v${r.latest}</b>（当前 v${r.current}）` +
+        `发现新版本 <b>v${esc(r.latest)}</b>（当前 v${esc(r.current)}）` +
         (fpk ? "，可点「一键更新」在线升级" :
           (r.url ? ` —— <a href="${esc(r.url)}" target="_blank" rel="noreferrer">前往下载</a>` : ""));
       // 0.1.39.1：展示最新版本的修改项（此前只有版本号一行，更新内容看不到）
@@ -1117,7 +1116,7 @@ on("#updateCheckBtn", "click", async () => {
       $("#updateRunBtn").hidden = true;
       st.innerHTML = (r.notice
         ? `<span style="color:var(--warn)">⚠ ${esc(r.notice)}</span><br>` : "") +
-        `✓ 已是最新版本（v${r.current}）`;
+        `✓ 已是最新版本（v${esc(r.current)}）`;
       // 0.1.39.2：无更新也渲染当前版本更新内容——「检查更新」永远有可见反馈
       refreshVersionNotes();
     }
@@ -1276,6 +1275,7 @@ const QSTATE_BADGE = {
   queued: `<span class="result-warn">待派发</span>`,
   done: `<span class="result-ok">✓ 已派发</span>`,
   failed: `<span class="result-fail">✗ 派发失败</span>`,
+  suspended: `<span class="result-fail">✗ 连续失败已搁置</span>`,
 };
 
 function renderQueue(s) {
@@ -1299,7 +1299,7 @@ function renderQueue(s) {
         <span class="link-reason">${esc(it.url)}</span>
         ${QSTATE_BADGE[it.status] || esc(it.status)}
         ${it.status === "done" && it.backend ? `<span class="link-reason">${esc(it.backend)}</span>` : ""}
-        ${it.status === "failed" && it.error ? `<span class="result-fail">${esc(it.error)}</span>` : ""}
+        ${(it.status === "failed" || it.status === "suspended") && it.error ? `<span class="result-fail">${esc(it.error)}</span>` : ""}
         <button class="btn danger" data-qdel="${esc(it.id)}">移除</button>`;
       ul.appendChild(li);
     }

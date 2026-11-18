@@ -75,6 +75,7 @@ class DownloadManager:
         tmp = RECORDS_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(records, ensure_ascii=False, indent=1),
                        encoding="utf-8")
+        tmp.chmod(0o600)   # URL 可能内嵌凭据，与 config.json 同级收紧
         tmp.replace(RECORDS_PATH)
 
     def _mutate_records(self, mutator) -> None:
