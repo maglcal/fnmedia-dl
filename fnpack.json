@@ -11,6 +11,15 @@
       "platform": ["all"],
       "categories": ["系统工具"],
       "icon_url": "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/packaging/fpk/ICON_512.PNG",
+      "preview_urls": [
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/01-startup-loading.png",
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/02-new-download.png",
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/03-parse-results.png",
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/04-task-list.png",
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/05-channel-settings.png",
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/07-download-queue.png",
+        "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/docs/preview/08-deploy-xunlei.png"
+      ],
       "readme_url": "https://raw.githubusercontent.com/maglcal/fnmedia-dl/main/README.md",
       "bug_report_url": "https://github.com/maglcal/fnmedia-dl/issues",
       "maintainer": "许诺",
