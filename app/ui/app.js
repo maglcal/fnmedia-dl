@@ -184,6 +184,33 @@ function renderParse(links) {
       ${li.meta && li.meta.infohash ? `<span class="link-reason">信息哈希：${esc(li.meta.infohash)}</span>` : ""}
     `;
     ul.appendChild(el);
+    // 裸磁力（无 dn）名称不在链接里 → 后台联网解析真名（DHT + 种子元数据）
+    if (li.kind === "magnet" && li.meta && li.meta.infohash && !li.meta.dn) {
+      enrichName(li, el);
+    }
+  }
+}
+
+async function enrichName(li, el) {
+  const nameEl = el.querySelector(".link-name");
+  if (!nameEl) return;
+  const fallback = li.display || li.url;
+  nameEl.textContent = fallback + " · 名称解析中…";
+  try {
+    const tr = (li.meta && li.meta.trackers || []).join(",");
+    const qs = `infohash=${encodeURIComponent(li.meta.infohash)}` +
+      (tr ? `&tr=${encodeURIComponent(tr)}` : "");
+    const r = await fetch(API._rel(`api/magnet/name?${qs}`));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    if (d && d.name) {
+      li.display = d.name;              // 真名入列，派发任务名随真名
+      nameEl.textContent = d.name;
+    } else {
+      nameEl.textContent = fallback + "（未能联网解析名称）";
+    }
+  } catch (e) {
+    nameEl.textContent = fallback;
   }
 }
 

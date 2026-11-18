@@ -25,6 +25,7 @@ from config import STATE_DIR
 import config as cfgmod
 import filelock
 import links as linksmod
+import magnetmeta
 import quota as quotamod
 
 RECORDS_PATH = STATE_DIR / "tasks.json"
@@ -115,6 +116,8 @@ class DownloadManager:
                  directory: str | None = None) -> dict:
         """单条链接派发。link 为 links.LinkInfo 或裸 URL 字符串。"""
         url = getattr(link, "url", None) or str(link)
+        # 裸磁力真名（解析期已联网解析入缓存）：命中即回填，任务名随真名
+        magnetmeta.apply_cached_name(link)
         name = getattr(link, "display", "") or ""
         dispatchable = getattr(link, "dispatchable", True)
         if not dispatchable:

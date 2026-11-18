@@ -59,6 +59,7 @@ from pydantic import BaseModel
 
 import config as cfgmod
 import links as linksmod
+import magnetmeta as magnetmod
 import stats as statsmod
 import taskqueue as tqmod
 import updatesrc
@@ -773,6 +774,25 @@ class ParseReq(BaseModel):
 @app.post("/api/parse")
 def parse_links(req: ParseReq):
     return {"links": [li.to_dict() for li in linksmod.parse_text(req.text)]}
+
+
+@app.get("/api/magnet/name")
+def magnet_name(infohash: str = "", wait: float = 15.0, tr: str = ""):
+    """裸磁力（无 dn）联网解析真实名称：DHT/tracker 找 peer + ut_metadata 拉
+    info 字典，SHA1 校验后取 name。阻塞至多 wait 秒（上限 30）；解析到返回
+    真名并缓存，失败返回 name=null（前端保留兜底显示，派发走缓存回填）。
+    tr 为逗号分隔的磁力自带 tracker（可空，仅 HTTP(S) 形态参与）。"""
+    digest = magnetmod._normalize_hash(infohash)
+    if not digest:
+        raise HTTPException(400, "infohash 需为 40 位 hex 或 32 位 base32")
+    try:
+        wait_f = float(wait)
+    except (TypeError, ValueError):
+        wait_f = 15.0
+    trackers = [t.strip() for t in (tr or "").split(",") if t.strip()]
+    name = magnetmod.resolve_name(digest, timeout=max(3.0, min(wait_f, 30.0)),
+                                  trackers=trackers)
+    return {"infohash": digest, "name": name}
 
 
 # 种子文件上传上限（正常 .torrent 远小于此；防恶意大包）
