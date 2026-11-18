@@ -179,7 +179,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 
 /* ---------------- 按钮 ---------------- */
 .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
-.row-inline { display: flex; align-items: center; gap: 12px; }
+.row-inline { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .row-inline .grow { flex: 1; min-width: 0; }
 
 .btn {
@@ -204,6 +204,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 .check {
   display: inline-flex; align-items: center; gap: 7px;
   font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none;
+  white-space: nowrap; flex-shrink: 0;
 }
 .check input { width: 15px; height: 15px; accent-color: var(--primary); }
 
@@ -475,8 +476,11 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 @media (max-width: 760px) {
   .topbar { padding: 14px 16px; }
   .tabs { padding: 10px 16px 0; }
+  .tab { flex: 1 1 0; min-width: 0; padding: 10px 6px; text-align: center; }
   main { padding: 16px 14px 40px; }
   .card { padding: 18px 16px; }
   .form-grid { grid-template-columns: 1fr; }
   .brand-icon { width: 38px; height: 38px; }
+  .xd-opt-row { grid-template-columns: 1fr; gap: 4px; }
+  .xd-opt-choices input[type="text"] { min-width: 0; }
 }
