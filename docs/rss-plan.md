@@ -1,6 +1,7 @@
 # RSS 订阅支持 · 研究与设计草案（feat/rss-subscribe）
 
-> 状态：研究定稿（2026-11-19），未实施。结论先行：**可行且成本可控**——
+> 状态：研究定稿（2026-11-19）；**P1 已落地**（feat/rss-subscribe，产物
+> v0.1.46.1-rss 分支测试包），P2/P3 见 §5 与 §7。结论先行：**可行且成本可控**——
 > 派发链（通道降级/配额熔断/历史查重/磁力真名）、持久化调度（taskqueue）
 > 与链接解析（links）三块积木全部可复用，新增的只有「订阅源拉取 + 条目
 > 解析 + 过滤去重」一层薄壳。
@@ -123,12 +124,16 @@ rss-ticker（后台线程，60s 醒一次）
 
 ## 5. 实施分期
 
-- **P1 手动闭环**（先验证解析质量）：订阅 CRUD + 「立即检查」+ 条目预览
-  + 手动派发 + guid/identity 去重缓存。**不做定时轮询**。
-- **P2 自动化**：rss-ticker 定时轮询 + auto_download 开关 + 关键词/正则
-  过滤 + 失败搁置与错误提示（对齐 taskqueue 语义）。
-- **P3 打磨**：剧集级防重复（Smart-episode 式，同集只下一次）、大小过滤、
-  nyaa/EZTV 扩展标签深解析、每订阅目录、条目历史清理策略。
+- **P1 手动闭环**（已落地）：订阅 CRUD + 「立即检查」+ 条目预览 + 手动
+  派发 + 三层去重（guid/identity/历史查重）+ 三轴过滤（含大小阈值与
+  正则模式）+ BEP 36 优先级链 + 条件 GET + MAX_FAILS 搁置 + 每订阅目录
+  透传。**不含定时轮询**。
+- **P2 自动化**：rss-ticker 定时轮询 + auto_download 开关 + 失败搁置与
+  错误提示（对齐 taskqueue 语义）；吸收 ani-rss 经验（§7.2）：订阅间
+  请求间隔防限流、失败任务重置链、auto_download 并发上限。
+- **P3 打磨**：剧集级防重复（自定义集数正则式，§7.3）、seen 缓存滚动
+  清理策略；可选大件（§7.3）：多源备用订阅（订阅组）、源停滞提醒、
+  遗漏检测、同资源多版本择优。
 
 ## 6. 开放问题（实施前需拍板）
 
@@ -140,10 +145,62 @@ rss-ticker（后台线程，60s 醒一次）
 3. **过滤层级**：关键词 + 正则开关够吗？剧集智能去重（P3）优先级如何？
 4. **下载目录**：全局默认目录即可，还是每订阅必须指定（分类存放）？
 
-## 7. 参考
+## 7. ani-rss 订阅实现对比（2026-11-19 调研）
+
+对象：wushuo894/ani-rss——Java/Spring 的 RSS 自动追番工具（订阅/下载/
+刮削/洗版，下载器 qBittorrent/Transmission/Aria2）。核心四件：RssTask
+（轮询调度）、ItemsUtil（条目解析/过滤）、DownloadService（下载决策链）、
+Ani（订阅实体）。结论：**基础机制 P1 已覆盖，值得搬的是 P2 的轮询工程
+细节与 P3 的剧集语义；刮削链路不搬**。
+
+### 7.1 已覆盖（P1 现状 ≈ 其基础能力）
+
+| ani-rss | P1 对应 |
+|---|---|
+| 条目字段链 enclosure→guid(infohash)→nyaa:infoHash/size→torrent:infohash→link(.torrent)→description 兜底 | BEP 36 优先级链（含 media:content、磁力直链、兜底提取） |
+| exclude/match/globalExclude 三规则 | must_not/must/regex 三轴过滤 |
+| RssTask.DOWNLOAD_LOCK 单飞锁 | 检查单飞守卫同款 |
+| 引擎 hash 查重 + itemDownloaded 本地查重 | 三层去重（guid→identity→history_check） |
+
+### 7.2 借鉴 → P2（轮询与自动派发）
+
+1. **订阅间请求间隔**：其 RssTask 每订阅间 sleep 500ms 防对端限流；
+   rss-ticker 连查多订阅时同加 0.5~1s 间隔。
+2. **失败任务重置链**：其下载重试 N 次后删任务待下轮新种；auto_download
+   的 failed 任务设重试上限，超限重置回待派发/搁置，不永久卡死。
+3. **并发下载上限**（downloadCount）：auto_download 单轮派发数限流——
+   配额熔断是事后熔断，这是前置节流，防一次检查涌入大量任务。
+
+### 7.3 借鉴 → P3（剧集/条目语义）
+
+1. **自定义集数解析正则**（customEpisode 正则 + groupIndex 捕获组 +
+   offset 偏移修正）：通用工具不能假设标题格式，用户自配正则提取集数
+   最通用——剧集去重建议直接采用此范式（比 Smart Episode Filter 的
+   固定正则更灵活）。
+2. **剧集去重模型**：集数解析后按（订阅, 季, 集）distinct，同集只收
+   一条；PROPER/REPACK 例外随「多版本择优」一起考虑。
+3. **集数级开关**：notDownload 集数黑名单、downloadNew 只收最新集。
+4. **多源备用订阅**（standbyRssList + master 标记 + coexist 共存）：
+   同一内容多源互补、同集删旧换新——通用化即「订阅组」，大件后置。
+5. **源停滞提醒**（procrastinating：N 天无新条目提醒，一天至多一次）：
+   通用 RSS 同样需要（订阅源停更/失效用户要知道），轻件。
+6. **遗漏检测 + 同资源多版本择优**（omitList / customPriorityKeywords
+   洗版）：依赖集数语义，随剧集去重落地后考虑。
+
+### 7.4 不适配（明确不搬）
+
+- TMDB/BGM 刮削、NFO 生成、媒体库对接、上传——追番专精链路，超出
+  通用下载工具边界。
+- 完结迁移 completed / 完结自动停订——依赖追番总集数语义。
+- 路径模板 `${season}/${bgmId}/${tmdbid}` 占位符——追番字段；通用场景
+  每订阅目录（P1 已支持）已够。
+
+## 8. 参考
 
 - BEP 36 Torrent RSS feeds：https://www.bittorrent.org/beps/bep_0036.html
 - qBittorrent RSS 下载规则 / Smart Episode Filter（正则三轴过滤范式）
 - at-rss（aria2/Transmission RSS 监视器）：include/exclude 关键词组、
   trick-mode 磁力提取、processed-item 持久缓存
 - nyaa 风格 `?page=rss` 扩展（nyaa:infoHash/media:hash 等）
+- ani-rss（RSS 自动追番/订阅/下载/洗版，订阅机制参考）：
+  https://github.com/wushuo894/ani-rss
