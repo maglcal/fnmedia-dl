@@ -3,8 +3,9 @@
 
 数据文件 state/rss.json（文件锁短临界区同 taskqueue 口径）：
   {"subs":  [{"id","name","url","enabled","interval_min","auto_download",
-              "directory","filter","etag","last_modified",
-              "last_check","last_check_ts","last_error","fail_count"}],
+              "directory","filter","episode","ep_seen","etag",
+              "last_modified","last_check","last_check_ts","last_error",
+              "fail_count"}],
    "items": {sub_id: [{"id","guid","identity","title","url","size",
                        "state","retry_count","first_seen","last_result"}]},
    "seen":  {fingerprint: ts}}        # 条目去重指纹，30 天滚动清理
@@ -21,6 +22,11 @@
 
 去重三层：①seen 指纹缓存（guid/identity 归一，30 天滚动清理）→
   ②links.identity + 下载历史 history_check → ③派发幂等（dispatched 不重发）。
+  剧集去重（P3，ani-rss 范式）：episode.enabled 开启后按（订阅,季,集）
+  distinct——同集只收一条（ep_seen 落订阅数据持久化，先到先得）；集数由
+  自定义正则（regex+group 捕获组+offset 偏移）或内置模式链（SxxExx→
+  第N集/话/回→EPxx→Exx→裸集数）解析，解析不出不拦（宁漏勿错杀）；
+  过滤排除的条目不占集名额，手动派发仍可越过（显式用户意图）。
 过滤（qBittorrent 三轴）：must_not 一票否决 → must 任一命中（空 = 全过）
   → 大小阈值（feed 提供大小时才生效）；regex 模式限长 512 字符（ReDoS 自担）。
 
@@ -69,9 +75,21 @@ TICK_INTERVAL_SEC = 60               # rss-ticker 醒转间隔（秒）
 TICK_SUB_GAP = 0.5                   # 订阅间请求间隔（秒，防对端限流）
 MAX_AUTO_DISPATCH = 3                # 单订阅每轮自动派发上限（前置节流）
 MAX_DISPATCH_RETRY = 3               # 自动派发失败重试上限（超限搁置待手动）
+MAX_EP_SEEN = 2000                   # 每订阅已收集数键上限（按时间淘汰旧键）
 
 _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^\s\"'<>]*")
 _TORRENT_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.torrent", re.I)
+_SEASON_RE = re.compile(r"[Ss](\d{1,2})\b|第\s*(\d{1,3})\s*[季部]")
+# 集数默认模式链（SxxExx → 第N集 → EPxx → Exx → 裸集数）：宁保守勿错杀
+# ——错杀同集不同资源会丢下载，漏判只是不去重。裸集数（ - 05）是动画
+# 发布命名主流，但多剧混合源可能撞集，靠 episode.enabled 显式开关自担。
+_EP_PATTERNS = (
+    re.compile(r"[Ss](\d{1,2})[Ee][Pp]?(\d{1,3})"),
+    re.compile(r"第\s*(\d{1,3})\s*[集话話回]"),
+    re.compile(r"\b[Ee][Pp](\d{1,3})\b"),
+    re.compile(r"\b[Ee](\d{2,3})\b"),
+    re.compile(r" - (\d{2,3})\b"),
+)
 
 
 # ---------------------------------------------------------------- 过滤
@@ -145,6 +163,74 @@ def _filter_entry(title: str, size: int, flt: dict) -> tuple[bool, str]:
         if smax is not None and mb > smax:
             return False, f"体积大于 {smax}MB"
     return True, ""
+
+
+# ---------------------------------------------------------------- 剧集（P3）
+
+def _season_of(title: str) -> int:
+    """季号独立探测：Sxx 或 第N季/部；取不到按 0。"""
+    m = _SEASON_RE.search(title)
+    if not m:
+        return 0
+    return int(m.group(1) or m.group(2) or 0)
+
+
+def parse_episode(title: str, pattern: str = "", group: int = 1,
+                  offset: int = 0) -> tuple[int, int] | None:
+    """标题 → (季, 集)；解析不出返回 None（剧集去重不拦，宁漏勿错杀）。
+
+    自定义正则优先（ani-rss 范式：pattern + group 捕获组 + offset 偏移
+    修正）；未配正则走默认模式链 _EP_PATTERNS。季号 _season_of 独立探测。"""
+    title = title or ""
+    if pattern:
+        try:
+            m = re.search(pattern, title)
+        except re.error:
+            return None                 # 运行期不抛：配置期 _norm_episode 已拦
+        if not m:
+            return None
+        try:
+            ep = int(m.group(group)) + int(offset)
+        except (IndexError, ValueError):
+            return None
+        return (_season_of(title), ep) if ep > 0 else None  # ep<=0 不产键（同默认链）
+    for i, rx in enumerate(_EP_PATTERNS):
+        m = rx.search(title)
+        if not m:
+            continue
+        if i == 0:
+            season, ep = int(m.group(1)), int(m.group(2))
+        else:
+            season, ep = _season_of(title), int(m.group(1))
+        if ep > 0:
+            return season, ep
+    return None
+
+
+def _norm_episode(ep: dict | None) -> dict:
+    """剧集去重配置归一 + 校验（正则编译 + 捕获组存在性）。"""
+    ep = ep or {}
+    regex = str(ep.get("regex") or "").strip()
+    if len(regex) > REGEX_MAX_LEN:
+        raise ValueError(f"集数正则过长（上限 {REGEX_MAX_LEN} 字符）")
+    try:
+        # 显式 0 组号必须拒绝（`or` 会把 0 吞成默认 1）；空/缺省才落默认
+        group = 1 if ep.get("group") in (None, "") else int(ep.get("group"))
+        offset = 0 if ep.get("offset") in (None, "") else int(ep.get("offset"))
+    except (TypeError, ValueError):
+        raise ValueError("集数捕获组/偏移需为整数")
+    if group < 1:
+        raise ValueError("集数捕获组从 1 开始")
+    if regex:
+        try:
+            compiled = re.compile(regex)
+        except re.error as exc:
+            raise ValueError(f"集数正则无效：{exc}")
+        if compiled.groups < group:
+            raise ValueError(
+                f"集数正则只有 {compiled.groups} 个捕获组，取不到第 {group} 组")
+    return {"enabled": bool(ep.get("enabled")), "regex": regex,
+            "group": group, "offset": offset}
 
 
 # ---------------------------------------------------------------- 解析
@@ -334,7 +420,7 @@ class RssFeed:
 
     def add(self, url: str, name: str = "", *, directory: str = "",
             interval_min: int = 30, auto_download: bool = False,
-            flt: dict | None = None) -> dict:
+            flt: dict | None = None, episode: dict | None = None) -> dict:
         url = (url or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("订阅地址需为 http(s) 链接")
@@ -347,6 +433,8 @@ class RssFeed:
             "auto_download": bool(auto_download),
             "directory": (directory or "").strip(),
             "filter": _norm_filter(flt),
+            "episode": _norm_episode(episode),
+            "ep_seen": {},
             "etag": "", "last_modified": "",
             "last_check": "", "last_check_ts": 0,
             "last_error": "", "fail_count": 0,
@@ -380,6 +468,10 @@ class RssFeed:
                 sub["directory"] = str(patch.get("directory") or "").strip()
             if "filter" in patch:
                 sub["filter"] = _norm_filter(patch.get("filter"))
+            if "episode" in patch:
+                sub["episode"] = _norm_episode(patch.get("episode"))
+            if patch.get("ep_reset"):
+                sub["ep_seen"] = {}      # 换正则/重收全集时显式清空已收集数
             self._save(data)
             return dict(sub)
 
@@ -501,6 +593,9 @@ class RssFeed:
                 data = self._load()
                 sub = self._find(data, sub_id)
                 flt = sub.get("filter") or {}
+                ep_cfg = sub.get("episode") or {}
+                ep_on = bool(ep_cfg.get("enabled"))
+                ep_seen = sub.setdefault("ep_seen", {})
                 lst = data["items"].setdefault(sub_id, [])
                 seen = data.setdefault("seen", {})
                 existing = ({it.get("guid") for it in lst}
@@ -524,6 +619,14 @@ class RssFeed:
                         "first_seen": now,
                         "last_result": "",
                     }
+                    ep_key = ""
+                    if ep_on:
+                        ep = parse_episode(raw.get("title") or "",
+                                           ep_cfg.get("regex") or "",
+                                           int(ep_cfg.get("group") or 1),
+                                           int(ep_cfg.get("offset") or 0))
+                        if ep:
+                            ep_key = f"S{ep[0]:02d}E{ep[1]:02d}"
                     # 层②：资源级下载历史查重（命中 = 已有同资源）
                     if history_check is not None:
                         try:
@@ -535,12 +638,27 @@ class RssFeed:
                             item["last_result"] = "下载历史已有同资源"
                             lst.append(item)
                             added.append(item)
+                            # 已有同资源 = 该集已入库，占集名额挡其他版本
+                            if ep_key and ep_key not in ep_seen:
+                                ep_seen[ep_key] = now
                             continue
                     ok, reason = _filter_entry(item["title"], item["size"], flt)
+                    # 层②.5 剧集去重（P3）：同（订阅,季,集）只收一条、先到
+                    # 先得；过滤排除的条目不占名额（同集换版本仍可收）
+                    if ok and ep_key:
+                        if ep_key in ep_seen:
+                            ok = False
+                            reason = f"同集已收：{ep_key}"
+                        else:
+                            ep_seen[ep_key] = now
                     item["state"] = "matched" if ok else "skipped"
                     item["last_result"] = "" if ok else reason
                     lst.append(item)
                     added.append(item)
+                if len(ep_seen) > MAX_EP_SEEN:   # 已收集数键按时间淘汰旧键
+                    keep = sorted(ep_seen.items(), key=lambda kv: kv[1],
+                                  reverse=True)[:MAX_EP_SEEN]
+                    sub["ep_seen"] = dict(keep)
                 if len(lst) > MAX_ITEMS_PER_SUB:
                     data["items"][sub_id] = lst[-MAX_ITEMS_PER_SUB:]
                 sub["etag"] = (fetched.get("etag") or sub.get("etag") or "")

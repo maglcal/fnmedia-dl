@@ -374,10 +374,21 @@
         <label>轮询间隔<span class="opt">分钟，最短 10</span>
           <input id="rssInterval" type="number" value="30" min="10" step="5">
         </label>
+        <label>集数正则<span class="opt">选填，剧集去重自定义解析（留空用内置模式）</span>
+          <input id="epRegex" type="text" spellcheck="false"
+                 placeholder="如：EP(\d+)">
+        </label>
+        <label>捕获组<span class="opt">正则中集数所在组号，选填</span>
+          <input id="epGroup" type="number" value="1" min="1" step="1">
+        </label>
+        <label>集数偏移<span class="opt">解析值 + 偏移 = 实际集数，选填</span>
+          <input id="epOffset" type="number" value="0" step="1">
+        </label>
       </div>
       <div class="row-inline dir-tools">
         <label class="check"><input type="checkbox" id="rssAutoDl"><span>自动下载命中条目（关闭 = 仅入库待确认）</span></label>
         <label class="check"><input type="checkbox" id="rssRegex"><span>按正则匹配（进阶）</span></label>
+        <label class="check"><input type="checkbox" id="epDedup"><span>剧集去重：同（季·集）只收一条（单剧订阅用）</span></label>
       </div>
       <div class="actions">
         <button id="btnRssAdd" class="btn primary">添加订阅</button>

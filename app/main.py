@@ -1040,6 +1040,7 @@ class RssSubAddReq(BaseModel):
     interval_min: int = 30
     auto_download: bool = False
     filter: dict | None = None
+    episode: dict | None = None
 
 
 @app.post("/api/rss/subs")
@@ -1048,7 +1049,7 @@ def rss_add(req: RssSubAddReq):
         sub = _rss().add(req.url, req.name, directory=req.directory,
                          interval_min=req.interval_min,
                          auto_download=req.auto_download,
-                         flt=req.filter)
+                         flt=req.filter, episode=req.episode)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True, "sub": sub}
@@ -1062,6 +1063,8 @@ class RssSubPatchReq(BaseModel):
     auto_download: bool | None = None
     directory: str | None = None
     filter: dict | None = None
+    episode: dict | None = None
+    ep_reset: bool | None = None      # true = 清空已收集数记录（换正则后用）
 
 
 @app.put("/api/rss/subs/{sub_id}")

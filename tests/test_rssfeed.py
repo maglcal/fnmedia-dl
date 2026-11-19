@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """RSS 订阅（rssfeed.py）测试：BEP 36 解析优先级、三轴过滤、指纹去重、
-CRUD、check 闭环（MockTransport 注入假 feed）、派发幂等 + API 层。"""
+剧集去重（P3）、CRUD、check 闭环（MockTransport 注入假 feed）、派发幂等
++ API 层。"""
 from __future__ import annotations
 
 import os
@@ -287,6 +288,80 @@ class TestFingerprint(unittest.TestCase):
         self.assertEqual(rssmod._fingerprint("", "url:x"), "url:x")
 
 
+# ---------------------------------------------------------------- 剧集（P3）
+
+class TestEpisodeParse(unittest.TestCase):
+    """集数解析：自定义正则（组+偏移）优先，否则内置模式链；解析不出返回
+    None（去重不拦，宁漏勿错杀）。"""
+
+    def test_default_sxxexx(self):
+        self.assertEqual(rssmod.parse_episode("Show.S02E05.1080p"), (2, 5))
+
+    def test_default_cn_episode(self):
+        self.assertEqual(rssmod.parse_episode("某剧 第2季 第12话"), (2, 12))
+        self.assertEqual(rssmod.parse_episode("某剧 第3集"), (0, 3))
+
+    def test_default_ep_word_and_bare_e(self):
+        self.assertEqual(rssmod.parse_episode("Show EP08"), (0, 8))
+        self.assertEqual(rssmod.parse_episode("Show E03"), (0, 3))
+
+    def test_default_dash_number(self):
+        self.assertEqual(rssmod.parse_episode("Show - 07"), (0, 7))
+
+    def test_default_no_match_returns_none(self):
+        self.assertIsNone(rssmod.parse_episode("每周杂谈 第12期"))
+        self.assertIsNone(rssmod.parse_episode(""))
+
+    def test_default_zero_ep_skipped(self):
+        """ep<=0 不产键：S01E00 退化为解析不出，去重不拦。"""
+        self.assertIsNone(rssmod.parse_episode("Show S01E00"))
+
+    def test_custom_regex_group_offset(self):
+        self.assertEqual(rssmod.parse_episode("Show EP5", r"EP(\d+)", 1, 10),
+                         (0, 15))
+        self.assertEqual(rssmod.parse_episode("v2-7", r"v(\d+)-(\d+)", 2),
+                         (0, 7))
+
+    def test_custom_season_from_title(self):
+        self.assertEqual(rssmod.parse_episode("Show S03 EP5", r"EP(\d+)"),
+                         (3, 5))
+
+    def test_custom_no_match_or_bad_regex_returns_none(self):
+        self.assertIsNone(rssmod.parse_episode("Show 12", r"EP(\d+)"))
+        self.assertIsNone(rssmod.parse_episode("Show EP5", "("))  # 运行期不抛
+
+    def test_custom_ep_nonpositive_returns_none(self):
+        self.assertIsNone(rssmod.parse_episode("Show EP5", r"EP(\d+)", 1, -10))
+        self.assertIsNone(rssmod.parse_episode("Show EP5", r"EP(\d+)", 1, -5))
+
+    def test_season_of(self):
+        self.assertEqual(rssmod._season_of("Show S03"), 3)
+        self.assertEqual(rssmod._season_of("某剧 第2季"), 2)
+        self.assertEqual(rssmod._season_of("杂谈"), 0)
+
+    def test_norm_episode_defaults(self):
+        self.assertEqual(rssmod._norm_episode(None),
+                         {"enabled": False, "regex": "", "group": 1,
+                          "offset": 0})
+        self.assertEqual(rssmod._norm_episode({"enabled": 1, "offset": "3"}),
+                         {"enabled": True, "regex": "", "group": 1,
+                          "offset": 3})
+
+    def test_norm_episode_validation(self):
+        with self.assertRaises(ValueError):
+            rssmod._norm_episode({"regex": "a" * (rssmod.REGEX_MAX_LEN + 1)})
+        with self.assertRaises(ValueError):
+            rssmod._norm_episode({"regex": "("})
+        with self.assertRaises(ValueError):
+            rssmod._norm_episode({"group": 0})        # 显式 0 同样拒绝
+        with self.assertRaises(ValueError):
+            rssmod._norm_episode({"group": -1})
+        with self.assertRaises(ValueError):
+            rssmod._norm_episode({"regex": r"EP(\d+)", "group": 5})
+        with self.assertRaises(ValueError):
+            rssmod._norm_episode({"group": "abc"})
+
+
 # ---------------------------------------------------------------- CRUD
 
 class TestCrud(RssTestBase):
@@ -506,6 +581,143 @@ class TestCheck(RssTestBase):
         self.feed.check(sub["id"], client=bad)
         self.assertEqual(self.feed.snapshot()["subs"][0]["fail_count"],
                          rssmod.MAX_FAILS + 1)
+
+
+# ---------------------------------------------------------------- 剧集去重
+
+class TestEpisodeDedup(RssTestBase):
+    """ep_seen 剧集去重（P3）：同（订阅,季,集）只收一条、先到先得。"""
+
+    def test_same_round_first_wins(self):
+        sub = self.seed_sub(episode={"enabled": True})
+        entries = (entry_link("gA", "Show S01E01 1080p", magnet(IH_A))
+                   + entry_link("gB", "Show S01E01 2160p", magnet(IH_B)))
+        res = self.feed.check(sub["id"],
+                              client=self.mock_client(body=rss_wrap(entries)))
+        self.assertEqual(res["matched"], 1)
+        self.assertEqual(res["skipped"], 1)
+        by_title = {i["title"]: i for i in res["items"]}
+        self.assertEqual(by_title["Show S01E01 1080p"]["state"], "matched")
+        self.assertEqual(by_title["Show S01E01 2160p"]["state"], "skipped")
+        self.assertIn("同集已收：S01E01",
+                      by_title["Show S01E01 2160p"]["last_result"])
+
+    def test_cross_check_dedup(self):
+        """跨检查去重：不同指纹（不同 guid+磁力）同集仍只收一条。"""
+        sub = self.seed_sub(episode={"enabled": True})
+        cli1 = self.mock_client(
+            body=rss_wrap(entry_link("gA", "Show S01E01", magnet(IH_A))))
+        self.assertEqual(self.feed.check(sub["id"], client=cli1)["matched"], 1)
+        cli2 = self.mock_client(
+            body=rss_wrap(entry_link("gB", "Show S01E01 v2", magnet(IH_B))))
+        res2 = self.feed.check(sub["id"], client=cli2)
+        self.assertEqual(res2["matched"], 0)
+        self.assertEqual(res2["skipped"], 1)
+        self.assertIn("同集已收", res2["items"][0]["last_result"])
+
+    def test_disabled_no_effect(self):
+        sub = self.seed_sub(episode={"enabled": False})
+        entries = (entry_link("gA", "Show S01E01 1080p", magnet(IH_A))
+                   + entry_link("gB", "Show S01E01 2160p", magnet(IH_B)))
+        res = self.feed.check(sub["id"],
+                              client=self.mock_client(body=rss_wrap(entries)))
+        self.assertEqual(res["matched"], 2)
+
+    def test_unparseable_not_blocked(self):
+        """解析不出集数不拦（宁漏勿错杀）。"""
+        sub = self.seed_sub(episode={"enabled": True})
+        entries = (entry_link("gA", "每周杂谈 12", magnet(IH_A))
+                   + entry_link("gB", "每周杂谈 12 修订版", magnet(IH_B)))
+        res = self.feed.check(sub["id"],
+                              client=self.mock_client(body=rss_wrap(entries)))
+        self.assertEqual(res["matched"], 2)
+
+    def test_filtered_not_occupy_slot(self):
+        """过滤排除的条目不占集名额（同集换版本仍可收）。"""
+        sub = self.seed_sub(flt={"must_not": ["cam"]}, episode={"enabled": True})
+        entries = (entry_link("gA", "Show S01E01 CAM", magnet(IH_A))
+                   + entry_link("gB", "Show S01E01 1080p", magnet(IH_B)))
+        res = self.feed.check(sub["id"],
+                              client=self.mock_client(body=rss_wrap(entries)))
+        by_title = {i["title"]: i for i in res["items"]}
+        self.assertEqual(by_title["Show S01E01 CAM"]["state"], "skipped")
+        self.assertEqual(by_title["Show S01E01 1080p"]["state"], "matched")
+
+    def test_history_hit_occupies_slot(self):
+        """历史查重命中的条目占集名额（已有同资源 = 该集已入库）。"""
+        sub = self.seed_sub(episode={"enabled": True})
+        entries = (entry_link("gA", "Show S01E01", magnet(IH_A))
+                   + entry_link("gB", "Show S01E01 v2", magnet(IH_B)))
+
+        def hist(url):
+            return {"downloaded": IH_A in url}
+        res = self.feed.check(sub["id"],
+                              client=self.mock_client(body=rss_wrap(entries)),
+                              history_check=hist)
+        by_title = {i["title"]: i for i in res["items"]}
+        self.assertEqual(by_title["Show S01E01"]["state"], "skipped")
+        self.assertIn("历史", by_title["Show S01E01"]["last_result"])
+        self.assertEqual(by_title["Show S01E01 v2"]["state"], "skipped")
+        self.assertIn("同集已收", by_title["Show S01E01 v2"]["last_result"])
+
+    def test_ep_reset_clears_slots(self):
+        sub = self.seed_sub(episode={"enabled": True})
+        cli1 = self.mock_client(
+            body=rss_wrap(entry_link("gA", "Show S01E01", magnet(IH_A))))
+        self.feed.check(sub["id"], client=cli1)
+        self.feed.update(sub["id"], {"ep_reset": True})
+        self.assertEqual(self.feed.snapshot()["subs"][0]["ep_seen"], {})
+        cli2 = self.mock_client(
+            body=rss_wrap(entry_link("gB", "Show S01E01 v2", magnet(IH_B))))
+        self.assertEqual(self.feed.check(sub["id"], client=cli2)["matched"], 1)
+
+    def test_ep_seen_per_sub(self):
+        """ep_seen 按订阅隔离：不同订阅同集互不挤占。"""
+        sub1 = self.seed_sub(episode={"enabled": True})
+        sub2 = self.feed.add("https://rss.example/other.xml", "另一源",
+                             episode={"enabled": True})
+        cli1 = self.mock_client(
+            body=rss_wrap(entry_link("gA", "Show S01E01", magnet(IH_A))))
+        self.assertEqual(self.feed.check(sub1["id"], client=cli1)["matched"], 1)
+        cli2 = self.mock_client(
+            body=rss_wrap(entry_link("gB", "Show S01E01 v2", magnet(IH_B))))
+        self.assertEqual(self.feed.check(sub2["id"], client=cli2)["matched"], 1)
+
+    def test_update_episode_config(self):
+        sub = self.seed_sub()
+        out = self.feed.update(sub["id"], {"episode": {"enabled": True,
+                                                       "regex": r"EP(\d+)",
+                                                       "group": 1,
+                                                       "offset": 2}})
+        self.assertEqual(out["episode"], {"enabled": True, "regex": r"EP(\d+)",
+                                          "group": 1, "offset": 2})
+        with self.assertRaises(ValueError):
+            self.feed.update(sub["id"], {"episode": {"regex": "("}})
+
+    def test_add_episode_validated_and_normalized(self):
+        with self.assertRaises(ValueError):
+            self.seed_sub(episode={"regex": "("})
+        with self.assertRaises(ValueError):
+            self.seed_sub(episode={"group": 0})
+        sub = self.seed_sub(episode={"enabled": 1, "offset": "3"})
+        self.assertEqual(sub["episode"], {"enabled": True, "regex": "",
+                                          "group": 1, "offset": 3})
+
+    def test_ep_seen_trim_evicts(self):
+        """ep_seen 超上限按时间淘汰旧键——被挤出的集可重新收集。"""
+        sub = self.seed_sub(episode={"enabled": True})
+        entries = (entry_link("g1", "Show S01E01", magnet(IH_A))
+                   + entry_link("g2", "Show S01E02", magnet(IH_B))
+                   + entry_link("g3", "Show S01E03", magnet(IH_C)))
+        with mock.patch.object(rssmod, "MAX_EP_SEEN", 2):
+            self.feed.check(sub["id"],
+                            client=self.mock_client(body=rss_wrap(entries)))
+        ep_seen = self.feed.snapshot()["subs"][0]["ep_seen"]
+        self.assertEqual(len(ep_seen), 2)
+        self.assertNotIn("S01E03", ep_seen)   # 等时间戳稳定排序，后进先淘汰
+        res2 = self.feed.check(sub["id"], client=self.mock_client(
+            body=rss_wrap(entry_link("g4", "Show S01E03 v2", magnet(IH_D)))))
+        self.assertEqual(res2["matched"], 1)
 
 
 # ---------------------------------------------------------------- 派发
@@ -804,6 +1016,26 @@ class TestRssAPI(unittest.TestCase):
             f"/api/rss/subs/{sub['id']}", json={"url": "bad"}).status_code, 400)
         self.assertEqual(self.client.put(
             "/api/rss/subs/nosuch", json={"name": "x"}).status_code, 404)
+
+    def test_episode_config_api(self):
+        """episode 配置 API 往返 + 非法配置 400 + ep_reset 清空已收集数。"""
+        sub = self._add(episode={"enabled": True, "regex": r"EP(\d+)",
+                                 "offset": 1})
+        self.assertEqual(sub["episode"], {"enabled": True,
+                                          "regex": r"EP(\d+)",
+                                          "group": 1, "offset": 1})
+        r = self.client.put(f"/api/rss/subs/{sub['id']}",
+                            json={"episode": {"enabled": True},
+                                  "ep_reset": True})
+        self.assertEqual(r.json()["sub"]["episode"]["enabled"], True)
+        self.assertEqual(r.json()["sub"]["ep_seen"], {})
+        self.assertEqual(self.client.post(
+            "/api/rss/subs",
+            json={"url": "https://x.example/f", "episode": {"regex": "("}}
+        ).status_code, 400)
+        self.assertEqual(self.client.put(
+            f"/api/rss/subs/{sub['id']}",
+            json={"episode": {"group": 0}}).status_code, 400)
 
     def test_items_and_check_404(self):
         self.assertEqual(self.client.get(

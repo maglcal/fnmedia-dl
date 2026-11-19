@@ -1725,6 +1725,7 @@ function renderRssSubs(subs) {
         ${esc(s.name || s.url)}
         ${s.enabled ? "" : `<span class="tag">已停用</span>`}
         ${s.auto_download ? `<span class="tag">自动下载</span>` : ""}
+        ${(s.episode && s.episode.enabled) ? `<span class="tag">剧集去重</span>` : ""}
         ${s.suspended ? `<span class="tag warn">连续失败已搁置</span>` : ""}
         <div class="link-reason">${esc(s.url)}</div>
         <div class="link-reason">
@@ -1814,6 +1815,12 @@ on("#btnRssAdd", "click", async () => {
       must: rssKwList($("#rssMust").value),
       must_not: rssKwList($("#rssMustNot").value),
       regex: $("#rssRegex").checked,
+    },
+    episode: {
+      enabled: $("#epDedup").checked,
+      regex: $("#epRegex").value.trim(),
+      group: parseInt($("#epGroup").value, 10) || 1,
+      offset: parseInt($("#epOffset").value, 10) || 0,
     },
   };
   const btn = $("#btnRssAdd");
