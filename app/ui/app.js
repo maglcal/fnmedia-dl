@@ -309,7 +309,7 @@ function renderTasks(tasks, backendErrors) {
         <div class="progress"><div class="state-${esc(t.state)}" style="width:${Math.min(100, t.progress || 0)}%"></div></div>
         <div class="progress-text"><span>${(t.progress || 0).toFixed(1)}%</span><span>${fmtSize(t.size)}</span></div>
       </td>
-      <td>${fmtSpeed(t.speed)}</td>
+      <td class="col-speed">${fmtSpeed(t.speed)}</td>
       <td>
         ${dead ? `
           <button class="btn" data-act="retry"

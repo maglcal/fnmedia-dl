@@ -26,7 +26,10 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import httpx
 
-from .base import Backend, BackendError, ParsedResource, TaskView
+import xunlei_docker
+
+from .base import (Backend, BackendError, ParsedResource, TaskView,
+                   apply_display_name)
 from .drive_core import (DriveCore, _agg_tries, _clip_timeout, _dbg,
                          task_to_view)
 
@@ -1030,10 +1033,25 @@ class ThunderCloud(Backend):
         self._require_token()
         target = self._target_of()
         resource = self.core.parse_resource(url)
-        if name:
-            resource.name = name
-        return self.core.create_task(url, resource, target,
-                                     directory=directory or (self.conf.get("dir") or ""))
+        # 兜底显示名不覆盖引擎解析真名（0.1.45.9，与本地直连同款）：
+        # resource/list 已解析出真名，拿 magnet:xxxxxxxx… 盖掉它=名字永远
+        # 只能指望 DHT 回填。显式真名（缓存命中/用户命名）仍覆盖。
+        apply_display_name(resource, url, name)
+        d = (directory or (self.conf.get("dir") or "")).strip()
+        # 目录映射校验（0.1.45.8，与本地直连同款补齐）：绝对路径先查容器
+        # 挂载——宿主路径自动换算为容器内路径（用户填 /vol1/1000/movie 而
+        # 引擎目录树是 /downloads/ 视角，此前 P2SP 通道缺这步翻译，
+        # 目录锚定必失败报「不在引擎可达的下载目录树内」——用户实测
+        # 删任务重下三通道全灭暴露）；映射外 → 明确报错阻止无效下发；
+        # 查不到容器 → 跳过校验靠目录表锚定（群晖套件/自建容器）。
+        if d.startswith("/"):
+            mapped, note = xunlei_docker.map_engine_dir(
+                d, xunlei_docker.container_mounts())
+            if mapped is None:
+                raise BackendError(f"保存目录 {d} 无效，已阻止下发。{note}")
+            if mapped != d:
+                d = mapped
+        return self.core.create_task(url, resource, target, directory=d)
 
     def browse_dirs(self, path: str = "") -> dict:
         """只读浏览远程设备下载目录树（下载目录选择器数据源）。
@@ -1062,3 +1080,7 @@ class ThunderCloud(Backend):
                                 task_id, "delete")
         else:
             self.core.delete_task(self._target_of(), task_id)
+
+    def rename_task(self, task_id: str, name: str) -> bool:
+        self._require_token()
+        return self.core.rename_task(self._target_of(), task_id, name)

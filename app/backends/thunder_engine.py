@@ -17,7 +17,8 @@ import httpx
 
 import xunlei_docker
 
-from .base import Backend, BackendError, ParsedResource, TaskView
+from .base import (Backend, BackendError, ParsedResource, TaskView,
+                   apply_display_name, is_fallback_name)
 from .drive_core import DriveCore, task_to_view
 
 UIAUTH_RE = re.compile(r'uiauth\(value\)\{\s*return\s*"([^"]+)"')
@@ -90,8 +91,10 @@ class ThunderEngine(Backend):
             resource = self.core.parse_resource(url)
         except BackendError:
             raise
-        if name:
-            resource.name = name
+        # 兜底显示名不覆盖引擎解析真名（0.1.45.9）：resource/list 已解析出
+        # 真名（种子名），派发瞬间拿 magnet:xxxxxxxx… 盖掉它=名字永远只能
+        # 指望 DHT 回填（弱网失败就一直兜底名，用户实测「名称还是不行」）。
+        apply_display_name(resource, url, name)
         d = (directory or self.dir or "").strip()
         # 目录映射校验（0.1.37.3）：绝对路径先查容器挂载——
         # 映射外 → 明确报错阻止无效下发（避免落盘容器可写层）；
@@ -134,3 +137,7 @@ class ThunderEngine(Backend):
                                 task_id, "delete")
         else:
             self.core.delete_task(self._space_of(), task_id)
+
+    def rename_task(self, task_id: str, name: str) -> bool:
+        self._login()
+        return self.core.rename_task(self._space_of(), task_id, name)

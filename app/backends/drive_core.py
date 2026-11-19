@@ -795,6 +795,36 @@ class DriveCore:
         self._request("DELETE", "/tasks",
                       params={"space": space, "task_ids": task_id})
 
+    def rename_task(self, space: str, task_id: str, name: str) -> bool:
+        """引擎侧任务改名（0.1.45.7，面板 TaskRename 同款两连击）：
+        先改磁盘文件/文件夹名（PATCH /files/{file_id}），再改任务显示名
+        （PATCH /task 带 name）。仅当引擎侧当前名仍是兜底形态
+        （magnet:xxxxxxxx… 或截断链接）才改——防覆盖用户在面板的改名。
+        返回是否执行了改名。"""
+        task = self.find_task(task_id, space) or {}
+        if not task:
+            return False
+        cur = str(task.get("name") or "")
+        _params = task.get("params") if isinstance(task.get("params"), dict) else {}
+        url = str(_params.get("url") or "")
+        if not (cur.startswith("magnet:") or (url and cur == url[:80])):
+            return False                 # 非兜底名（用户/上游改过），不动
+        file_id = str(task.get("file_id") or "")
+        if file_id:
+            try:
+                self._request("PATCH", f"/files/{file_id}",
+                              params={"space": task.get("space") or space},
+                              json_body={"id": file_id, "name": name})
+            except BackendError:
+                pass    # 文件/文件夹名改不动（如未落盘）不阻断任务名改名
+        self._request("PATCH", "/task", json_body={
+            "id": task_id,
+            "space": task.get("space") or space,
+            "type": task.get("type") or "user#download-url",
+            "name": name,
+        })
+        return True
+
 
 def task_to_view(backend: str, t: dict):
     """drive/v1 任务对象 → 统一任务视图。

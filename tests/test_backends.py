@@ -144,6 +144,74 @@ class TestDriveCore(unittest.TestCase):
         self.assertEqual(captured["params"]["sub_file_index"], "--1,")
         self.assertEqual(captured["file_size"], "10")
 
+    # ---- 引擎侧同步改名（0.1.45.7，面板 TaskRename 同款两连击）----
+
+    @staticmethod
+    def _rename_handler(task, patches, *, files_status=200):
+        """find_task 查询 + 两连击 PATCH 记录的最小 handler。"""
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"tasks": [
+                    {"params": {"target": "dev-space"}}, task]})
+            patches.append((request.method, request.url.path, request))
+            if "/files/" in request.url.path and files_status >= 400:
+                return httpx.Response(files_status, text="boom")
+            return httpx.Response(200, json={})
+        return handler
+
+    def test_rename_task_two_step(self):
+        """两连击：先 PATCH /files/{file_id} 改磁盘文件/文件夹名，
+        再 PATCH /task 改任务显示名（body 平铺 name 字段）。"""
+        patches = []
+        task = {"id": "t1", "name": "magnet:c14c89fa…", "file_id": "f1",
+                "params": {"url": "magnet:?xt=urn:btih:c14c89fa"}}
+        core = self._mk(self._rename_handler(task, patches))
+        self.assertTrue(core.rename_task("sp-1", "t1", "嫁金钗[全30集]"))
+        p_list = [x for x in patches if x[0] == "PATCH"]
+        self.assertEqual(len(p_list), 2)
+        _, p0, r0 = p_list[0]
+        self.assertTrue(p0.endswith("/files/f1"))
+        self.assertEqual(r0.url.params.get("space"), "sp-1")
+        self.assertEqual(json.loads(r0.content),
+                         {"id": "f1", "name": "嫁金钗[全30集]"})
+        _, p1, r1 = p_list[1]
+        self.assertTrue(p1.endswith("/drive/v1/task"))
+        body = json.loads(r1.content)
+        self.assertEqual(body["id"], "t1")
+        self.assertEqual(body["name"], "嫁金钗[全30集]")
+        self.assertEqual(body["type"], "user#download-url")
+
+    def test_rename_task_guard_skips_named(self):
+        """引擎侧名非兜底（用户在面板改过）→ 返回 False 零请求，防覆盖。"""
+        patches = []
+        task = {"id": "t1", "name": "嫁金钗[全30集]", "file_id": "f1",
+                "params": {"url": "magnet:?xt=urn:btih:c14c89fa"}}
+        core = self._mk(self._rename_handler(task, patches))
+        self.assertFalse(core.rename_task("sp-1", "t1", "别的名"))
+        self.assertEqual(patches, [])
+
+    def test_rename_without_file_id_renames_task_only(self):
+        """无 file_id（文件未落盘）→ 只改任务显示名。"""
+        patches = []
+        task = {"id": "t1", "name": "magnet:c14c89fa…",
+                "params": {"url": "magnet:?xt=urn:btih:c14c89fa"}}
+        core = self._mk(self._rename_handler(task, patches))
+        self.assertTrue(core.rename_task("sp-1", "t1", "真名"))
+        p_list = [x for x in patches if x[0] == "PATCH"]
+        self.assertEqual(len(p_list), 1)
+        self.assertTrue(p_list[0][1].endswith("/drive/v1/task"))
+
+    def test_rename_file_failure_still_renames_task(self):
+        """文件/文件夹名改不动（HTTP 500）不阻断任务显示名改名。"""
+        patches = []
+        task = {"id": "t1", "name": "magnet:c14c89fa…", "file_id": "f1",
+                "params": {"url": "magnet:?xt=urn:btih:c14c89fa"}}
+        core = self._mk(self._rename_handler(task, patches, files_status=500))
+        self.assertTrue(core.rename_task("sp-1", "t1", "真名"))
+        paths = [p for m, p, _ in patches if m == "PATCH"]
+        self.assertTrue(any(p.endswith("/files/f1") for p in paths))
+        self.assertTrue(any(p.endswith("/drive/v1/task") for p in paths))
+
     # ---- parent_folder_id 解析（2026-11-08 用户实测任务永远排队中 0.0% 的原因：
     #      缺省 parent_folder_id 的任务不会开始下载，已验证） ----
 
@@ -815,6 +883,33 @@ class TestThunderEngine(unittest.TestCase):
         self.assertEqual(json.loads(body["set_params"]["spec"]),
                          {"phase": "delete"})
 
+    def test_rename_task_engine_sync(self):
+        """引擎侧同步改名端到端（0.1.45.7）：thunder_engine.rename_task
+        转发 drive_core 两连击——迅雷里任务名与下载文件夹名随真名
+        （修用户实测：迅雷面板下载文件夹名残留 magnet:c14c89fa…）。"""
+        seen = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("index.cgi/"):
+                return httpx.Response(200, text=PANEL_HTML)
+            if request.method == "GET":
+                return httpx.Response(200, json={"tasks": [
+                    {"params": {"target": "dev-space"}},
+                    {"id": "t-9", "name": "magnet:c14c89fa…", "file_id": "f-1",
+                     "params": {"url": "magnet:?xt=urn:btih:c14c89fa"}}]})
+            seen.append((request.method, path, request))
+            return httpx.Response(200, json={})
+
+        eng = ThunderEngine(_client(handler), {"base_url": "http://nas:2345"})
+        self.assertTrue(eng.rename_task("t-9", "嫁金钗[全30集]"))
+        patches = [x for x in seen if x[0] == "PATCH"]
+        self.assertEqual(len(patches), 2)
+        self.assertTrue(patches[0][1].endswith("/files/f-1"))
+        self.assertTrue(patches[1][1].endswith("/drive/v1/task"))
+        self.assertEqual(json.loads(patches[1][2].content)["name"],
+                         "嫁金钗[全30集]")
+
     # ---- 目录映射校验（0.1.37.3）----
 
     @staticmethod
@@ -875,6 +970,32 @@ class TestThunderEngine(unittest.TestCase):
         self.assertEqual(tid, "t-1")
         self.assertEqual(captured.get("directory"), "/xunlei/downloads/movie")
 
+    def test_add_fallback_name_keeps_engine_resolved_name(self):
+        """兜底显示名不覆盖引擎解析真名（0.1.45.9 用户实测「名称还是不行」）：
+        resource/list 解析出的种子名才应成为任务名——派发瞬间拿
+        magnet:xxxxxxxx… 盖掉它=名字永远只能指望 DHT 回填。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = (
+            lambda url, resource, space, **kw:
+            captured.update(name=resource.name) or "t-1")
+        tid = eng.add("magnet:?xt=urn:btih:aa", name="magnet:aa…")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("name"), "f")     # 引擎解析真名生效
+
+    def test_add_explicit_name_overrides_engine_name(self):
+        """显式真名（真名缓存命中/用户命名）仍覆盖引擎解析名。"""
+        eng = ThunderEngine(_client(self._map_handler()),
+                            {"base_url": "http://nas:2345"})
+        captured = {}
+        eng.core.create_task = (
+            lambda url, resource, space, **kw:
+            captured.update(name=resource.name) or "t-1")
+        tid = eng.add("magnet:?xt=urn:btih:aa", name="真名.S01E01")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("name"), "真名.S01E01")
+
     def test_add_skips_validation_without_mounts(self):
         """查不到容器挂载 → 跳过校验、原样传递（群晖套件/自建容器）。"""
         eng = ThunderEngine(_client(self._map_handler()),
@@ -912,6 +1033,74 @@ class TestThunderEngine(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- thunder cloud
+
+class TestThunderCloudDirMap(unittest.TestCase):
+    """P2SP 通道目录映射（0.1.45.8 用户实测删任务重下三通道全灭）：
+    宿主路径 → 容器路径翻译此前只有本地直连通道有，P2SP 缺这步——
+    用户填 /vol1/1000/movie（NAS 宿主路径）目录锚定必失败报
+    「不在引擎可达的下载目录树内」。补齐后与本地直连同款语义。"""
+
+    MOUNTS = [{"Source": "/vol1/1000", "Destination": "/downloads"}]
+
+    def _tc(self, captured):
+        tc = ThunderCloud(_client(lambda r: httpx.Response(200, json={})),
+                          {"target": "remote-1"})
+        tc._require_token = lambda: None
+        tc._target_of = lambda: "dev-space"
+        tc.core.parse_resource = lambda url: ParsedResource(name="f")
+        tc.core.create_task = lambda *a, **kw: captured.update(kw) or "t-1"
+        return tc
+
+    def test_add_converts_host_path_to_container(self):
+        """宿主路径自动换算为容器内路径再下发（与本地直连同款）。"""
+        captured = {}
+        tc = self._tc(captured)
+        with mock.patch("xunlei_docker.container_mounts",
+                        return_value=self.MOUNTS):
+            tid = tc.add("magnet:?xt=urn:btih:aa",
+                         directory="/vol1/1000/movie")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "/downloads/movie")
+
+    def test_add_blocks_unmapped_dir(self):
+        """映射外路径 → 明确报错阻止无效下发，不建任务。"""
+        captured = {}
+        tc = self._tc(captured)
+        with mock.patch("xunlei_docker.container_mounts",
+                        return_value=self.MOUNTS):
+            with self.assertRaises(BackendError) as ctx:
+                tc.add("magnet:?xt=urn:btih:aa", directory="/vol1/other")
+        self.assertIn("阻止下发", str(ctx.exception))
+        self.assertIn("未映射进迅雷容器", str(ctx.exception))
+        self.assertNotIn("task", captured)          # 未走到 create_task
+
+    def test_add_skips_validation_without_mounts(self):
+        """查不到容器挂载 → 跳过校验、原样传递（群晖套件/自建容器）。"""
+        captured = {}
+        tc = self._tc(captured)
+        with mock.patch("xunlei_docker.container_mounts",
+                        return_value=None):
+            tid = tc.add("magnet:?xt=urn:btih:aa",
+                         directory="/vol1/1000/movie")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "/vol1/1000/movie")
+
+    def test_add_fallback_name_keeps_engine_resolved_name(self):
+        """P2SP 同款（0.1.45.9）：兜底显示名不覆盖引擎解析真名。"""
+        captured = {}
+        tc = ThunderCloud(_client(lambda r: httpx.Response(200, json={})),
+                          {"target": "remote-1"})
+        tc._require_token = lambda: None
+        tc._target_of = lambda: "dev-space"
+        tc.core.parse_resource = \
+            lambda url: ParsedResource(name="嫁金钗[全30集]")
+        tc.core.create_task = (
+            lambda url, resource, space, **kw:
+            captured.update(name=resource.name) or "t-1")
+        tid = tc.add("magnet:?xt=urn:btih:aa", name="magnet:aa…")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("name"), "嫁金钗[全30集]")
+
 
 class TestThunderCloudSign(unittest.TestCase):
     def test_captcha_sign_chain(self):

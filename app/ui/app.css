@@ -277,6 +277,8 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: .7; }
 /* 操作列：收缩到按钮内容宽，窄屏下按钮换行不换字（"暂停"竖排问题） */
 .task-table td:last-child { white-space: nowrap; width: 1%; }
 .col-progress { width: 230px; }
+/* 速度列：禁止「6.5 MB/s」折行错位，收缩到内容宽 */
+.col-speed { white-space: nowrap; width: 1%; }
 .empty { text-align: center; color: var(--muted); padding: 36px 0 !important; }
 
 .task-name { font-weight: 500; word-break: break-all; }
