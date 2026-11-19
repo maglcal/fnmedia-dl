@@ -198,7 +198,7 @@ async function enrichName(li, el) {
   nameEl.textContent = fallback + " · 名称解析中…";
   try {
     const tr = (li.meta && li.meta.trackers || []).join(",");
-    const qs = `infohash=${encodeURIComponent(li.meta.infohash)}` +
+    const qs = `infohash=${encodeURIComponent(li.meta.infohash)}&wait=30` +
       (tr ? `&tr=${encodeURIComponent(tr)}` : "");
     const r = await fetch(API._rel(`api/magnet/name?${qs}`));
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -320,7 +320,8 @@ function renderTasks(tasks, backendErrors) {
             ${t.state === "paused" ? "继续" : "暂停"}
           </button>` : ""}
         <button class="btn danger" data-act="delete"
-                data-backend="${esc(t.backend)}" data-id="${esc(t.id)}">删除</button>
+                data-backend="${esc(t.backend)}" data-id="${esc(t.id)}"
+                data-name="${esc(t.name)}">删除</button>
       </td>
     `;
     body.appendChild(tr);
@@ -330,11 +331,15 @@ function renderTasks(tasks, backendErrors) {
                      retry: "已按原链接重新派发" };
   body.querySelectorAll("button[data-act]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const { act, backend, id } = btn.dataset;
+      const { act, backend, id, name } = btn.dataset;
+      if (act === "delete") {          // 删除走确认弹窗（二选一），不直接发请求
+        openDeleteDialog(backend, id, name);
+        return;
+      }
       try {
         const url = `/api/tasks/${encodeURIComponent(backend)}/${encodeURIComponent(id)}` +
-                    (act === "delete" ? "" : `/${act}`);
-        const r = await API.send(url, act === "delete" ? "DELETE" : "POST");
+                    `/${act}`;
+        const r = await API.send(url, "POST");
         // 重试可能自动换了通道（原通道配额已满），优先展示后端提示
         toast(act === "retry" && r && r.message ? r.message : (ACT_TEXT[act] || "已完成"));
         loadTasks();
@@ -344,6 +349,73 @@ function renderTasks(tasks, backendErrors) {
     });
   });
 }
+
+/* ---------------- 删除任务确认（弹窗二选一） ----------------
+   语义与迅雷面板删除弹窗一致：默认「仅删除任务」保留已下载文件，
+   「删除任务并删除文件」才走引擎 phase:"delete" 连文件删除；
+   aria2 等不支持连文件删除的通道只显示单选项并注明文件保留。 */
+let delTarget = null;
+const delCaps = {};   // backend -> can_delete_files（按需查询缓存）
+
+async function openDeleteDialog(backend, id, name) {
+  delTarget = { backend, id, name };
+  const box = $("#delConfirm");
+  if (!box) return;
+  const text = $("#delText");
+  const btnFiles = $("#delTaskFiles");
+  let can = false;
+  try {
+    if (!(backend in delCaps)) {
+      const data = await API.get("/api/backends");
+      for (const [k, st] of Object.entries(data)) delCaps[k] = !!st.can_delete_files;
+    }
+    can = !!delCaps[backend];
+  } catch (e) {
+    can = false;   // 能力查不到时按不支持处理，宁少勿多
+  }
+  if (text) {
+    text.innerHTML = can
+      ? `任务「${esc(name || id)}」将从任务列表移除。<br>` +
+        `<b>仅删除任务</b>：已下载的文件保留在磁盘上。<br>` +
+        `<b>删除任务并删除文件</b>：已下载的数据一并删除，<b>不可恢复</b>。`
+      : `任务「${esc(name || id)}」将从任务列表移除。` +
+        `该通道仅删除任务记录，已下载的文件保留。`;
+  }
+  if (btnFiles) btnFiles.hidden = !can;
+  box.hidden = false;
+}
+
+function closeDeleteDialog() {
+  const box = $("#delConfirm");
+  if (box) box.hidden = true;
+  delTarget = null;
+}
+
+async function doDelete(deleteFiles) {
+  if (!delTarget) return;
+  const { backend, id } = delTarget;
+  closeDeleteDialog();
+  try {
+    const q = deleteFiles ? "?delete_files=true" : "";
+    const r = await API.send(
+      `/api/tasks/${encodeURIComponent(backend)}/${encodeURIComponent(id)}${q}`,
+      "DELETE");
+    toast((r && r.message) ? r.message
+      : (deleteFiles && r && r.files_deleted) ? "已删除任务与已下载文件"
+      : "已删除任务（文件保留）");
+    loadTasks();
+  } catch (e) {
+    toast("操作失败：" + e.message);
+  }
+}
+
+on("#delClose", "click", closeDeleteDialog);
+on("#delCancel", "click", closeDeleteDialog);
+on("#delTaskOnly", "click", () => doDelete(false));
+on("#delTaskFiles", "click", () => doDelete(true));
+on("#delConfirm", "click", (e) => {
+  if (e.target && e.target.id === "delConfirm") closeDeleteDialog();
+});
 
 on("#btnRefresh", "click", loadTasks);
 

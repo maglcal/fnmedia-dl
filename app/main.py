@@ -212,6 +212,8 @@ def _save_update_check_state(state: dict) -> None:
 # ------------------------------------------- 更新内容（CHANGELOG.md，0.1.39.2）
 # 随包 CHANGELOG.md 与 VERSION 同放仓库根部；按 "## <版本>" 标题分段。
 # 供 About 页「无更新也显示当前版本更新内容」与更新弹窗复用。
+# 0.1.45.2：版本段正文尾部随附「最近更新」常驻概括块（## 最近更新，置于
+# 版本段之前）——更新信息规范要求所有更新内容展示尾附该段。
 
 def _changelog_path() -> Path:
     here = Path(__file__).resolve()
@@ -222,12 +224,38 @@ def _changelog_path() -> Path:
     return here.parents[2] / "CHANGELOG.md"
 
 
+def _recent_block(text: str) -> str:
+    """常驻「最近更新」概括块正文（## 最近更新 起，到下一个 ## 标题止）。
+
+    缺失返回空串（旧版 CHANGELOG 兼容）；版本分段解析不受它影响
+    （标题不含版本号，正则不命中，且必须置于首个版本段之前）。"""
+    out: list[str] = []
+    grab = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            grab = line[3:].strip() == "最近更新"
+            continue
+        if grab:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
 def _changelog_section(version: str) -> dict:
-    """提取指定版本的更新日志段落；找不到该版本则取最新一段（found=False）。"""
+    """提取指定版本的更新日志段落；找不到该版本则取最新一段（found=False）。
+
+    正文尾部随附「最近更新」概括（**最近更新** 加粗行 + 条目），
+    保证所有更新内容展示都带该段（2026-11-19 更新信息规范）。"""
     try:
         text = _changelog_path().read_text(encoding="utf-8")
     except OSError:
         return {"version": version, "text": "", "found": False}
+    recent = _recent_block(text)
+
+    def _tail(body: str) -> str:
+        if not recent:
+            return body
+        return (body + "\n\n**最近更新**\n" + recent).strip()
+
     sections: list = []          # [(ver, body)]
     cur_ver: str | None = None
     cur_lines: list = []
@@ -242,12 +270,12 @@ def _changelog_section(version: str) -> dict:
     if cur_ver is not None:
         sections.append((cur_ver, "\n".join(cur_lines).strip()))
     if not sections:
-        return {"version": version, "text": "", "found": False}
+        return {"version": version, "text": _tail(""), "found": False}
     for ver, body in sections:
         if ver == version:
-            return {"version": ver, "text": body, "found": True}
+            return {"version": ver, "text": _tail(body), "found": True}
     ver, body = sections[0]
-    return {"version": ver, "text": body, "found": False}
+    return {"version": ver, "text": _tail(body), "found": False}
 
 
 @app.get("/api/update/changelog")
@@ -415,7 +443,10 @@ def backends_status():
     disabled = set(mgr.cfg.get("disabled_backends") or [])
     out = {}
     for key, impl in mgr.backends().items():
-        out[key] = {"label": impl.label, "disabled": key in disabled, **impl.status()}
+        out[key] = {"label": impl.label, "disabled": key in disabled,
+                    "can_delete_files": bool(getattr(impl, "can_delete_files",
+                                                    False)),
+                    **impl.status()}
     if "thunder_engine" in out:
         # 今日配额用量（非会员每日创建次数有限），UI 引擎卡展示
         out["thunder_engine"]["quota"] = mgr.quota.snapshot()
@@ -886,8 +917,22 @@ def retry_task(backend: str, task_id: str):
 
 
 @app.delete("/api/tasks/{backend}/{task_id}")
-def delete_task(backend: str, task_id: str):
-    return _control("delete", backend, task_id)
+def delete_task(backend: str, task_id: str, delete_files: bool = False):
+    """删除任务。delete_files=true 时连已下载文件一起删（迅雷通道走引擎
+    「同时删除本地文件」同款 phase:"delete"）；通道不支持连文件删除时
+    回执 files_deleted=false 并注明文件保留，绝不谎报已删。"""
+    mgr = _manager()
+    try:
+        mgr.control("delete", backend, task_id, delete_files=delete_files)
+    except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误
+        raise HTTPException(502, str(exc))
+    impl = mgr.backends().get(backend)
+    can = bool(impl and getattr(impl, "can_delete_files", False))
+    files_deleted = bool(delete_files and can)
+    out = {"ok": True, "files_deleted": files_deleted}
+    if delete_files and not can:
+        out["message"] = "该通道不支持连文件删除，已仅删除任务记录，已下载文件保留"
+    return out
 
 
 def _control(action: str, backend: str, task_id: str):
@@ -995,6 +1040,18 @@ def _queue_worker_start():
             except Exception as exc:  # noqa: BLE001 - 后台线程绝不因异常退出
                 print(f"[fnmedia-dl] 队列定时派发异常：{exc}", file=sys.stderr)
     threading.Thread(target=_loop, daemon=True, name="queue-ticker").start()
+
+
+@app.on_event("startup")
+def _magnet_name_backfill():
+    """既往裸磁力任务真名回填（0.1.45.3）：启动后台解析真名回写任务记录，
+    升级重启后旧任务列表名也随真名。fire-and-forget，失败不影响主流程。"""
+    def _run():
+        try:
+            _manager().bootstrap_magnet_names()
+        except Exception as exc:  # noqa: BLE001 - 后台线程绝不因异常退出
+            print(f"[fnmedia-dl] 任务真名回填异常：{exc}", file=sys.stderr)
+    threading.Thread(target=_run, daemon=True, name="magnet-name-backfill").start()
 
 
 @app.exception_handler(Exception)

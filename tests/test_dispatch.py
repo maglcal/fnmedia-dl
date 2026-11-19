@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
 
 import downloader                              # noqa: E402
 import links                                    # noqa: E402
+import magnetmeta                               # noqa: E402
 from backends.base import Backend, BackendError, ParsedResource, TaskView  # noqa: E402
 
 
@@ -28,6 +29,7 @@ class FakeBackend(Backend):
         self.paused = []
         self.resumed = []
         self.deleted = []
+        self.deleted_with_files = []
 
     def status(self):
         return {"configured": True, "reachable": self._reachable,
@@ -47,7 +49,9 @@ class FakeBackend(Backend):
 
     def pause(self, tid): self.paused.append(tid)
     def resume(self, tid): self.resumed.append(tid)
-    def delete(self, tid): self.deleted.append(tid)
+    def delete(self, tid, *, with_files=False):
+        self.deleted.append(tid)
+        self.deleted_with_files.append(with_files)
 
 
 class DispatchTestBase(unittest.TestCase):
@@ -454,6 +458,70 @@ class TestDispatchBudget(DispatchTestBase):
                           directory="电影/2025")
         self.assertEqual([d for _, _, d in good.added],
                          ["电影/2025", "电影/2025"])
+
+
+class TestMagnetTrueName(DispatchTestBase):
+    """裸磁力任务真名回填（0.1.45.3）：解析成功回写任务记录名。"""
+
+    IH = "80ae772175e56bcbf9e9a4e1689fa023aae68f9e"
+
+    def _bare_link(self):
+        return links.LinkInfo(
+            kind="magnet", url=f"magnet:?xt=urn:btih:{self.IH}",
+            display=f"magnet:{self.IH[:8]}…",
+            meta={"infohash": self.IH, "dn": ""})
+
+    def test_rename_record_only_when_fallback_matches(self):
+        mgr = self.manager({})
+        mgr._record("aria2", "t1", f"magnet:?xt=urn:btih:{self.IH}",
+                    f"magnet:{self.IH[:8]}…", "")
+        self.assertFalse(mgr._rename_record("aria2", "t1", "别的名", "真名"))
+        self.assertTrue(mgr._rename_record("aria2", "t1",
+                                           f"magnet:{self.IH[:8]}…", "真名"))
+        self.assertEqual(mgr._load_records()[0]["name"], "真名")
+
+    def test_resolve_and_rename_writes_true_name(self):
+        mgr = self.manager({})
+        mgr._record("thunder_engine", "t2", f"magnet:?xt=urn:btih:{self.IH}",
+                    f"magnet:{self.IH[:8]}…", "")
+        orig = magnetmeta.resolve_name
+        magnetmeta.resolve_name = \
+            lambda ih, timeout=0, trackers=None: "嫁金钗[全30集]"
+        try:
+            mgr._resolve_and_rename(self._bare_link(), "thunder_engine", "t2",
+                                    f"magnet:{self.IH[:8]}…", attempts=1)
+        finally:
+            magnetmeta.resolve_name = orig
+        self.assertEqual(mgr._load_records()[0]["name"], "嫁金钗[全30集]")
+
+    def test_resolve_failure_keeps_fallback(self):
+        mgr = self.manager({})
+        mgr._record("aria2", "t3", f"magnet:?xt=urn:btih:{self.IH}",
+                    f"magnet:{self.IH[:8]}…", "")
+        orig = magnetmeta.resolve_name
+        magnetmeta.resolve_name = lambda ih, timeout=0, trackers=None: None
+        try:
+            mgr._resolve_and_rename(self._bare_link(), "aria2", "t3",
+                                    f"magnet:{self.IH[:8]}…", attempts=1)
+        finally:
+            magnetmeta.resolve_name = orig
+        self.assertEqual(mgr._load_records()[0]["name"], f"magnet:{self.IH[:8]}…")
+
+    def test_backfill_candidates_only_fallback_magnets(self):
+        recs = [
+            {"backend": "aria2", "id": "1",
+             "url": f"magnet:?xt=urn:btih:{self.IH}",
+             "name": f"magnet:{self.IH[:8]}…"},
+            {"backend": "aria2", "id": "2",
+             "url": f"magnet:?xt=urn:btih:{self.IH}", "name": "已有真名"},
+            {"backend": "aria2", "id": "3", "url": "https://x/a.bin",
+             "name": "a.bin"},
+            {"backend": "aria2", "id": "4",
+             "url": f"magnet:?xt=urn:btih:{self.IH}",
+             "name": f"magnet:?xt=urn:btih:{self.IH}"[:80]},
+        ]
+        out = downloader.DownloadManager._backfill_candidates(recs)
+        self.assertEqual([c[1] for c in out], ["1", "4"])
 
 
 if __name__ == "__main__":

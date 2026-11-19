@@ -29,6 +29,7 @@ SCOPE_HINT = ("（本通道仅支持 Docker/群晖套件版迅雷面板；应用
 class ThunderEngine(Backend):
     name = "thunder_engine"
     label = "迅雷下载引擎（本地直连）"
+    can_delete_files = True    # drive/v1 phase:"delete" 删任务+本地文件
 
     def __init__(self, client: httpx.Client, conf: dict):
         self.client = client
@@ -125,6 +126,11 @@ class ThunderEngine(Backend):
         self._login()
         self.core.set_phase(self._space_of(), "user#download-url", task_id, "running")
 
-    def delete(self, task_id: str) -> None:
+    def delete(self, task_id: str, *, with_files: bool = False) -> None:
         self._login()
-        self.core.delete_task(self._space_of(), task_id)
+        if with_files:
+            # 面板「同时删除本地文件」同款：PATCH phase:"delete" 连文件一起删
+            self.core.set_phase(self._space_of(), "user#download-url",
+                                task_id, "delete")
+        else:
+            self.core.delete_task(self._space_of(), task_id)

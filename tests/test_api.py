@@ -205,6 +205,38 @@ class TestAPI(unittest.TestCase):
         r = self.client.delete("/api/tasks/aria2/g1")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(good.deleted, ["g1"])
+        self.assertEqual(good.deleted_with_files, [False])
+
+    def test_delete_files_semantics(self):
+        """删除二选一回执钉（0.1.45.5）：delete_files=true 但通道无该能力
+        （FakeBackend/can_delete_files=False）→ files_deleted=false + 注明
+        文件保留，绝不谎报已删；有能力的通道 → files_deleted=true。"""
+        good = FakeBackend("aria2", "aria2")
+        self._patch_backends({"aria2": good})
+        r = self.client.delete("/api/tasks/aria2/g1?delete_files=true")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["ok"])
+        self.assertFalse(body["files_deleted"])
+        self.assertIn("文件保留", body["message"])
+        self.assertEqual(good.deleted_with_files, [True])
+
+        class FilesCapBackend(FakeBackend):
+            can_delete_files = True
+
+        cap = FilesCapBackend("thunder_engine", "e")
+        self._patch_backends({"thunder_engine": cap})
+        r = self.client.delete("/api/tasks/thunder_engine/t1?delete_files=true")
+        body = r.json()
+        self.assertTrue(body["files_deleted"])
+        self.assertNotIn("message", body)
+        self.assertEqual(cap.deleted_with_files, [True])
+
+    def test_backends_exposes_can_delete_files(self):
+        self._patch_backends({"aria2": FakeBackend("aria2", "aria2")})
+        r = self.client.get("/api/backends")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["aria2"]["can_delete_files"])
 
     def test_control_unknown_backend(self):
         self._patch_backends({})
@@ -740,6 +772,29 @@ class TestUpdateStatusChangelog(unittest.TestCase):
         sec = main._changelog_section(main.VERSION)
         self.assertTrue(sec["found"])
         self.assertEqual(sec["version"], main.VERSION)
+
+    def test_changelog_appends_recent_block(self):
+        """「最近更新」概括块尾随每个版本的更新内容（2026-11-19 更新信息规范）。
+
+        锚点取结构而非具体文案（版本滚动不破钉）：本版正文非空且在
+        概括块之前，概括块尾部内容与常驻块逐字一致。"""
+        body = self.client.get("/api/update/changelog").json()
+        self.assertIn("**最近更新**", body["text"])
+        self.assertNotIn("##", body["text"])
+        # 尾附语义：概括块在本版正文之后
+        head, sep, tail = body["text"].rpartition("**最近更新**")
+        self.assertEqual(sep, "**最近更新**")
+        self.assertTrue(head.strip())           # 本版正文在前
+        recent = main._recent_block(
+            main._changelog_path().read_text(encoding="utf-8"))
+        self.assertTrue(recent)                 # 常驻块在场
+        self.assertEqual(tail.strip(), recent.strip())
+
+    def test_recent_block_extract(self):
+        """常驻块提取：取 ## 最近更新 到下一标题之间；缺失返回空。"""
+        text = "## 最近更新\n\n- 甲\n- 乙\n\n## 0.1.0\n\n- 丙\n"
+        self.assertEqual(main._recent_block(text), "- 甲\n- 乙")
+        self.assertEqual(main._recent_block("## 0.1.0\n- 丙\n"), "")
 
 
 class TestCompliancePins(unittest.TestCase):

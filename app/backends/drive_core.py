@@ -776,8 +776,10 @@ class DriveCore:
         return None
 
     def set_phase(self, space: str, task_type: str, task_id: str, phase: str) -> None:
-        """phase: "pause" | "running"。
+        """phase: "pause" | "running" | "delete"。
 
+        "delete" = 引擎面板「同时删除本地文件」同款（实测面板 handelPatchTaskList
+        确认路径）：任务连同已下载文件一起删；纯删任务记录走 delete_task。
         先查任务真实 space/type 再 PATCH；
         查不到（引擎已清理等）时回退调用方给的值。"""
         task = self.find_task(task_id, space) or {}
@@ -795,24 +797,41 @@ class DriveCore:
 
 
 def task_to_view(backend: str, t: dict):
-    """drive/v1 任务对象 → 统一任务视图。"""
+    """drive/v1 任务对象 → 统一任务视图。
+
+    字段口径（2026-11-19 引擎真实对象实测钉死）：已下载字节在
+    params.checked_size（字符串字节数）、速度在 params.speed（字符串 B/s）；
+    顶层没有 status_size——早期代码误读该字段导致进度恒 0.0%、速度恒「-」。
+    progress 兜底链：字节数自算 → 引擎顶层 progress（0-100 整数）→ 0。"""
     from .base import TaskView
     phase = t.get("phase") or ""
     state = _phase_state(phase)
+    _params = t.get("params") if isinstance(t.get("params"), dict) else {}
     size = scalar_int(t.get("file_size"), 0) or None
-    done = scalar_int(t.get("status_size"), 0)
+    dl = scalar_int(_params.get("download_size"), 0)
+    done = (scalar_int(_params.get("checked_size"), 0)
+            or scalar_int(t.get("status_size"), 0))
+    speed = (scalar_int(_params.get("speed"), 0)
+             or scalar_int(t.get("speed"), 0) or None)
     progress = t.get("progress")
-    if size:
-        # 字节数口径最可靠，优先自算（progress 语义多口径，
-        # 0-1 比率与 0-100 百分比无法无歧义区分，仅作兜底）
+    # 进度口径与面板逐字一致（panel progress()）：全量下载
+    # （download_size===file_size）按字节自算最精确；否则用引擎 progress
+    # （0-100）——部分选中时字节比率失真，面板日常显示的也是引擎 progress。
+    if dl and size and dl == size and done:
         pct = done * 100.0 / size
-    elif isinstance(progress, (int, float)):
-        pct = float(progress)
+    elif isinstance(progress, (int, float)) or (
+            isinstance(progress, str) and progress.strip()):
+        try:
+            pct = float(progress)
+        except (TypeError, ValueError):
+            pct = 0.0
         pct = pct if pct <= 100 else pct / 100.0  # 兼容千分比等异常值按 100 封顶
+    elif size and done:
+        # 引擎 progress 缺失时字节兜底，避免恒 0（历史 bug 根源）
+        pct = done * 100.0 / size
     else:
         pct = 0.0
-    _params = t.get("params")
-    _url = (_params.get("url", "") if isinstance(_params, dict) else "")
+    _url = _params.get("url", "")
     name = t.get("name") or t.get("file_name") or _url[:80]
     return TaskView(
         backend=backend,
@@ -820,7 +839,7 @@ def task_to_view(backend: str, t: dict):
         name=name,
         state=state,
         progress=max(0.0, min(100.0, pct)),
-        speed=None,
+        speed=speed,
         size=size,
         url=_url,
         message=t.get("message") or "",

@@ -89,7 +89,7 @@ class StubBackend(Backend):
     def resume(self, task_id):
         raise NotImplementedError
 
-    def delete(self, task_id):
+    def delete(self, task_id, *, with_files=False):
         raise NotImplementedError
 
 

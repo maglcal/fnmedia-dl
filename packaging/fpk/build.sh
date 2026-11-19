@@ -100,8 +100,9 @@ fi
 # manifest version 用完整版本号（支持四段分支号；fnOS 宽松接受，安装校验若拒则回退 0.1.36-1 形式）
 MANIFEST_VER="${VERSION}"
 # manifest 生成：@VERSION@/@TAG@/@CHANGELOG@ 一次性替换（Python 处理多字节与转义）。
-# changelog 从随包 CHANGELOG.md 提取当前版本段落单行化（≤280 字符），
-# 提取不到回退 releases 链接——内嵌真实修改项，不再只放一个链接。
+# changelog 从随包 CHANGELOG.md 提取当前版本段落单行化（≤400 字符，
+# 尾部恒带「最近更新」概括——截断只砍正文不砍尾），提取不到回退 releases
+# 链接——内嵌真实修改项，不再只放一个链接。
 PYBIN="${PYTHON:-python3}"; command -v "${PYBIN}" >/dev/null 2>&1 || PYBIN=python
 "${PYBIN}" - "${FPK_DIR}/manifest.in" "${STAGE}/manifest" \
     "${MANIFEST_VER}" "${RELEASE_TAG}" "${REPO_ROOT}/CHANGELOG.md" <<'PYMANIFEST'
@@ -139,8 +140,31 @@ if not body and sections:
 one = body.lstrip("- ").replace("\n- ", "；").replace("\n", " ")
 one = re.sub(r"\*\*", "", one)
 one = re.sub(r"\s+", " ", one).strip()
-if len(one) > 280:
-    one = one[:280] + "…"
+# 常驻「最近更新」概括块（## 最近更新，置于版本段之前）压缩成单行尾附
+# （更新信息规范：更新内容展示尾部必带该段）；版本分段解析天然忽略它
+recent_lines, grab = [], False
+for line in text.splitlines():
+    if line.startswith("## "):
+        grab = line[3:].strip() == "最近更新"
+        continue
+    if grab and line.strip():
+        recent_lines.append(line.strip())
+recent = "；".join(x.lstrip("- ").strip() for x in recent_lines)
+recent = re.sub(r"\*\*", "", recent)
+recent = re.sub(r"\s+", " ", recent).strip()
+if recent:
+    tail = "最近更新：" + recent
+    if len(tail) > 150:
+        tail = tail[:150] + "…"
+    if one:
+        budget = 400 - len(tail) - 1        # 截断砍正文、保尾部「最近更新」
+        if len(one) > budget:
+            one = one[:max(0, budget)] + "…"
+        one = one + "；" + tail
+    else:
+        one = tail
+elif len(one) > 400:
+    one = one[:400] + "…"
 if not one:
     one = "更新内容详见 https://github.com/maglcal/fnmedia-dl/releases/tag/" + tag
 tpl = Path(src).read_text(encoding="utf-8")

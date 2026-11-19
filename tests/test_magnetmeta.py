@@ -7,6 +7,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -167,6 +168,85 @@ class TestTrackerAnnounce(unittest.TestCase):
         self.assertEqual(magnetmeta._parse_announce(b"not-bencode"), [])
 
 
+class TestUdpTracker(unittest.TestCase):
+    def test_connect_request_layout(self):
+        raw = magnetmeta._udp_connect_request(0x01020304)
+        magic, action, tx = struct.unpack(">QII", raw)
+        self.assertEqual(magic, 0x41727101980)
+        self.assertEqual(action, 0)
+        self.assertEqual(tx, 0x01020304)
+
+    def test_parse_connect(self):
+        data = struct.pack(">IIQ", 0, 7, 0xCAFEBABE12345678)
+        self.assertEqual(magnetmeta._udp_parse_connect(data, 7),
+                         0xCAFEBABE12345678)
+        self.assertIsNone(magnetmeta._udp_parse_connect(data, 8))     # tx 不符
+        self.assertIsNone(magnetmeta._udp_parse_connect(data[:8], 7))  # 短包
+        err = struct.pack(">IIQ", 3, 7, 0)                            # action=3
+        self.assertIsNone(magnetmeta._udp_parse_connect(err, 7))
+
+    def test_announce_request_layout(self):
+        ih = bytes(range(20))
+        raw = magnetmeta._udp_announce_request(0x1122334455667788, 9, ih,
+                                               0x55667788)
+        self.assertEqual(len(raw), 98)
+        conn, action, tx = struct.unpack(">QII", raw[:16])
+        self.assertEqual((conn, action, tx), (0x1122334455667788, 1, 9))
+        self.assertEqual(raw[16:36], ih)
+        self.assertEqual(raw[36:56], magnetmeta._PEER_ID)
+        down, left, up = struct.unpack(">QQQ", raw[56:80])
+        self.assertEqual((down, left, up), (0, 1, 0))
+        event, ip, key, numwant, port = struct.unpack(">IIIiH", raw[80:98])
+        self.assertEqual((event, ip), (2, 0))
+        self.assertEqual(key, 0x55667788)
+        self.assertEqual((numwant, port), (50, 6881))
+
+    def test_parse_announce(self):
+        head = struct.pack(">IIIII", 1, 5, 1800, 3, 7)  # action/tx/interval/leech/seed
+        body = (head + bytes([1, 2, 3, 4, 0x1A, 0xE1])
+                + bytes([5, 6, 7, 8, 0x1A, 0xE2]))
+        self.assertEqual(magnetmeta._udp_parse_announce(body, 5),
+                         [("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+        self.assertEqual(magnetmeta._udp_parse_announce(body, 6), [])  # tx 不符
+        self.assertEqual(magnetmeta._udp_parse_announce(head[:10], 5), [])  # 短包
+        err = struct.pack(">IIIII", 3, 5, 0, 0, 0)                     # action=3
+        self.assertEqual(magnetmeta._udp_parse_announce(err, 5), [])
+
+
+class TestTrackerLookup(unittest.TestCase):
+    def test_routes_and_merges(self):
+        seen = {"udp": [], "http": []}
+
+        def fake_udp(url, infohash, deadline):
+            seen["udp"].append(url)
+            return [("9.9.9.9", 1)]
+
+        def fake_http(url, infohash, deadline, opener):
+            seen["http"].append(url)
+            return [("9.9.9.9", 1), ("8.8.8.8", 2)]
+
+        saved = (magnetmeta._udp_announce, magnetmeta._http_announce,
+                 magnetmeta._TRACKERS)
+        magnetmeta._udp_announce = fake_udp
+        magnetmeta._http_announce = fake_http
+        magnetmeta._TRACKERS = ("http://builtin.example/a",
+                                "udp://b.example:9/a")
+        try:
+            out = magnetmeta._tracker_lookup(
+                b"\x00" * 20, time.monotonic() + 5,
+                ["udp://t.example:80/a", "http://h.example/a",
+                 "udp://t.example:80/a",          # 重复去重
+                 "ws://bad.example/a"])           # 非 udp/http(S) 丢弃
+        finally:
+            (magnetmeta._udp_announce, magnetmeta._http_announce,
+             magnetmeta._TRACKERS) = saved
+        self.assertEqual(seen["udp"], ["udp://t.example:80/a",
+                                       "udp://b.example:9/a"])
+        self.assertEqual(seen["http"], ["http://h.example/a",
+                                        "http://builtin.example/a"])
+        self.assertEqual(set(out), {("9.9.9.9", 1), ("8.8.8.8", 2)})
+
+
 class TestResolve(unittest.TestCase):
     def tearDown(self):
         magnetmeta._CACHE.clear()
@@ -206,6 +286,28 @@ class TestResolve(unittest.TestCase):
             self.assertIsNone(magnetmeta.resolve_name("0" * 40, timeout=3))
         finally:
             magnetmeta._dht_lookup, magnetmeta._tracker_lookup = saved
+
+    def test_resolve_tracker_not_starved_by_dht(self):
+        """DHT 拖满窗口也不能吃掉 tracker 通道（并行回归钉）。"""
+        meta, ih = _make_metadata(b"tracker-win")
+
+        def slow_dht(infohash, deadline):
+            time.sleep(0.5)                       # 模拟 DHT 迟迟无果
+            return []
+
+        saved = (magnetmeta._dht_lookup, magnetmeta._tracker_lookup,
+                 magnetmeta._fetch_metadata_from_peer)
+        magnetmeta._dht_lookup = slow_dht
+        magnetmeta._tracker_lookup = \
+            lambda infohash, deadline, trackers=None: [("2.2.2.2", 6881)]
+        magnetmeta._fetch_metadata_from_peer = \
+            lambda ip, port, infohash, deadline: meta
+        try:
+            self.assertEqual(magnetmeta.resolve_name(ih.hex(), timeout=5),
+                             "tracker-win")
+        finally:
+            (magnetmeta._dht_lookup, magnetmeta._tracker_lookup,
+             magnetmeta._fetch_metadata_from_peer) = saved
 
     def test_single_flight(self):
         meta, ih = _make_metadata(b"once")

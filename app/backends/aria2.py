@@ -132,7 +132,9 @@ class Aria2(Backend):
     def resume(self, task_id: str) -> None:
         self._rpc("aria2.unpause", [task_id])
 
-    def delete(self, task_id: str) -> None:
+    def delete(self, task_id: str, *, with_files: bool = False) -> None:
+        # aria2.remove 只移除任务、不碰已下载文件（aria2 无「连文件删除」
+        # 语义），with_files 在本通道仅删任务记录、文件保留。
         try:
             self._rpc("aria2.remove", [task_id])
         except BackendError:

@@ -110,6 +110,94 @@ class DownloadManager:
                       if not (r.get("backend") == backend
                               and str(r.get("id")) == str(task_id))]
 
+    # ------------------------------------------------- 真名回填（0.1.45.3）
+    # 裸磁力任务名在派发瞬间可能只有兜底显示（解析未完成/瞬时失败）——
+    # 解析出真名后回写任务记录，任务列表名随真名走。
+
+    def _rename_record(self, backend: str, task_id: str,
+                       fallback: str, new_name: str) -> bool:
+        """真名回写：仅当记录名仍是派发时的兜底名才替换（防覆盖并发改名）。"""
+        hit: list[bool] = []
+
+        def mutator(records: list[dict]) -> None:
+            for r in records:
+                if (r.get("backend") == backend
+                        and str(r.get("id")) == str(task_id)
+                        and r.get("name") == fallback and new_name):
+                    r["name"] = new_name
+                    hit.append(True)
+
+        self._mutate_records(mutator)
+        return bool(hit)
+
+    def _resolve_and_rename(self, link, backend: str, task_id: str,
+                            fallback: str, attempts: int = 2) -> None:
+        """后台解析裸磁力真名并回写任务名；失败静默保留兜底名。
+
+        attempts>1 失败隔 20s 再试一次（弱网瞬断自愈）；同哈希并发由
+        magnetmeta 单飞合并，多任务不会重复打网络。"""
+        meta = getattr(link, "meta", None) or {}
+        infohash = str(meta.get("infohash") or "")
+        if not infohash:
+            return
+        name = None
+        for i in range(max(1, attempts)):
+            if i:
+                time.sleep(20)
+            try:
+                name = magnetmeta.resolve_name(infohash, timeout=30.0)
+            except Exception:
+                name = None
+            if name:
+                break
+        if name and name != fallback:
+            self._rename_record(backend, task_id, fallback, name)
+
+    def _schedule_true_name(self, link, backend: str, task_id: str,
+                            fallback: str) -> None:
+        """派发后挂后台真名回写（仅裸磁力且仍是兜底名时）。"""
+        meta = getattr(link, "meta", None) or {}
+        if getattr(link, "kind", "") != "magnet" or meta.get("dn"):
+            return
+        if not str(meta.get("infohash") or ""):
+            return
+        url = getattr(link, "url", "") or ""
+        if not (fallback.startswith("magnet:") or fallback == url[:80]):
+            return                        # 已是真名（缓存命中/自带 dn），不回填
+        threading.Thread(target=self._resolve_and_rename,
+                         args=(link, backend, task_id, fallback),
+                         daemon=True, name="magnet-rename").start()
+
+    @staticmethod
+    def _backfill_candidates(records: list[dict],
+                             limit: int = 50) -> list[tuple]:
+        """启动回填候选：磁力记录里任务名仍是兜底显示的（只动兜底名）。"""
+        out: list[tuple] = []
+        for r in records:
+            if len(out) >= limit:
+                break
+            url = str(r.get("url") or "")
+            name = str(r.get("name") or "")
+            if not url.lower().startswith("magnet:"):
+                continue
+            if not (name.startswith("magnet:") or name == url[:80]):
+                continue
+            out.append((str(r.get("backend")), str(r.get("id")), name, url))
+        return out
+
+    def bootstrap_magnet_names(self, limit: int = 50) -> int:
+        """启动回填：既往裸磁力任务名仍是兜底显示的，后台解析真名回写
+        （升级重启后旧任务也享受真名显示；用户/上游改过的名字不碰）。"""
+        todo = self._backfill_candidates(self._load_records(), limit)
+        for backend, task_id, fallback, url in todo:
+            found = linksmod.parse_text(url)
+            if not found:
+                continue
+            threading.Thread(target=self._resolve_and_rename,
+                             args=(found[0], backend, task_id, fallback),
+                             daemon=True, name="magnet-rename").start()
+        return len(todo)
+
     # ------------------------------------------------------------ 派发
 
     def dispatch(self, link, *, backend: str = "auto",
@@ -156,6 +244,9 @@ class DownloadManager:
                 if name_key == "thunder_engine":
                     self.quota.note_engine_create()
                 self._record(name_key, task_id, url, name, directory or "")
+                # 真名晚到：后台解析回写任务名（解析未完成/瞬时失败时兜底名
+                # 只是过渡，真名出来自动替换；不拖慢派发）
+                self._schedule_true_name(link, name_key, str(task_id), name)
                 result = {"ok": True, "url": url, "backend": name_key,
                           "id": task_id, "label": impl.label}
                 if prior["downloaded"]:
@@ -272,7 +363,8 @@ class DownloadManager:
 
     # ------------------------------------------------------------ 操作
 
-    def control(self, action: str, backend: str, task_id: str) -> None:
+    def control(self, action: str, backend: str, task_id: str,
+                *, delete_files: bool = False) -> None:
         pool = self.backends()
         impl = pool.get(backend)
         if not impl:
@@ -282,7 +374,7 @@ class DownloadManager:
         elif action == "resume":
             impl.resume(task_id)
         elif action == "delete":
-            impl.delete(task_id)
+            impl.delete(task_id, with_files=delete_files)
             self._mutate_records(
                 lambda records: self._filter_out(records, backend, task_id))
         else:

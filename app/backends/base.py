@@ -51,6 +51,9 @@ class Backend(ABC):
 
     name: str = ""
     label: str = ""
+    # 「删除任务并删除文件」是否真实可行（迅雷 drive/v1 走 phase:"delete"
+    # 删任务+本地文件；aria2 移除不碰文件，只能删记录）——UI 按此渲染选项。
+    can_delete_files: bool = False
 
     @abstractmethod
     def status(self) -> dict:
@@ -78,5 +81,6 @@ class Backend(ABC):
         ...
 
     @abstractmethod
-    def delete(self, task_id: str) -> None:
-        ...
+    def delete(self, task_id: str, *, with_files: bool = False) -> None:
+        """删除任务。with_files=True 时连已下载文件一起删（引擎同款
+        「同时删除本地文件」语义）；通道不支持时仅删任务记录、文件保留。"""

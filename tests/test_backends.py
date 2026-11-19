@@ -80,13 +80,25 @@ class TestAria2(unittest.TestCase):
         with self.assertRaises(BackendError):
             a2.add("https://x/a.iso")
 
+    def test_delete_with_files_is_record_only(self):
+        """aria2 通道不支持「连文件删除」：with_files=True 仍只移除任务记录
+        （aria2.remove 不碰已下载文件），能力位 can_delete_files=False。"""
+        store = {"aria2.remove": "gid001", "aria2.removeDownloadResult": None}
+        a2 = self._mk(self._rpc_handler(store))
+        self.assertFalse(a2.can_delete_files)
+        a2.delete("gid001", with_files=True)     # 不抛即通过，语义=仅删记录
+
 
 # ---------------------------------------------------------------- drive core
 
+# 真实字段形态（2026-11-19 引擎对象实测钉死）：已下载字节在 params.checked_size、
+# 速度在 params.speed（均为字符串）；顶层无 status_size——旧夹具造假字段，
+# 与线上形态脱节，进度恒 0.0% 的 bug 正是读了不存在的字段所致。
 DRIVE_TASKS = [{
     "id": "t1", "name": "demo", "phase": "PHASE_TYPE_RUNNING",
-    "file_size": "2000", "status_size": "500",
-    "params": {"url": "magnet:?xt=urn:btih:aa"},
+    "file_size": "2000",
+    "params": {"url": "magnet:?xt=urn:btih:aa",
+               "checked_size": "500", "speed": "100"},
 }]
 
 
@@ -669,7 +681,53 @@ class TestDriveCore(unittest.TestCase):
     def test_task_to_view(self):
         v = task_to_view("aria2-like", DRIVE_TASKS[0])
         self.assertEqual(v.state, "running")
-        self.assertAlmostEqual(v.progress, 25.0)
+        self.assertAlmostEqual(v.progress, 25.0)   # 字节兜底 500/2000
+        self.assertEqual(v.speed, 100)             # params.speed 映射
+
+    def test_task_to_view_togo_real_shape(self):
+        """真实 Togo 对象形态回归钉（2026-11-19 实测 dump）：
+        params.checked_size/file_size 均字符串、顶层 progress=99、params.speed="0"。
+        无 download_size 键 → 走引擎 progress（面板 progress() 同口径），
+        旧代码读不存在的 status_size 恒显 0.0%、speed 恒「-」。"""
+        t = {
+            "id": "togo", "name": "Togo.mkv",
+            "phase": "PHASE_TYPE_COMPLETE", "message": "完成",
+            "file_size": "2033652560", "progress": 99,
+            "params": {"url": "magnet:?xt=urn:btih:bb",
+                       "checked_size": "2033649487", "speed": "0"},
+        }
+        v = task_to_view("x", t)
+        self.assertEqual(v.state, "completed")
+        self.assertAlmostEqual(v.progress, 99.0)   # 引擎 progress，非字节自算
+        self.assertIsNone(v.speed)                 # speed="0" → None 显示「-」
+        self.assertEqual(v.size, 2033652560)
+
+    def test_task_to_view_full_download_byte_progress(self):
+        """全量下载（download_size===file_size）按字节自算最精确——
+        与面板 progress() 公式逐字一致。"""
+        t = {
+            "id": "t2", "name": "demo.bin",
+            "phase": "PHASE_TYPE_RUNNING",
+            "file_size": "4000", "progress": 50,
+            "params": {"url": "https://x/d", "download_size": "4000",
+                       "checked_size": "1000", "speed": "12345"},
+        }
+        v = task_to_view("x", t)
+        self.assertAlmostEqual(v.progress, 25.0)   # 字节自算 1000/4000 压过 progress=50
+        self.assertEqual(v.speed, 12345)
+
+    def test_task_to_view_engine_progress_over_byte_fallback(self):
+        """部分选中（download_size≠file_size）时字节比率失真，
+        引擎 progress 优先于字节兜底。"""
+        t = {
+            "id": "t3", "name": "part.bin",
+            "phase": "PHASE_TYPE_RUNNING",
+            "file_size": "4000", "progress": 80,
+            "params": {"url": "https://x/p", "download_size": "1000",
+                       "checked_size": "800"},
+        }
+        v = task_to_view("x", t)
+        self.assertAlmostEqual(v.progress, 80.0)
 
 
 # ---------------------------------------------------------------- thunder engine
@@ -720,6 +778,42 @@ class TestThunderEngine(unittest.TestCase):
             return httpx.Response(200, text="login page")
         eng = ThunderEngine(_client(handler), {"base_url": "http://nas:2345"})
         self.assertFalse(eng.status()["reachable"])
+
+    def test_delete_two_modes(self):
+        """删除二选一语义钉（0.1.45.5）：
+        默认 DELETE /drive/v1/tasks 只删任务记录；
+        with_files=True 走面板「同时删除本地文件」同款 PATCH phase:"delete"。"""
+        seen = []
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith("index.cgi/"):
+                return httpx.Response(200, text=PANEL_HTML)
+            seen.append((request.method, path, request))
+            if request.method == "GET":
+                # 设备空间发现要 user#runner 设备行；find_task 同口查询
+                # 不会命中 t-9（无 id 键）→ set_phase 回退调用方值
+                return httpx.Response(200, json={"tasks": [
+                    {"params": {"target": "dev-space"}}]})
+            return httpx.Response(200, json={})
+
+        eng = ThunderEngine(_client(handler), {"base_url": "http://nas:2345"})
+        self.assertTrue(eng.can_delete_files)
+        eng.delete("t-9")
+        eng.delete("t-9", with_files=True)
+        # 纯删任务记录：唯一一发 DELETE /tasks?task_ids=（空间发现 GET 在前）
+        deletes = [x for x in seen if x[0] == "DELETE"]
+        self.assertEqual(len(deletes), 1)
+        _, p0, r0 = deletes[0]
+        self.assertTrue(p0.endswith("/drive/v1/tasks"))
+        self.assertEqual(r0.url.params.get("task_ids"), "t-9")
+        # 连文件删除：find_task 查询 + PATCH /task 带 phase:"delete"
+        m2, p2, r2 = seen[-1]
+        self.assertEqual(m2, "PATCH")
+        self.assertTrue(p2.endswith("/drive/v1/task"))
+        body = json.loads(r2.content)
+        self.assertEqual(json.loads(body["set_params"]["spec"]),
+                         {"phase": "delete"})
 
     # ---- 目录映射校验（0.1.37.3）----
 

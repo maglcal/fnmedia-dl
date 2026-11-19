@@ -612,6 +612,21 @@
   </div>
 </div>
 
+<div id="delConfirm" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-modal="true" aria-label="删除任务">
+    <div class="modal-head">
+      <h3>🗑 删除任务</h3>
+      <button type="button" id="delClose" class="btn ghost">关闭</button>
+    </div>
+    <div id="delText" class="update-notes"></div>
+    <div class="actions">
+      <button type="button" id="delTaskOnly" class="btn primary">仅删除任务（保留文件）</button>
+      <button type="button" id="delTaskFiles" class="btn danger">删除任务并删除文件</button>
+      <button type="button" id="delCancel" class="btn ghost">取消</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" hidden></div>
 <script src="static/app.js?v=@VERSION@"></script>
 <script>

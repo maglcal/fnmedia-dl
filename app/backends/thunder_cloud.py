@@ -461,6 +461,7 @@ class _CloudDrive(DriveCore):
 class ThunderCloud(Backend):
     name = "thunder_cloud"
     label = "迅雷远程通道（P2SP 加速，推荐）"
+    can_delete_files = True    # drive/v1 phase:"delete" 删任务+本地文件
 
     def __init__(self, client: httpx.Client, conf: dict,
                  persist: Callable[[dict], None] | None = None):
@@ -1053,6 +1054,11 @@ class ThunderCloud(Backend):
         self._require_token()
         self.core.set_phase(self._target_of(), "user#download-url", task_id, "running")
 
-    def delete(self, task_id: str) -> None:
+    def delete(self, task_id: str, *, with_files: bool = False) -> None:
         self._require_token()
-        self.core.delete_task(self._target_of(), task_id)
+        if with_files:
+            # 面板「同时删除本地文件」同款：PATCH phase:"delete" 连文件一起删
+            self.core.set_phase(self._target_of(), "user#download-url",
+                                task_id, "delete")
+        else:
+            self.core.delete_task(self._target_of(), task_id)

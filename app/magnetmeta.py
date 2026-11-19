@@ -4,7 +4,8 @@
 magnet:?xt=urn:btih:<hash> 本身只带信息哈希，剧集/文件名存在 BT 网络的
 种子元数据里。本模块用纯标准库实现最小元数据获取链路：
 
-  1. DHT（BEP-5）get_peers 迭代查找，收集持有该种子的 peer 地址；
+  1. 找 peer：DHT（BEP-5）get_peers 迭代查找与 tracker announce（HTTP(S)
+     + BEP-15 UDP，含磁力自带 tr=）并行跑，两边 peer 合并去重；
   2. TCP 连 peer：BT 握手（BEP-3）+ 扩展协议（BEP-10）+ ut_metadata（BEP-9）
      只拉 info 字典（16KiB 分片，总量上限 10MB）；
   3. SHA1(info) == infohash 校验通过后 bdecode 取 name / name.utf-8。
@@ -22,11 +23,12 @@ import os
 import random
 import socket
 import struct
+import sys
 import threading
 import time
 import urllib.request
 from collections import deque
-from urllib.parse import quote_from_bytes
+from urllib.parse import quote_from_bytes, urlsplit
 
 from links import _BencodeError, _bdecode
 
@@ -39,7 +41,10 @@ _MSG_MAX = 2 * 1024 * 1024         # 单条 peer 消息上限
 _PEER_ID = b"-FN0100-" + os.urandom(12)
 _EXT_ID = 3                        # 本端 ut_metadata 扩展消息 id（BEP-10 私有空间）
 _NAME_MAX = 512                    # 名称长度上限（防异常元数据撑爆界面）
-_BATCH_PEERS = 4                   # 同时尝试的 peer 数
+_BATCH_PEERS = 6                   # 同时尝试的 peer 数
+_PEER_TRY = 32                     # 元数据最多试这么多 peer（死 peer 常占多数）
+_TRACKER_MAX = 12                  # 单次解析最多并发 announce 的 tracker 数
+_GATHER_SECS = 10.0                # peer 汇聚窗口上限（其余预算留给拉元数据）
 _DHT_WANT = 12                     # 凑够多少 peer 就开拉元数据
 _BOOTSTRAP = (
     ("router.bittorrent.com", 6881),
@@ -47,12 +52,19 @@ _BOOTSTRAP = (
     ("dht.transmissionbt.com", 6881),
     ("dht.libtorrent.org", 25401),
 )
-# 公共 HTTP(S) tracker 兜底（DHT 不可达时的第二 peer 来源；
+# 公共 tracker 兜底（与 DHT 并行的第二 peer 来源；udp/http 混布提高残网存活率；
 # tracker 与 DHT 同级：都只看到信息哈希，隐私面一致）
 _TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
     "http://tracker.opentrackr.org:1337/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker1.bt.moack.co.kr:80/announce",
     "http://t.acg.rip:6699/announce",
     "http://tracker.openbittorrent.com:80/announce",
+    "udp://open.demonii.com:1337/announce",
 )
 
 _CACHE: dict[str, str] = {}
@@ -210,23 +222,76 @@ def resolve_name(infohash: str, timeout: float = 15.0,
         ev.set()
 
 
+def _log_fail(digest: str, reason: str) -> None:
+    """失败诊断行只进 stderr（落 NAS 服务日志），不进 UI、不影响主流程。"""
+    try:
+        print(f"magnetmeta: 解析失败 {digest} {reason}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def _resolve(digest: str, deadline: float,
              trackers: list[str] | None = None) -> str | None:
     try:
         infohash = bytes.fromhex(digest)
     except ValueError:
         return None
-    peers = _dht_lookup(infohash, deadline)
-    if time.monotonic() < deadline:
-        got = _tracker_lookup(infohash, deadline, trackers)
-        peers = list(dict.fromkeys(peers + got))
+    dht_peers: dict[tuple[str, int], None] = {}
+    tr_peers: dict[tuple[str, int], None] = {}
+    merged: dict[tuple[str, int], None] = {}
+    lock = threading.Lock()
+    pending = [2]
+    settled = threading.Event()
+
+    def _merge(src: dict) -> None:
+        with lock:
+            for a in src:
+                merged.setdefault(a)
+            pending[0] -= 1
+            if pending[0] <= 0:
+                settled.set()
+
+    def dht_worker() -> None:
+        try:
+            for a in _dht_lookup(infohash, deadline):
+                dht_peers.setdefault(a)
+        except Exception:
+            pass
+        _merge(dht_peers)
+
+    def tr_worker() -> None:
+        try:
+            for a in _tracker_lookup(infohash, deadline, trackers):
+                tr_peers.setdefault(a)
+        except Exception:
+            pass
+        _merge(tr_peers)
+
+    # DHT 与 tracker 并行：任一通道被断不拖死另一条（串行时 DHT 会吃光预算）
+    threading.Thread(target=dht_worker, daemon=True).start()
+    threading.Thread(target=tr_worker, daemon=True).start()
+    gather_end = min(deadline, time.monotonic() + _GATHER_SECS)
+    while time.monotonic() < gather_end:
+        with lock:
+            if len(merged) >= _DHT_WANT or pending[0] <= 0:
+                break
+        time.sleep(0.05)
+    with lock:
+        peers = list(merged)
+        n_dht, n_tr = len(dht_peers), len(tr_peers)
     if not peers:
+        _log_fail(digest, f"无 peer（dht={n_dht} tracker={n_tr}）")
         return None
     random.shuffle(peers)
-    meta = _fetch_metadata(infohash, peers[:12], deadline)
+    meta = _fetch_metadata(infohash, peers[:_PEER_TRY], deadline)
     if meta is None:
+        _log_fail(digest, f"元数据拉取失败（dht={n_dht} tracker={n_tr} "
+                          f"tried={min(len(peers), _PEER_TRY)}）")
         return None
-    return _name_from_metadata(meta)
+    name = _name_from_metadata(meta)
+    if name is None:
+        _log_fail(digest, "元数据无 name")
+    return name
 
 
 # ---------------------------------------------------------------- DHT（BEP-5）
@@ -349,33 +414,130 @@ def _parse_announce(data: bytes) -> list[tuple[str, int]]:
 
 def _tracker_lookup(infohash: bytes, deadline: float,
                     trackers: list[str] | None = None) -> list[tuple[str, int]]:
-    """HTTP(S) tracker announce 收 peer（DHT 不可达时的兜底来源）。
-    自带 tr= 优先，公共 tracker 兜底；单个失败不中断，全部失败返回空。"""
+    """tracker announce 收 peer（与 DHT 并行的第二来源）。
+    自带 tr= 优先（udp/http 均收），公共 tracker 兜底；各 tracker 并发
+    announce、单个失败不中断，全部失败返回空。"""
     urls: list[str] = []
     for t in (trackers or []) + list(_TRACKERS):
         t = (t or "").strip()
-        if t.startswith(("http://", "https://")) and t not in urls:
+        if t.startswith(("http://", "https://", "udp://")) and t not in urls:
             urls.append(t)
     peers: dict[tuple[str, int], None] = {}
+    lock = threading.Lock()
     # 强制直连：不走环境代理（与 stats 上报同一铁律）
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    for url in urls[:6]:
-        if time.monotonic() >= deadline or len(peers) >= _DHT_WANT:
-            break
-        qs = ("?info_hash=" + quote_from_bytes(infohash)
-              + "&peer_id=" + quote_from_bytes(_PEER_ID)
-              + "&port=6881&uploaded=0&downloaded=0&left=0&compact=1&numwant=50")
+
+    def worker(url: str) -> None:
         try:
-            req = urllib.request.Request(
-                url + qs, headers={"User-Agent": "fnmedia-dl/1.0"})
-            timeout = max(1.0, min(5.0, deadline - time.monotonic()))
-            with opener.open(req, timeout=timeout) as resp:
-                data = resp.read(256 * 1024)
+            if url.startswith("udp://"):
+                got = _udp_announce(url, infohash, deadline)
+            else:
+                got = _http_announce(url, infohash, deadline, opener)
         except Exception:
-            continue
-        for a in _parse_announce(data):
-            peers.setdefault(a)
-    return list(peers)[:_DHT_WANT]
+            got = []
+        with lock:
+            for a in got:
+                peers.setdefault(a)
+
+    threads = [threading.Thread(target=worker, args=(u,), daemon=True)
+               for u in urls[:_TRACKER_MAX]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.1, deadline - time.monotonic()))
+    return list(peers)[:_PEER_TRY]
+
+
+def _http_announce(url: str, infohash: bytes, deadline: float,
+                   opener) -> list[tuple[str, int]]:
+    """HTTP(S) tracker announce 单发：失败返回空。"""
+    qs = ("?info_hash=" + quote_from_bytes(infohash)
+          + "&peer_id=" + quote_from_bytes(_PEER_ID)
+          + "&port=6881&uploaded=0&downloaded=0&left=0&compact=1&numwant=50")
+    try:
+        req = urllib.request.Request(
+            url + qs, headers={"User-Agent": "fnmedia-dl/1.0"})
+        timeout = max(1.0, min(5.0, deadline - time.monotonic()))
+        with opener.open(req, timeout=timeout) as resp:
+            data = resp.read(256 * 1024)
+    except Exception:
+        return []
+    return _parse_announce(data)
+
+
+def _udp_connect_request(tx: int) -> bytes:
+    """BEP-15 connect 请求：8 字节魔数 + action=0 + 事务 id。"""
+    return struct.pack(">QII", 0x41727101980, 0, tx)
+
+
+def _udp_parse_connect(data: bytes, tx: int) -> int | None:
+    """connect 响应 → connection_id；tx 不符/action 出错/短包返回 None。"""
+    if len(data) < 16:
+        return None
+    action, rtx, conn = struct.unpack(">IIQ", data[:16])
+    if action != 0 or rtx != tx:
+        return None
+    return conn
+
+
+def _udp_announce_request(conn: int, tx: int, infohash: bytes,
+                          key: int) -> bytes:
+    """BEP-15 announce 请求（98 字节）。left=1 以下载者身份要 peer，
+    event=started，ip=0 由 tracker 看源地址。"""
+    return struct.pack(">QII20s20sQQQIIIiH", conn, 1, tx,
+                       infohash, _PEER_ID, 0, 1, 0, 2, 0, key, 50, 6881)
+
+
+def _udp_parse_announce(data: bytes, tx: int) -> list[tuple[str, int]]:
+    """announce 响应 → peer 地址。tx 不符/action 出错/短包返回空。"""
+    if len(data) < 20:
+        return []
+    action, rtx = struct.unpack(">II", data[:8])
+    if action != 1 or rtx != tx:
+        return []
+    out: list[tuple[str, int]] = []
+    for i in range(20, len(data) - 5, 6):
+        a = _decode_compact_peer(data[i:i + 6])
+        if a:
+            out.append(a)
+    return out[:_DHT_WANT]
+
+
+def _udp_announce(url: str, infohash: bytes, deadline: float) -> list[tuple[str, int]]:
+    """BEP-15 UDP tracker announce：connect → announce → 紧凑 peer。
+    失败返回空。磁力自带 tr= 多为 udp 形态，这条通道不可省。"""
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port or 80
+    except ValueError:
+        return []
+    if not host:
+        return []
+    try:
+        addr = socket.getaddrinfo(host, port, socket.AF_INET,
+                                  socket.SOCK_DGRAM)[0][4]
+    except (OSError, IndexError):
+        return []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(max(1.0, min(4.0, deadline - time.monotonic())))
+        tx = random.getrandbits(32)
+        sock.sendto(_udp_connect_request(tx), addr)
+        data, _src = sock.recvfrom(2048)
+        conn = _udp_parse_connect(data, tx)
+        if conn is None:
+            return []
+        key = random.getrandbits(32)
+        sock.sendto(_udp_announce_request(conn, tx, infohash, key), addr)
+        data, _src = sock.recvfrom(64 * 1024)
+    except (OSError, struct.error):
+        return []
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return _udp_parse_announce(data, tx)
 
 
 # ---------------------------------------------------------------- peer 元数据（BEP-9/10）
