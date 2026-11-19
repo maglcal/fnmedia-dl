@@ -78,6 +78,7 @@ $$(".tab").forEach((btn) => {
     if (btn.dataset.tab === "tasks") loadTasks();
     if (btn.dataset.tab === "settings") loadConfig();
     if (btn.dataset.tab === "add") { loadChips(); loadQueue(); }
+    if (btn.dataset.tab === "rss") loadRss();
   });
 });
 
@@ -1677,6 +1678,226 @@ on("#upNowBtn", "click", async () => {
     }
   }, 1000);
 });
+
+/* ---------------- RSS 订阅（P1 手动闭环） ----------------
+   订阅 CRUD + 立即检查 + 条目预览 + 手动派发；样式复用任务表/链接列表。
+   P1 无定时轮询：检查与派发全靠手动按钮，条目经去重过滤后待确认。 */
+const RSS_STATE_BADGE = {
+  new: `<span class="result-warn">待确认</span>`,
+  matched: `<span class="result-warn">待确认</span>`,
+  dispatched: `<span class="result-ok">✓ 已派发</span>`,
+  skipped: `<span class="state paused">已跳过</span>`,
+  failed: `<span class="result-fail">✗ 派发失败</span>`,
+};
+let rssItemsSub = "";      // 当前条目预览所属订阅 id（"" = 面板收起）
+
+function rssKwList(v) {
+  return (v || "").split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+}
+
+async function loadRss() {
+  try {
+    const d = await API.get("/api/rss/subs");
+    renderRssSubs(d.subs || []);
+    $("#rssError").hidden = true;
+  } catch (e) {
+    const box = $("#rssError");
+    box.hidden = false;
+    box.textContent = "订阅列表加载失败：" + e.message;
+  }
+}
+
+function renderRssSubs(subs) {
+  const ul = $("#rssSubList");
+  if (!ul) return;
+  ul.innerHTML = "";
+  if (!subs.length) {
+    ul.innerHTML = `<li class="empty">暂无订阅：在上方填写 RSS 地址点「添加订阅」</li>`;
+    return;
+  }
+  for (const s of subs) {
+    const li = document.createElement("li");
+    const f = s.filter || {};
+    const rules = [].concat(f.must || [], (f.must_not || []).map((k) => "排除:" + k));
+    li.innerHTML = `
+      <span class="link-name">
+        ${esc(s.name || s.url)}
+        ${s.enabled ? "" : `<span class="tag">已停用</span>`}
+        ${s.suspended ? `<span class="tag warn">连续失败已搁置</span>` : ""}
+        <div class="link-reason">${esc(s.url)}</div>
+        <div class="link-reason">
+          上次检查：${esc(s.last_check || "从未")}
+          · 条目 ${s.items_count}（待确认 ${s.matched_count}）
+          ${rules.length ? " · 规则：" + esc(rules.join(" / ")) : ""}
+          ${s.last_error ? ` · <span class="result-fail">${esc(s.last_error)}</span>` : ""}
+        </div>
+      </span>
+      <button class="btn" data-rss="check" data-id="${esc(s.id)}">立即检查</button>
+      <button class="btn ghost" data-rss="items" data-id="${esc(s.id)}"
+              data-name="${esc(s.name || s.url)}">条目</button>
+      <button class="btn ghost" data-rss="toggle" data-id="${esc(s.id)}"
+              data-enabled="${s.enabled ? "1" : "0"}">${s.enabled ? "停用" : "启用"}</button>
+      <button class="btn danger" data-rss="del" data-id="${esc(s.id)}"
+              data-name="${esc(s.name || s.url)}">删除</button>`;
+    ul.appendChild(li);
+  }
+  ul.querySelectorAll("button[data-rss]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const { rss, id, name } = btn.dataset;
+      if (rss === "check") {
+        btn.disabled = true;
+        btn.textContent = "检查中…";
+        try {
+          const r = await API.send(`/api/rss/subs/${encodeURIComponent(id)}/check`, "POST");
+          if (r.status === "not_modified") {
+            toast("✓ 订阅源无更新");
+          } else if (r.ok) {
+            toast(`✓ 检查完成：新条目 ${r.new} 条（待确认 ${r.matched} / 已跳过 ${r.skipped}）`);
+          } else {
+            toast("检查失败：" + (r.error || "未知错误"));
+          }
+          loadRss();
+        } catch (e) {
+          toast("检查失败：" + e.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "立即检查";
+        }
+      } else if (rss === "items") {
+        openRssItems(id, name);
+      } else if (rss === "toggle") {
+        try {
+          await API.send(`/api/rss/subs/${encodeURIComponent(id)}`, "PUT",
+            { enabled: btn.dataset.enabled !== "1" });
+          loadRss();
+        } catch (e) {
+          toast("操作失败：" + e.message);
+        }
+      } else if (rss === "del") {
+        if (!confirm(`删除订阅「${name || id}」？其条目记录一并移除（已派发的下载任务不受影响）。`)) return;
+        try {
+          await API.send(`/api/rss/subs/${encodeURIComponent(id)}`, "DELETE");
+          if (rssItemsSub === id) closeRssItems();
+          toast("已删除订阅");
+          loadRss();
+        } catch (e) {
+          toast("删除失败：" + e.message);
+        }
+      }
+    });
+  });
+}
+
+on("#btnRssAdd", "click", async () => {
+  const url = $("#rssUrl").value.trim();
+  if (!url) return toast("请先填写订阅地址");
+  const body = {
+    url,
+    name: $("#rssName").value.trim(),
+    directory: $("#rssDir").value.trim(),
+    filter: {
+      must: rssKwList($("#rssMust").value),
+      must_not: rssKwList($("#rssMustNot").value),
+      regex: $("#rssRegex").checked,
+    },
+  };
+  const btn = $("#btnRssAdd");
+  btn.disabled = true;
+  try {
+    await API.send("/api/rss/subs", "POST", body);
+    toast("✓ 已添加订阅，点「立即检查」拉取条目");
+    $("#rssUrl").value = "";
+    $("#rssName").value = "";
+    loadRss();
+  } catch (e) {
+    toast("添加失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+on("#btnRssRefresh", "click", loadRss);
+
+/* ---- 条目预览 + 手动派发 ---- */
+async function openRssItems(subId, name) {
+  rssItemsSub = subId;
+  const card = $("#rssItemsCard");
+  if (card) card.hidden = false;
+  const badge = $("#rssItemsSub");
+  if (badge) badge.textContent = name || subId;
+  await loadRssItems();
+}
+
+function closeRssItems() {
+  rssItemsSub = "";
+  const card = $("#rssItemsCard");
+  if (card) card.hidden = true;
+}
+
+on("#btnRssItemsClose", "click", closeRssItems);
+
+async function loadRssItems() {
+  if (!rssItemsSub) return;
+  const body = $("#rssItemsBody");
+  if (!body) return;
+  body.innerHTML = `<tr><td colspan="4" class="empty">加载中…</td></tr>`;
+  try {
+    const d = await API.get(`/api/rss/subs/${encodeURIComponent(rssItemsSub)}/items`);
+    renderRssItems(d.items || []);
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="4" class="empty">加载失败：${esc(e.message)}</td></tr>`;
+  }
+}
+
+function renderRssItems(items) {
+  const body = $("#rssItemsBody");
+  if (!items.length) {
+    body.innerHTML = `<tr><td colspan="4" class="empty">暂无条目：点订阅卡片上的「立即检查」拉取</td></tr>`;
+    return;
+  }
+  body.innerHTML = "";
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    const canDispatch = it.state !== "dispatched";
+    tr.innerHTML = `
+      <td>
+        <div class="task-name">${esc(it.title || it.url)}</div>
+        <div class="task-url">${esc(it.url)}</div>
+        ${it.last_result && it.state !== "dispatched"
+          ? `<div class="task-url">${esc(it.last_result)}</div>` : ""}
+      </td>
+      <td>${fmtSize(it.size)}</td>
+      <td>${RSS_STATE_BADGE[it.state] || esc(it.state)}</td>
+      <td>${canDispatch ? `
+        <button class="btn" data-rss-dispatch="${esc(it.id)}">派发</button>` : ""}</td>`;
+    body.appendChild(tr);
+  }
+  body.querySelectorAll("button[data-rss-dispatch]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "派发中…";
+      try {
+        const r = await API.send(
+          `/api/rss/items/${encodeURIComponent(btn.dataset.rssDispatch)}/dispatch`,
+          "POST", { backend: "auto" });
+        if (r.already) {
+          toast("该条目已派发过，不重复创建任务");
+        } else if (r.ok) {
+          toast(`✓ 已派发 · ${r.label || r.backend}` +
+            (r.duplicate ? "（⚠ 之前下载过同资源，注意避免重复）" : ""));
+        } else {
+          toast("派发失败：" + (r.error || "未知错误"));
+        }
+        await loadRssItems();
+        loadRss();
+      } catch (e) {
+        toast("派发失败：" + e.message);
+        btn.disabled = false;
+        btn.textContent = "派发";
+      }
+    });
+  });
+}
 
 /* ---------------- init ----------------
    顶层执行到这说明脚本未被中途异常带崩；给页面看门狗一个就绪信号。

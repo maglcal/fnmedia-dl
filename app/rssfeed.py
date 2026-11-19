@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""RSS 订阅（P1 手动闭环）：订阅 CRUD、条目拉取解析、过滤去重、手动派发。
+
+数据文件 state/rss.json（文件锁短临界区同 taskqueue 口径）：
+  {"subs":  [{"id","name","url","enabled","interval_min","auto_download",
+              "directory","filter","etag","last_modified",
+              "last_check","last_error","fail_count"}],
+   "items": {sub_id: [{"id","guid","identity","title","url","size",
+                       "state","first_seen","last_result"}]},
+   "seen":  {fingerprint: ts}}        # 条目去重指纹，30 天滚动清理
+
+条目解析（BEP 36 优先级链，Torrent RSS feeds 事实标准）：
+  ① enclosure type="application/x-bittorrent"（MUST，优先于一切标签）
+  ② <torrent><infoHash> → magnet_from_infohash 直接组磁力（免拉种子）
+  ③ <link> 直接放 magnet:
+  ④ media:content url（磁力 / .torrent）
+  ⑤ description 正则兜底提取磁力 / .torrent 直链
+  普通 http(s) <link> 是条目详情页而非下载地址，**不入库**（防误派发）；
+  非种子条目（播客 enclosure 等）P1 不入库。RSS 2.0 优先，Atom 容错
+  （entry / link href / id）。
+
+去重三层：①seen 指纹缓存（guid/identity 归一，30 天滚动清理）→
+  ②links.identity + 下载历史 history_check → ③派发幂等（dispatched 不重发）。
+过滤（qBittorrent 三轴）：must_not 一票否决 → must 任一命中（空 = 全过）
+  → 大小阈值（feed 提供大小时才生效）；regex 模式限长 512 字符（ReDoS 自担）。
+
+P1 仅手动闭环：check() 只拉取-解析-去重-过滤-入库，**不做定时轮询**，
+auto_download 字段先落库预留（P2 自动化用）；「立即检查」永远可用——
+fail_count ≥ MAX_FAILS 只搁置 P2 的定时轮询，不拦手动检查（手动重试即复位）。
+
+条目 state 取值：new（入库瞬态）→ matched（过滤命中，待手动派发）/
+  skipped（过滤排除 / 历史已有同资源）/ dispatched（已派发）/ failed（派发失败）。
+
+注意：文件名不能叫 queue.py——app 目录在 sys.path 首位，会遮蔽标准库
+queue 模块把 threading/anyio 等依赖带崩。
+"""
+from __future__ import annotations
+
+import json
+import re
+import threading
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import httpx
+
+import config as cfgmod
+import filelock
+import links as linksmod
+
+_FILE_LOCK = threading.Lock()
+_CHECK_GUARD = threading.Lock()      # 检查单飞：手动检查与未来轮询不并发
+
+DEFAULT_FEED_TIMEOUT = 15.0          # 单次拉取超时（秒）
+MAX_FEED_BYTES = 2 * 1024 * 1024     # feed 体积极限 2MB（防恶意大包）
+MAX_FEED_ITEMS = 500                 # 单次解析条目极顶
+MAX_ITEMS_PER_SUB = 500              # 每订阅条目留存量（旧条目滚动丢弃）
+MAX_FAILS = 5                        # 连续失败次数上限（P2 轮询搁置阈值）
+SEEN_TTL = 30 * 86400                # seen 指纹缓存滚动窗口（秒）
+REGEX_MAX_LEN = 512                  # 正则规则长度上限（ReDoS 防护）
+MIN_INTERVAL_MIN = 10                # 轮询间隔下限（分钟，P2 生效）
+
+_MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^\s\"'<>]*")
+_TORRENT_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.torrent", re.I)
+
+
+# ---------------------------------------------------------------- 过滤
+
+def _norm_interval(v) -> int:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise ValueError("轮询间隔需为整数（分钟）")
+    if n < MIN_INTERVAL_MIN:
+        raise ValueError(f"轮询间隔最短 {MIN_INTERVAL_MIN} 分钟")
+    return n
+
+
+def _opt_float(v):
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("大小阈值需为数字（MB）")
+    if f < 0:
+        raise ValueError("大小阈值不能为负")
+    return f
+
+
+def _norm_filter(flt: dict | None) -> dict:
+    """过滤规则归一 + 校验（regex 模式逐条编译 + 限长）。"""
+    flt = flt or {}
+    must = [str(x).strip() for x in (flt.get("must") or []) if str(x).strip()]
+    must_not = [str(x).strip() for x in (flt.get("must_not") or []) if str(x).strip()]
+    regex = bool(flt.get("regex"))
+    if regex:
+        for pat in must + must_not:
+            if len(pat) > REGEX_MAX_LEN:
+                raise ValueError(f"正则规则过长（上限 {REGEX_MAX_LEN} 字符）")
+            try:
+                re.compile(pat)
+            except re.error as exc:
+                raise ValueError(f"正则规则无效（{pat}）：{exc}")
+    return {
+        "must": must, "must_not": must_not, "regex": regex,
+        "size_min_mb": _opt_float(flt.get("size_min_mb")),
+        "size_max_mb": _opt_float(flt.get("size_max_mb")),
+    }
+
+
+def _filter_entry(title: str, size: int, flt: dict) -> tuple[bool, str]:
+    """三轴过滤：must_not 一票否决 → must 任一命中（空 = 全过）→ 大小阈值。"""
+    title = title or ""
+    must = flt.get("must") or []
+    must_not = flt.get("must_not") or []
+    if flt.get("regex"):
+        for pat in must_not:
+            if re.search(pat, title):
+                return False, f"命中排除规则：{pat}"
+        if must and not any(re.search(p, title) for p in must):
+            return False, "未命中任何包含规则"
+    else:
+        low = title.lower()
+        for kw in must_not:
+            if kw.lower() in low:
+                return False, f"命中排除关键词：{kw}"
+        if must and not any(k.lower() in low for k in must):
+            return False, "未命中任何包含关键词"
+    if size > 0:
+        mb = size / (1024 * 1024)
+        smin, smax = flt.get("size_min_mb"), flt.get("size_max_mb")
+        if smin is not None and mb < smin:
+            return False, f"体积小于 {smin}MB"
+        if smax is not None and mb > smax:
+            return False, f"体积大于 {smax}MB"
+    return True, ""
+
+
+# ---------------------------------------------------------------- 解析
+
+def _local(tag: str) -> str:
+    """XML 标签本地名（剥命名空间），小写归一（infoHash → infohash）。"""
+    return tag.rsplit("}", 1)[-1].split(":")[-1].lower()
+
+
+def _child_text(elem, name: str) -> str:
+    for ch in elem:
+        if _local(ch.tag) == name and ch.text:
+            return ch.text.strip()
+    return ""
+
+
+def _parse_entry(elem) -> dict | None:
+    """单条目 → {guid,title,url,size}；提不出种子/磁力链接返回 None。
+
+    BEP 36 优先级链：enclosure(application/x-bittorrent) → torrent:infoHash
+    → link 磁力 → media:content → description 正则兜底。"""
+    title = _child_text(elem, "title")
+    guid = _child_text(elem, "guid") or _child_text(elem, "id")
+    link = ""            # RSS <link> 文本 / Atom <link href>
+    desc = ""
+    enc_url, enc_len, enc_is_bt = "", 0, False
+    infohash, hash_len = "", 0
+    mc_url, mc_size = "", 0
+
+    for ch in elem:
+        name = _local(ch.tag)
+        if name == "link":
+            link = (ch.get("href") or ch.text or "").strip() or link
+        elif name == "enclosure":
+            u = (ch.get("url") or "").strip()
+            t = (ch.get("type") or "").lower()
+            if u and (t == "application/x-bittorrent"
+                      or u.lower().endswith(".torrent")):
+                enc_url, enc_is_bt = u, True
+                try:
+                    enc_len = int(ch.get("length") or 0)
+                except ValueError:
+                    enc_len = 0
+        elif name in ("description", "summary", "encoded"):
+            desc += "\n" + (ch.text or "")
+        # 扩展标签（EZTV/nyaa 风格）在任意深度，用 iter 兜底
+    for ch in elem.iter():
+        name = _local(ch.tag)
+        if name == "infohash" and ch.text and ch.text.strip():
+            infohash = infohash or ch.text.strip()
+        elif name == "contentlength" and ch.text:
+            try:
+                hash_len = hash_len or int(ch.text.strip())
+            except ValueError:
+                pass
+        elif name == "content" and (ch.get("url") or "").strip():
+            # media:content（Atom <content> 无 url 属性，不会误命中）
+            u = (ch.get("url") or "").strip()
+            if u.lower().startswith("magnet:") or u.lower().endswith(".torrent"):
+                mc_url = mc_url or u
+                try:
+                    mc_size = mc_size or int(ch.get("fileSize") or 0)
+                except ValueError:
+                    pass
+
+    url, size = "", 0
+    if enc_url:
+        url, size = enc_url, enc_len
+    elif infohash and (linksmod.HEX40.match(infohash)
+                       or linksmod.BASE32.match(infohash.upper())):
+        url = linksmod.magnet_from_infohash(infohash, dn=title)
+        size = hash_len
+    elif link.lower().startswith("magnet:"):
+        url = link
+    elif mc_url:
+        url, size = mc_url, mc_size
+    else:
+        m = _MAGNET_RE.search(desc) or _TORRENT_URL_RE.search(desc)
+        if m:
+            url = m.group(0)
+    if not url:
+        return None                 # 提不出种子/磁力条目（详情页/播客等）不入库
+    return {
+        "guid": guid or linksmod.identity(url),
+        "title": title or url[:80],
+        "url": url,
+        "size": size,
+    }
+
+
+def _parse_feed(data: bytes) -> list[dict]:
+    """feed 字节 → 条目列表（上限 MAX_FEED_ITEMS）；XML 损坏抛 ValueError。
+
+    安全：拒绝 ENTITY 声明（billion-laughs 实体炸弹的必要条件）；
+    条目按文档顺序取前 N 条。"""
+    if b"<!ENTITY" in data[:4096]:
+        raise ValueError("订阅源包含实体声明，已拒绝解析（安全防护）")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ValueError(f"订阅源 XML 解析失败：{exc}")
+    out: list[dict] = []
+    for el in root.iter():
+        if _local(el.tag) not in ("item", "entry"):
+            continue
+        entry = _parse_entry(el)
+        if entry:
+            out.append(entry)
+        if len(out) >= MAX_FEED_ITEMS:
+            break
+    return out
+
+
+# ---------------------------------------------------------------- 存储
+
+def _fingerprint(guid: str, identity: str) -> str:
+    """条目去重指纹：资源级身份（磁力/ed2k 按哈希归一）优先，guid 兜底。"""
+    if identity.startswith(("btih:", "ed2k:")):
+        return identity
+    return guid or identity
+
+
+class RssFeed:
+    def __init__(self, path: Path | None = None):
+        self.path = Path(path) if path else Path(cfgmod.STATE_DIR) / "rss.json"
+
+    # ------------------------------------------------------------ 内部
+
+    def _load(self) -> dict:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        data["subs"] = [s for s in (data.get("subs") or []) if isinstance(s, dict)]
+        data["items"] = {str(k): [i for i in (v or []) if isinstance(i, dict)]
+                         for k, v in (data.get("items") or {}).items()}
+        data["seen"] = {str(k): int(v) for k, v in (data.get("seen") or {}).items()}
+        return data
+
+    def _save(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.chmod(0o600)   # 订阅 URL 可能内嵌凭据，与 tasks.json 同级收紧
+        tmp.replace(self.path)
+
+    @staticmethod
+    def _find(data: dict, sub_id: str) -> dict:
+        for sub in data["subs"]:
+            if sub.get("id") == sub_id:
+                return sub
+        raise KeyError(f"订阅不存在：{sub_id}")
+
+    @staticmethod
+    def _find_item(data: dict, item_id: str) -> tuple[dict, dict | None]:
+        for sub_id, lst in (data.get("items") or {}).items():
+            for it in lst:
+                if it.get("id") == item_id:
+                    sub = next((s for s in data.get("subs", [])
+                                if s.get("id") == sub_id), None)
+                    return it, sub
+        raise KeyError(f"条目不存在：{item_id}")
+
+    @staticmethod
+    def _prune_seen(data: dict, now: int) -> None:
+        """seen 指纹 30 天滚动清理（旧指纹自然过期，条目清理是 P3）。"""
+        cutoff = now - SEEN_TTL
+        data["seen"] = {k: ts for k, ts in data["seen"].items() if ts >= cutoff}
+
+    def _touch(self, sub_id: str, *, ok: bool, error: str = "") -> None:
+        """检查结果回写订阅状态（成功清零 fail_count，失败累计并留错因）。"""
+        with _FILE_LOCK, filelock.locked(self.path):
+            data = self._load()
+            sub = self._find(data, sub_id)
+            sub["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            if ok:
+                sub["fail_count"] = 0
+                sub["last_error"] = ""
+            else:
+                sub["fail_count"] = int(sub.get("fail_count") or 0) + 1
+                sub["last_error"] = error[:200]
+            self._save(data)
+
+    # ------------------------------------------------------------ CRUD
+
+    def add(self, url: str, name: str = "", *, directory: str = "",
+            interval_min: int = 30, auto_download: bool = False,
+            flt: dict | None = None) -> dict:
+        url = (url or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("订阅地址需为 http(s) 链接")
+        sub = {
+            "id": uuid.uuid4().hex[:10],
+            "name": (name or "").strip() or url.split("//", 1)[-1][:40],
+            "url": url,
+            "enabled": True,
+            "interval_min": _norm_interval(interval_min),
+            "auto_download": bool(auto_download),
+            "directory": (directory or "").strip(),
+            "filter": _norm_filter(flt),
+            "etag": "", "last_modified": "",
+            "last_check": "", "last_error": "", "fail_count": 0,
+        }
+        with _FILE_LOCK, filelock.locked(self.path):
+            data = self._load()
+            data["subs"].append(sub)
+            self._save(data)
+        return dict(sub)
+
+    def update(self, sub_id: str, patch: dict) -> dict:
+        """局部更新订阅（只动 patch 里出现的键）。"""
+        patch = patch or {}
+        with _FILE_LOCK, filelock.locked(self.path):
+            data = self._load()
+            sub = self._find(data, sub_id)
+            if "name" in patch:
+                sub["name"] = str(patch.get("name") or "").strip()
+            if "url" in patch:
+                url = str(patch.get("url") or "").strip()
+                if not url.lower().startswith(("http://", "https://")):
+                    raise ValueError("订阅地址需为 http(s) 链接")
+                sub["url"] = url
+            if "enabled" in patch:
+                sub["enabled"] = bool(patch.get("enabled"))
+            if "auto_download" in patch:
+                sub["auto_download"] = bool(patch.get("auto_download"))
+            if "interval_min" in patch:
+                sub["interval_min"] = _norm_interval(patch.get("interval_min"))
+            if "directory" in patch:
+                sub["directory"] = str(patch.get("directory") or "").strip()
+            if "filter" in patch:
+                sub["filter"] = _norm_filter(patch.get("filter"))
+            self._save(data)
+            return dict(sub)
+
+    def remove(self, sub_id: str) -> bool:
+        """移除订阅与其条目（seen 指纹保留——跨订阅去重仍有效）。"""
+        with _FILE_LOCK, filelock.locked(self.path):
+            data = self._load()
+            before = len(data["subs"])
+            data["subs"] = [s for s in data["subs"] if s.get("id") != sub_id]
+            data["items"].pop(sub_id, None)
+            self._save(data)
+            return len(data["subs"]) != before
+
+    def snapshot(self) -> dict:
+        with _FILE_LOCK:
+            data = self._load()
+        subs = []
+        for s in data["subs"]:
+            d = dict(s)
+            lst = data["items"].get(s.get("id"), [])
+            d["items_count"] = len(lst)
+            d["matched_count"] = sum(1 for i in lst if i.get("state") == "matched")
+            d["suspended"] = int(s.get("fail_count") or 0) >= MAX_FAILS
+            subs.append(d)
+        return {"subs": subs}
+
+    def items(self, sub_id: str) -> list[dict]:
+        """订阅条目（新 → 旧）。"""
+        with _FILE_LOCK:
+            data = self._load()
+        self._find(data, sub_id)          # 不存在抛 KeyError → API 404
+        lst = [dict(i) for i in data["items"].get(sub_id, [])]
+        return sorted(lst, key=lambda i: int(i.get("first_seen") or 0),
+                      reverse=True)
+
+    # ------------------------------------------------------------ 检查
+
+    @staticmethod
+    def _fetch(sub: dict, client: httpx.Client) -> dict:
+        """条件 GET 拉取 feed（锁外网络段）。返回 {status, ...}。
+
+        304 Not Modified 视为成功（无新条目）——不算失败不动 fail_count；
+        计划草案把 304 与失败并列是笔误口径，成功响应不该累计失败次数。"""
+        headers = {"User-Agent": "fnmedia-dl/rss"}
+        if sub.get("etag"):
+            headers["If-None-Match"] = sub["etag"]
+        if sub.get("last_modified"):
+            headers["If-Modified-Since"] = sub["last_modified"]
+        try:
+            with client.stream("GET", sub["url"], headers=headers,
+                               timeout=DEFAULT_FEED_TIMEOUT,
+                               follow_redirects=True) as resp:
+                if resp.status_code == 304:
+                    return {"status": "not_modified"}
+                if resp.status_code >= 400:
+                    return {"status": "error",
+                            "error": f"订阅源返回 HTTP {resp.status_code}"}
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_FEED_BYTES:
+                        return {"status": "error",
+                                "error": "订阅源内容超过 2MB 上限"}
+                    chunks.append(chunk)
+                return {"status": "ok", "body": b"".join(chunks),
+                        "etag": resp.headers.get("etag", ""),
+                        "last_modified": resp.headers.get("last-modified", "")}
+        except httpx.HTTPError as exc:
+            return {"status": "error", "error": f"订阅源拉取失败：{exc}"}
+
+    def check(self, sub_id: str, *, client: httpx.Client | None = None,
+              history_check=None) -> dict:
+        """立即检查：拉取 → 解析 → 三层去重 → 过滤 → 入库（不派发）。
+
+        history_check(url) → {"downloaded": bool}（资源级查重，API 层注入
+        downloader.history_check）；None = 跳过该层（测试/离线）。
+        并发语义（同 taskqueue O3）：网络段不持文件锁，入库回写短临界区；
+        检查整体单飞，撞车直接报错不排队。"""
+        if not _CHECK_GUARD.acquire(blocking=False):
+            raise RuntimeError("已有 RSS 检查正在进行，请稍后再试")
+        try:
+            with _FILE_LOCK:
+                data = self._load()
+                sub = dict(self._find(data, sub_id))
+            cli = client or httpx.Client(trust_env=False)
+            try:
+                fetched = self._fetch(sub, cli)
+            finally:
+                if client is None:
+                    cli.close()
+            if fetched["status"] == "not_modified":
+                self._touch(sub_id, ok=True)
+                return {"ok": True, "sub_id": sub_id, "status": "not_modified",
+                        "new": 0, "matched": 0, "skipped": 0, "items": []}
+            if fetched["status"] == "error":
+                err = fetched.get("error") or "订阅源拉取失败"
+                self._touch(sub_id, ok=False, error=err)
+                return {"ok": False, "sub_id": sub_id, "status": "error",
+                        "error": err}
+            try:
+                entries = _parse_feed(fetched["body"])
+            except ValueError as exc:
+                self._touch(sub_id, ok=False, error=str(exc))
+                return {"ok": False, "sub_id": sub_id, "status": "error",
+                        "error": str(exc)}
+
+            # 入库（短锁）：seen 指纹先写（宁漏勿重）→ 历史查重 → 过滤
+            now = int(time.time())
+            added: list[dict] = []
+            with _FILE_LOCK, filelock.locked(self.path):
+                data = self._load()
+                sub = self._find(data, sub_id)
+                flt = sub.get("filter") or {}
+                lst = data["items"].setdefault(sub_id, [])
+                seen = data.setdefault("seen", {})
+                existing = ({it.get("guid") for it in lst}
+                            | {it.get("identity") for it in lst})
+                for raw in entries:
+                    ident = linksmod.identity(raw["url"])
+                    fp = _fingerprint(raw.get("guid") or "", ident)
+                    if fp in seen or fp in existing:
+                        seen[fp] = now          # 刷新时间戳，活跃条目不滚出
+                        continue
+                    seen[fp] = now
+                    item = {
+                        "id": uuid.uuid4().hex[:10],
+                        "guid": raw.get("guid") or "",
+                        "identity": ident,
+                        "title": raw.get("title") or "",
+                        "url": raw.get("url") or "",
+                        "size": int(raw.get("size") or 0),
+                        "state": "new",
+                        "first_seen": now,
+                        "last_result": "",
+                    }
+                    # 层②：资源级下载历史查重（命中 = 已有同资源）
+                    if history_check is not None:
+                        try:
+                            hit = history_check(raw["url"]) or {}
+                        except Exception:  # noqa: BLE001 - 查重失败不阻断入库
+                            hit = {}
+                        if hit.get("downloaded"):
+                            item["state"] = "skipped"
+                            item["last_result"] = "下载历史已有同资源"
+                            lst.append(item)
+                            added.append(item)
+                            continue
+                    ok, reason = _filter_entry(item["title"], item["size"], flt)
+                    item["state"] = "matched" if ok else "skipped"
+                    item["last_result"] = "" if ok else reason
+                    lst.append(item)
+                    added.append(item)
+                if len(lst) > MAX_ITEMS_PER_SUB:
+                    data["items"][sub_id] = lst[-MAX_ITEMS_PER_SUB:]
+                sub["etag"] = (fetched.get("etag") or sub.get("etag") or "")
+                sub["last_modified"] = (fetched.get("last_modified")
+                                        or sub.get("last_modified") or "")
+                sub["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                sub["fail_count"] = 0
+                sub["last_error"] = ""
+                self._prune_seen(data, now)
+                self._save(data)
+            matched = sum(1 for i in added if i["state"] == "matched")
+            return {"ok": True, "sub_id": sub_id, "status": "ok",
+                    "new": len(added), "matched": matched,
+                    "skipped": len(added) - matched, "items": added}
+        finally:
+            _CHECK_GUARD.release()
+
+    # ------------------------------------------------------------ 派发
+
+    def dispatch_item(self, item_id: str, dispatch_fn) -> dict:
+        """手动派发单条（dispatch_fn(url, directory) → 结果 dict）。
+
+        幂等：已派发（dispatched）直接回执不重发；其余状态（matched/skipped/
+        failed/new）允许手动派发——手动 = 显式用户意图，可越过过滤/查重。
+        并发语义同 taskqueue run_now：网络派发不持文件锁，结果回写短临界区。"""
+        with _FILE_LOCK:
+            data = self._load()
+            item, sub = self._find_item(data, item_id)
+            if item.get("state") == "dispatched":
+                return {"ok": True, "already": True, "item": dict(item)}
+            url = item.get("url", "")
+            directory = (sub or {}).get("directory") or None
+        try:
+            res = dispatch_fn(url, directory) or {}
+        except Exception as exc:  # noqa: BLE001 - 派发异常转失败结果
+            res = {"ok": False, "error": str(exc)}
+        with _FILE_LOCK, filelock.locked(self.path):
+            data = self._load()
+            try:
+                item, _ = self._find_item(data, item_id)
+            except KeyError:
+                return res           # 派发期间条目被删除：结果照回不回写
+            if res.get("ok"):
+                item["state"] = "dispatched"
+                item["last_result"] = str(res.get("backend") or "")
+            else:
+                item["state"] = "failed"
+                item["last_result"] = str(res.get("error") or "派发失败")[:200]
+            self._save(data)
+        return res

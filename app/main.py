@@ -35,6 +35,13 @@
   DELETE /api/queue/{id}     移除队列项
   POST /api/queue/run        立即派发全部待发项
   POST /api/queue/settings   每日定时派发设置
+  GET  /api/rss/subs                    RSS 订阅列表（P1 手动闭环）
+  POST /api/rss/subs                    新增订阅
+  PUT  /api/rss/subs/{id}               更新订阅
+  DELETE /api/rss/subs/{id}             删除订阅（连同条目）
+  POST /api/rss/subs/{id}/check         立即检查（拉取→解析→去重→过滤→入库）
+  GET  /api/rss/subs/{id}/items         订阅条目预览
+  POST /api/rss/items/{id}/dispatch     手动派发单条
 """
 from __future__ import annotations
 
@@ -60,6 +67,7 @@ from pydantic import BaseModel
 import config as cfgmod
 import links as linksmod
 import magnetmeta as magnetmod
+import rssfeed as rssmod
 import stats as statsmod
 import taskqueue as tqmod
 import updatesrc
@@ -1009,6 +1017,115 @@ def queue_settings(req: QueueSettingsReq):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True, **q.snapshot()}
+
+
+# ------------------------------------------------------------ RSS 订阅（P1 手动闭环）
+# 订阅 CRUD + 立即检查 + 条目预览 + 手动派发；P1 无定时轮询（P2 上 rss-ticker）。
+# 写操作鉴权由 _admin_guard 统一兜（POST/PUT/DELETE 需网关令牌），
+# GET 只读接口与既有 /api/queue 等同口径放行。
+
+def _rss() -> rssmod.RssFeed:
+    return rssmod.RssFeed(Path(cfgmod.STATE_DIR) / "rss.json")
+
+
+@app.get("/api/rss/subs")
+def rss_subs():
+    return {"ok": True, **_rss().snapshot()}
+
+
+class RssSubAddReq(BaseModel):
+    url: str
+    name: str = ""
+    directory: str = ""
+    interval_min: int = 30
+    auto_download: bool = False
+    filter: dict | None = None
+
+
+@app.post("/api/rss/subs")
+def rss_add(req: RssSubAddReq):
+    try:
+        sub = _rss().add(req.url, req.name, directory=req.directory,
+                         interval_min=req.interval_min,
+                         auto_download=req.auto_download,
+                         flt=req.filter)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "sub": sub}
+
+
+class RssSubPatchReq(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    enabled: bool | None = None
+    interval_min: int | None = None
+    auto_download: bool | None = None
+    directory: str | None = None
+    filter: dict | None = None
+
+
+@app.put("/api/rss/subs/{sub_id}")
+def rss_update(sub_id: str, req: RssSubPatchReq):
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    try:
+        sub = _rss().update(sub_id, patch)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "sub": sub}
+
+
+@app.delete("/api/rss/subs/{sub_id}")
+def rss_remove(sub_id: str):
+    if not _rss().remove(sub_id):
+        raise HTTPException(404, f"订阅不存在：{sub_id}")
+    return {"ok": True}
+
+
+@app.post("/api/rss/subs/{sub_id}/check")
+def rss_check(sub_id: str):
+    """立即检查：拉取→解析→三层去重→过滤→入库，返回新条目命中情况。
+    资源级查重复用全局下载历史（downloader.history_check）。"""
+    mgr = _manager()
+    try:
+        return _rss().check(sub_id, history_check=mgr.history_check)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.get("/api/rss/subs/{sub_id}/items")
+def rss_items(sub_id: str):
+    try:
+        return {"ok": True, "items": _rss().items(sub_id)}
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+
+
+class RssDispatchReq(BaseModel):
+    backend: str = "auto"
+
+
+@app.post("/api/rss/items/{item_id}/dispatch")
+def rss_dispatch(item_id: str, req: RssDispatchReq | None = None):
+    """手动派发单条（显式用户意图，可越过过滤/查重；dispatched 幂等不重发）。
+    backend 沿用界面通道选择（缺省 auto 降级链），目录：订阅目录 → 全局默认。"""
+    mgr = _manager()
+    backend = (req.backend if req else "auto") or "auto"
+
+    def _fn(url: str, directory: str | None) -> dict:
+        return mgr.dispatch(linksmod.parse_line(url), backend=backend,
+                            directory=directory
+                            or mgr.cfg.get("default_dir") or None)
+    try:
+        res = _rss().dispatch_item(item_id, _fn)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    return res
 
 
 @app.on_event("startup")

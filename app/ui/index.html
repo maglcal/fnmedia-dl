@@ -219,6 +219,7 @@
 <nav class="tabs">
   <button class="tab active" data-tab="add">新建下载</button>
   <button class="tab" data-tab="tasks">任务列表</button>
+  <button class="tab" data-tab="rss">RSS 订阅</button>
   <button class="tab" data-tab="settings">通道设置</button>
   <button class="tab" data-tab="about">关于</button>
 </nav>
@@ -330,6 +331,75 @@
           </thead>
           <tbody id="taskBody">
             <tr><td colspan="6" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ RSS 订阅（P1 手动闭环） ============ -->
+  <section id="tab-rss" class="panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>RSS 订阅</h2>
+        <span class="hint">订阅 BT 站发布源，「立即检查」拉新条目，确认后手动派发下载</span>
+      </div>
+      <p class="hint">条目解析按 BEP 36 优先级（种子附件 → infoHash → 磁力链接 → 兜底提取），
+        新条目经过去重（同一资源只出现一次，与全局下载历史联动查重）与过滤规则后入库，
+        点「派发」才创建下载任务。当前版本为手动模式，暂不自动轮询与自动下载。</p>
+      <div class="form-grid">
+        <label>订阅地址<span class="opt">RSS / Atom 源 URL</span>
+          <input id="rssUrl" type="text" spellcheck="false"
+                 placeholder="https://example.com/rss">
+        </label>
+        <label>备注名称<span class="opt">留空自动生成</span>
+          <input id="rssName" type="text" placeholder="如：某站 1080p 更新">
+        </label>
+        <label>保存目录<span class="opt">留空用全局默认目录</span>
+          <span class="dir-pick-row">
+            <input id="rssDir" type="text">
+            <button type="button" class="btn ghost dir-pick"
+                    data-pick="rssDir" data-src="device">📁 选择目录</button>
+          </span>
+        </label>
+        <label>包含关键词<span class="opt">任一命中才入库，留空 = 全部</span>
+          <input id="rssMust" type="text" spellcheck="false"
+                 placeholder="1080p, 2160p（逗号分隔）">
+        </label>
+        <label>排除关键词<span class="opt">任一命中即丢弃，优先于包含</span>
+          <input id="rssMustNot" type="text" spellcheck="false"
+                 placeholder="CAM, TS（逗号分隔）">
+        </label>
+      </div>
+      <div class="row-inline dir-tools">
+        <label class="check"><input type="checkbox" id="rssRegex"><span>按正则匹配（进阶）</span></label>
+      </div>
+      <div class="actions">
+        <button id="btnRssAdd" class="btn primary">添加订阅</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>订阅列表</h2>
+        <button id="btnRssRefresh" class="btn ghost">刷新</button>
+      </div>
+      <div id="rssError" class="error" hidden></div>
+      <ul id="rssSubList" class="link-list"></ul>
+    </div>
+
+    <div class="card" id="rssItemsCard" hidden>
+      <div class="card-head">
+        <h2>条目预览 <span id="rssItemsSub" class="badge"></span></h2>
+        <button id="btnRssItemsClose" class="btn ghost">关闭</button>
+      </div>
+      <div class="table-wrap">
+        <table class="task-table">
+          <thead>
+            <tr><th>条目</th><th>大小</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody id="rssItemsBody">
+            <tr><td colspan="4" class="empty">加载中…</td></tr>
           </tbody>
         </table>
       </div>
