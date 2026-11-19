@@ -1038,18 +1038,20 @@ class ThunderCloud(Backend):
         # 只能指望 DHT 回填。显式真名（缓存命中/用户命名）仍覆盖。
         apply_display_name(resource, url, name)
         d = (directory or (self.conf.get("dir") or "")).strip()
-        # 目录映射校验（0.1.45.8，与本地直连同款补齐）：绝对路径先查容器
-        # 挂载——宿主路径自动换算为容器内路径（用户填 /vol1/1000/movie 而
-        # 引擎目录树是 /downloads/ 视角，此前 P2SP 通道缺这步翻译，
-        # 目录锚定必失败报「不在引擎可达的下载目录树内」——用户实测
-        # 删任务重下三通道全灭暴露）；映射外 → 明确报错阻止无效下发；
-        # 查不到容器 → 跳过校验靠目录表锚定（群晖套件/自建容器）。
+        # 目录映射换算（0.1.45.8 补翻译，0.1.47 修误挡）：绝对路径先查
+        # 容器挂载——宿主路径自动换算为容器内路径（用户填
+        # /vol1/1000/movie 而引擎目录树是 /downloads/ 视角，缺这步翻译
+        # 目录锚定必失败报「不在引擎可达的下载目录树内」——0.1.45.8
+        # 用户实测删任务重下三通道全灭暴露）；映射外 → 原样放行，
+        # 可达性交回设备侧目录树锚定判定——0.1.46 回归教训：本地容器
+        # 挂载 ≠ 远程设备文件系统，硬拦会误杀设备原生可见的路径（用户
+        # /vol00 外置盘实测被误挡、回滚 0.1.45 即正常）；真不可达时
+        # drive_core 自会报错并给可操作指引。查不到容器 → 同样放行
+        # 靠目录表锚定（群晖套件/自建容器）。
         if d.startswith("/"):
-            mapped, note = xunlei_docker.map_engine_dir(
+            mapped, _ = xunlei_docker.map_engine_dir(
                 d, xunlei_docker.container_mounts())
-            if mapped is None:
-                raise BackendError(f"保存目录 {d} 无效，已阻止下发。{note}")
-            if mapped != d:
+            if mapped is not None and mapped != d:
                 d = mapped
         return self.core.create_task(url, resource, target, directory=d)
 

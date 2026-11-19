@@ -1035,10 +1035,12 @@ class TestThunderEngine(unittest.TestCase):
 # ---------------------------------------------------------------- thunder cloud
 
 class TestThunderCloudDirMap(unittest.TestCase):
-    """P2SP 通道目录映射（0.1.45.8 用户实测删任务重下三通道全灭）：
+    """P2SP 通道目录映射（0.1.45.8 补翻译 / 0.1.47 修误挡）：
     宿主路径 → 容器路径翻译此前只有本地直连通道有，P2SP 缺这步——
     用户填 /vol1/1000/movie（NAS 宿主路径）目录锚定必失败报
-    「不在引擎可达的下载目录树内」。补齐后与本地直连同款语义。"""
+    「不在引擎可达的下载目录树内」。翻译与本地直连同款；但映射外
+    **不**硬拦（0.1.46 回归教训：本地容器挂载 ≠ 远程设备文件系统，
+    硬拦误杀设备原生可见路径），原样放行交设备侧目录树锚定判定。"""
 
     MOUNTS = [{"Source": "/vol1/1000", "Destination": "/downloads"}]
 
@@ -1062,17 +1064,17 @@ class TestThunderCloudDirMap(unittest.TestCase):
         self.assertEqual(tid, "t-1")
         self.assertEqual(captured.get("directory"), "/downloads/movie")
 
-    def test_add_blocks_unmapped_dir(self):
-        """映射外路径 → 明确报错阻止无效下发，不建任务。"""
+    def test_add_passthrough_unmapped_dir(self):
+        """映射外路径原样放行，可达性交回设备侧目录树锚定（0.1.47 修
+        0.1.46 回归：本地容器挂载 ≠ 远程设备文件系统，硬拦误杀设备
+        原生可见路径——用户 /vol00 外置盘实测被误挡、回滚 0.1.45 正常）。"""
         captured = {}
         tc = self._tc(captured)
         with mock.patch("xunlei_docker.container_mounts",
                         return_value=self.MOUNTS):
-            with self.assertRaises(BackendError) as ctx:
-                tc.add("magnet:?xt=urn:btih:aa", directory="/vol1/other")
-        self.assertIn("阻止下发", str(ctx.exception))
-        self.assertIn("未映射进迅雷容器", str(ctx.exception))
-        self.assertNotIn("task", captured)          # 未走到 create_task
+            tid = tc.add("magnet:?xt=urn:btih:aa", directory="/vol1/other")
+        self.assertEqual(tid, "t-1")
+        self.assertEqual(captured.get("directory"), "/vol1/other")
 
     def test_add_skips_validation_without_mounts(self):
         """查不到容器挂载 → 跳过校验、原样传递（群晖套件/自建容器）。"""
