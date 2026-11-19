@@ -29,6 +29,19 @@
       "is_docker": false,
       "service_port": "",
       "releases": {
+        "0.1.46": {
+          "changelog": "磁力任务真名全链贯通：解析加固（补齐 UDP tracker 支持、三路并行找 peer、解析等待 30 秒，弱网成功率显著提高），派发即用引擎解析真名命名任务与下载文件夹（不再被磁力兜底名覆盖），裸磁力解析成功后自动回填真名，迅雷侧任务显示名与磁盘文件/文件夹名同步随真名；下载进度与速度实时同步；删除任务弹窗二选一（仅删任务或连文件一起删）；迅雷远程通道保存目录宿主路径自动映射容器路径；更新内容展示尾附最近更新。",
+          "updated_at": "2026-11-19T16:05:00+08:00",
+          "os_min_version": "1.2.0",
+          "packages": {
+            "all": {
+              "download_url": "https://github.com/maglcal/fnmedia-dl/releases/download/main-v0.1.46/fnmedia-dl-main-v0.1.46.fpk",
+              "sha256": "46c056a4e88eaacce7aec3594a32037eaf2bb249beae457821df5637fd63ff41",
+              "size": 26605875,
+              "updated_at": "2026-11-19T16:05:00+08:00"
+            }
+          }
+        },
         "0.1.45": {
           "changelog": "磁力真名显示：无文件名的裸磁力链接自动联网解析真实名称（DHT 与 tracker 双通道找 peer、按信息哈希核对后取种子名），解析结果与任务名显示真实剧集/文件名，失败保留原显示不阻塞流程。",
           "updated_at": "2026-11-18T16:32:00+08:00",

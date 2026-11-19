@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 
 from backends import Backend, BackendError, build_backends
-from backends.base import TaskView
+from backends.base import TaskView, is_fallback_name
 from config import STATE_DIR
 import config as cfgmod
 import filelock
@@ -114,6 +114,15 @@ class DownloadManager:
     # 裸磁力任务名在派发瞬间可能只有兜底显示（解析未完成/瞬时失败）——
     # 解析出真名后回写任务记录，任务列表名随真名走。
 
+    @staticmethod
+    def _is_fallback_name(name: str, url: str) -> bool:
+        """兜底任务名判定（调度回填/启动回填/合并显示三处共用）。
+
+        委托共享判定 backends.base.is_fallback_name——与 add 层
+        「兜底名不覆盖引擎解析真名」（0.1.45.9）同一套语义：
+        兜底形态两种，磁力短名 `magnet:xxxxxxxx…` 与截断链接 `url[:80]`。"""
+        return is_fallback_name(name, url)
+
     def _rename_record(self, backend: str, task_id: str,
                        fallback: str, new_name: str) -> bool:
         """真名回写：仅当记录名仍是派发时的兜底名才替换（防覆盖并发改名）。"""
@@ -152,6 +161,19 @@ class DownloadManager:
                 break
         if name and name != fallback:
             self._rename_record(backend, task_id, fallback, name)
+            self._rename_engine_task(backend, task_id, name)
+
+    def _rename_engine_task(self, backend: str, task_id: str,
+                            name: str) -> None:
+        """引擎侧同步改名（0.1.45.7）：任务名 + 磁盘文件/文件夹名随真名——
+        只改本地记录的话，迅雷里的任务与下载文件夹还是派发瞬间的兜底名。
+        失败静默（显示层已修，引擎改名是尽力而为）。"""
+        try:
+            impl = self.backends().get(backend)
+            if impl:
+                impl.rename_task(task_id, name)
+        except Exception:  # noqa: BLE001 - 引擎改名失败不阻断主流程
+            pass
 
     def _schedule_true_name(self, link, backend: str, task_id: str,
                             fallback: str) -> None:
@@ -162,7 +184,7 @@ class DownloadManager:
         if not str(meta.get("infohash") or ""):
             return
         url = getattr(link, "url", "") or ""
-        if not (fallback.startswith("magnet:") or fallback == url[:80]):
+        if not self._is_fallback_name(fallback, url):
             return                        # 已是真名（缓存命中/自带 dn），不回填
         threading.Thread(target=self._resolve_and_rename,
                          args=(link, backend, task_id, fallback),
@@ -180,15 +202,37 @@ class DownloadManager:
             name = str(r.get("name") or "")
             if not url.lower().startswith("magnet:"):
                 continue
-            if not (name.startswith("magnet:") or name == url[:80]):
+            if not DownloadManager._is_fallback_name(name, url):
                 continue
             out.append((str(r.get("backend")), str(r.get("id")), name, url))
         return out
 
+    @staticmethod
+    def _engine_rename_candidates(records: list[dict],
+                                  limit: int = 50) -> list[tuple]:
+        """启动清尾候选：磁力记录名已是真名、但引擎侧（迅雷任务/文件夹名）
+        可能还残留派发瞬间兜底名的——直接引擎改名，无需重新解析。
+        rename_task 自带引擎侧兜底名守卫，引擎已改过则不动。"""
+        out: list[tuple] = []
+        for r in records:
+            if len(out) >= limit:
+                break
+            url = str(r.get("url") or "")
+            name = str(r.get("name") or "")
+            if not url.lower().startswith("magnet:"):
+                continue
+            if DownloadManager._is_fallback_name(name, url):
+                continue     # 连真名都还没有的走解析回填路径
+            out.append((str(r.get("backend")), str(r.get("id")), name))
+        return out
+
     def bootstrap_magnet_names(self, limit: int = 50) -> int:
         """启动回填：既往裸磁力任务名仍是兜底显示的，后台解析真名回写
-        （升级重启后旧任务也享受真名显示；用户/上游改过的名字不碰）。"""
-        todo = self._backfill_candidates(self._load_records(), limit)
+        （升级重启后旧任务也享受真名显示；用户/上游改过的名字不碰）。
+        0.1.45.7 加清尾：记录已是真名但引擎侧还是兜底名的，直接引擎改名
+        （修复迅雷里任务/文件夹名残留 magnet:xxxxxxxx… 的存量问题）。"""
+        records = self._load_records()
+        todo = self._backfill_candidates(records, limit)
         for backend, task_id, fallback, url in todo:
             found = linksmod.parse_text(url)
             if not found:
@@ -196,7 +240,12 @@ class DownloadManager:
             threading.Thread(target=self._resolve_and_rename,
                              args=(found[0], backend, task_id, fallback),
                              daemon=True, name="magnet-rename").start()
-        return len(todo)
+        stale = self._engine_rename_candidates(records, limit)
+        for backend, task_id, name in stale:
+            threading.Thread(target=self._rename_engine_task,
+                             args=(backend, task_id, name),
+                             daemon=True, name="magnet-rename").start()
+        return len(todo) + len(stale)
 
     # ------------------------------------------------------------ 派发
 
@@ -333,6 +382,14 @@ class DownloadManager:
                 item = dict(live[k])
                 item["url"] = item.get("url") or rec.get("url", "")
                 item["created_at"] = rec.get("created_at")
+                # 真名显示（0.1.45.6 修）：真名回填只写本地记录，合并若只认
+                # 引擎侧名（派发瞬间定格的兜底名）则真名永远上不了屏——
+                # 引擎名仍是兜底名而记录已是真名时以记录为准；
+                # 引擎侧真实改名（非兜底名）始终优先。
+                if (self._is_fallback_name(item.get("name"), item.get("url"))
+                        and not self._is_fallback_name(rec.get("name"),
+                                                       rec.get("url"))):
+                    item["name"] = rec.get("name")
                 seen.add(k)
             else:
                 item = {"backend": rec.get("backend"), "id": str(rec.get("id")),

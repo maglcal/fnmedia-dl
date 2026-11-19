@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -30,6 +31,7 @@ class FakeBackend(Backend):
         self.resumed = []
         self.deleted = []
         self.deleted_with_files = []
+        self.renamed = []
 
     def status(self):
         return {"configured": True, "reachable": self._reachable,
@@ -52,6 +54,10 @@ class FakeBackend(Backend):
     def delete(self, tid, *, with_files=False):
         self.deleted.append(tid)
         self.deleted_with_files.append(with_files)
+
+    def rename_task(self, tid, name):
+        self.renamed.append((tid, name))
+        return True
 
 
 class DispatchTestBase(unittest.TestCase):
@@ -146,6 +152,52 @@ class TestUnifiedTasks(DispatchTestBase):
         mgr = self.manager({"aria2": bad})
         _, errors = mgr.unified_tasks()
         self.assertIn("aria2", errors)
+
+    def test_true_name_record_beats_fallback_live_name(self):
+        """真名显示回归钉（0.1.45.6）：真名回填只写本地记录，合并必须让
+        记录真名盖过引擎侧兜底名——旧合并只认引擎名，回填永远上不了屏。"""
+        url = "magnet:?xt=urn:btih:" + "a" * 40
+        fallback = "magnet:aaaaaaaa…"
+        live = [TaskView(backend="aria2", id="g1", name=fallback,
+                         state="running", progress=10, url=url)]
+        mgr = self.manager({"aria2": FakeBackend("aria2", "aria2", tasks=live)})
+        mgr._record("aria2", "g1", url, fallback, "")
+        self.assertTrue(
+            mgr._rename_record("aria2", "g1", fallback, "真名.S01E01"))
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(tasks[0]["name"], "真名.S01E01")
+
+    def test_engine_real_name_wins_over_record(self):
+        """引擎侧真实改名（非兜底名）始终优先于本地记录。"""
+        url = "magnet:?xt=urn:btih:" + "b" * 40
+        fallback = "magnet:bbbbbbbb…"
+        live = [TaskView(backend="aria2", id="g1", name="引擎改的名",
+                         state="running", progress=10, url=url)]
+        mgr = self.manager({"aria2": FakeBackend("aria2", "aria2", tasks=live)})
+        mgr._record("aria2", "g1", url, fallback, "")
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(tasks[0]["name"], "引擎改的名")
+
+    def test_both_fallback_keeps_live_name(self):
+        """真名还没解析出来（双方都是兜底名）→ 维持显示不误换。"""
+        url = "magnet:?xt=urn:btih:" + "c" * 40
+        fallback = "magnet:cccccccc…"
+        live = [TaskView(backend="aria2", id="g1", name=fallback,
+                         state="running", progress=10, url=url)]
+        mgr = self.manager({"aria2": FakeBackend("aria2", "aria2", tasks=live)})
+        mgr._record("aria2", "g1", url, fallback, "")
+        tasks, _ = mgr.unified_tasks()
+        self.assertEqual(tasks[0]["name"], fallback)
+
+    def test_is_fallback_name_shapes(self):
+        """兜底名两形态：磁力短名 / 截断链接名；其余为真名。"""
+        url = "https://x/" + "d" * 100
+        self.assertTrue(downloader.DownloadManager._is_fallback_name(
+            "magnet:300529cf…", "magnet:?xt=urn:btih:300529cf" + "0" * 32))
+        self.assertTrue(downloader.DownloadManager._is_fallback_name(
+            url[:80], url))
+        self.assertFalse(downloader.DownloadManager._is_fallback_name(
+            "真名.S01E01.1080p", url))
 
     def test_same_task_on_two_backends_single_row(self):
         """同一底层任务被两个通道各列一行时合并为一行（回归）。
@@ -522,6 +574,79 @@ class TestMagnetTrueName(DispatchTestBase):
         ]
         out = downloader.DownloadManager._backfill_candidates(recs)
         self.assertEqual([c[1] for c in out], ["1", "4"])
+
+    # ---- 引擎侧同步改名（0.1.45.7，修迅雷里任务/文件夹名残留兜底名）----
+
+    def test_resolve_and_rename_renames_engine(self):
+        """真名解析成功后不只回写记录——同步改引擎侧任务名。"""
+        good = FakeBackend("thunder_engine", "引擎")
+        mgr = self.manager({"thunder_engine": good})
+        mgr._record("thunder_engine", "t2", f"magnet:?xt=urn:btih:{self.IH}",
+                    f"magnet:{self.IH[:8]}…", "")
+        orig = magnetmeta.resolve_name
+        magnetmeta.resolve_name = \
+            lambda ih, timeout=0, trackers=None: "嫁金钗[全30集]"
+        try:
+            mgr._resolve_and_rename(self._bare_link(), "thunder_engine", "t2",
+                                    f"magnet:{self.IH[:8]}…", attempts=1)
+        finally:
+            magnetmeta.resolve_name = orig
+        self.assertEqual(good.renamed, [("t2", "嫁金钗[全30集]")])
+
+    def test_rename_engine_task_silent_on_error(self):
+        """引擎改名失败（通道缺实现/抛异常）静默，不阻断主流程。"""
+        mgr = self.manager({})
+        self.assertIsNone(
+            mgr._rename_engine_task("thunder_engine", "t1", "真名"))
+
+        class Boom(FakeBackend):
+            def rename_task(self, tid, name):
+                raise RuntimeError("boom")
+
+        mgr2 = self.manager({"thunder_engine": Boom("thunder_engine", "引擎")})
+        self.assertIsNone(
+            mgr2._rename_engine_task("thunder_engine", "t1", "真名"))
+
+    def test_engine_rename_candidates_only_true_name_magnets(self):
+        """清尾候选只选「记录已是真名」的磁力任务（引擎侧可能残留兜底名）；
+        还没真名的走解析回填路径，非磁力不碰。"""
+        recs = [
+            {"backend": "thunder_engine", "id": "1",
+             "url": f"magnet:?xt=urn:btih:{self.IH}", "name": "已有真名"},
+            {"backend": "thunder_engine", "id": "2",
+             "url": f"magnet:?xt=urn:btih:{self.IH}",
+             "name": f"magnet:{self.IH[:8]}…"},
+            {"backend": "thunder_engine", "id": "3",
+             "url": "https://x/a.bin", "name": "a.bin"},
+        ]
+        out = downloader.DownloadManager._engine_rename_candidates(recs)
+        self.assertEqual([c[1] for c in out], ["1"])
+        self.assertEqual(out[0][2], "已有真名")
+
+    def test_bootstrap_clear_tail_renames_engine(self):
+        """启动清尾：记录已是真名的磁力任务直接触发引擎改名
+        （升级重启后迅雷里的存量兜底文件夹名自动随真名）。"""
+        good = FakeBackend("thunder_engine", "引擎")
+        mgr = self.manager({"thunder_engine": good})
+        mgr._record("thunder_engine", "t9", f"magnet:?xt=urn:btih:{self.IH}",
+                    "嫁金钗[全30集]", "")
+
+        class _Sync:
+            """线程同步替身：清尾线程内联执行，测试可确定断言。"""
+            def __init__(self, target=None, args=(), **_kw):
+                self._t, self._a = target, args
+
+            def start(self):
+                self._t(*self._a)
+
+        orig = downloader.threading
+        downloader.threading = types.SimpleNamespace(Thread=_Sync)
+        try:
+            n = mgr.bootstrap_magnet_names()
+        finally:
+            downloader.threading = orig
+        self.assertEqual(n, 1)
+        self.assertEqual(good.renamed, [("t9", "嫁金钗[全30集]")])
 
 
 if __name__ == "__main__":
