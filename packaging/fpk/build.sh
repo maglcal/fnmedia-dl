@@ -35,7 +35,7 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude='.git/' --exclude='dist/' --exclude='logs/' \
     --exclude='state/' --exclude='packaging/fpk/.build/' \
     --exclude='.tools/' --exclude='.playwright-cli/' --exclude='*.fpk' --exclude='.DS_Store' \
-    --exclude='tests/' \
+    --exclude='tests/' --exclude='.workbuddy/' \
     "${REPO_ROOT}/" "${STAGE}/app/repo/"
 else
   # 无 rsync 的环境（如 Windows Git Bash）：用 Python 等价复制
@@ -44,7 +44,8 @@ import shutil, sys
 from pathlib import Path
 src, dst = Path(sys.argv[1]), Path(sys.argv[2])
 EXCLUDE_DIRS = {".venv", "__pycache__", ".git", "dist", "logs", "state",
-                ".build", ".tools", ".playwright-cli", "tests", "node_modules"}
+                ".build", ".tools", ".playwright-cli", "tests", "node_modules",
+                ".workbuddy"}
 EXCLUDE_NAMES = {".DS_Store"}
 
 def ignore(directory, names):
