@@ -136,10 +136,11 @@ class TestQueueSchedule(QueueTestBase):
     def test_tick_runs_once_per_day(self):
         self.q.add(["https://x/a.iso"])
         self.q.set_settings(enabled=True, time_str="00:05")
-        results = self.q.tick(ok_dispatch)
+        # 钉死时刻（now 测试缝）：真实时钟在 00:00–00:05 窗口内会假失败
+        results = self.q.tick(ok_dispatch, now="23:55")
         self.assertEqual(len(results), 1)
         # 当天不再重复触发（last_run 已记录）
-        self.assertIsNone(self.q.tick(ok_dispatch))
+        self.assertIsNone(self.q.tick(ok_dispatch, now="23:56"))
 
     def test_tick_not_due(self):
         self.q.add(["https://x/a.iso"])

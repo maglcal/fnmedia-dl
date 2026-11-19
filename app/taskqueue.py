@@ -196,9 +196,12 @@ class TaskQueue:
         hhmm = now or time.strftime("%H:%M")
         return hhmm >= st["time"]
 
-    def tick(self, dispatch_fn) -> list[dict] | None:
-        """定时检查：到点则派发待发项并记录今日已跑；未到点返回 None。"""
-        if not self.should_run():
+    def tick(self, dispatch_fn, now: str | None = None) -> list[dict] | None:
+        """定时检查：到点则派发待发项并记录今日已跑；未到点返回 None。
+
+        now 同 should_run 的测试缝：不传用真实时钟（生产）；测试钉死时刻，
+        避开每日 00:00–排程点窗口里真实时钟抖动的假失败。"""
+        if not self.should_run(now):
             return None
         try:
             results = self.run_now(dispatch_fn)
