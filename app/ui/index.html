@@ -345,8 +345,9 @@
         <span class="hint">订阅 BT 站发布源，「立即检查」拉新条目，确认后手动派发下载</span>
       </div>
       <p class="hint">条目解析按 BEP 36 优先级（种子附件 → infoHash → 磁力链接 → 兜底提取），
-        新条目经过去重（同一资源只出现一次，与全局下载历史联动查重）与过滤规则后入库，
-        点「派发」才创建下载任务。当前版本为手动模式，暂不自动轮询与自动下载。</p>
+        新条目经过去重（同一资源只出现一次，与全局下载历史联动查重）与过滤规则后入库。
+        到点订阅每轮自动检查；开启「自动下载」的订阅命中条目自动派发
+        （单订阅每轮最多 3 条，失败自动重试 3 次后搁置），未开启的点「派发」手动创建任务。</p>
       <div class="form-grid">
         <label>订阅地址<span class="opt">RSS / Atom 源 URL</span>
           <input id="rssUrl" type="text" spellcheck="false"
@@ -370,8 +371,12 @@
           <input id="rssMustNot" type="text" spellcheck="false"
                  placeholder="CAM, TS（逗号分隔）">
         </label>
+        <label>轮询间隔<span class="opt">分钟，最短 10</span>
+          <input id="rssInterval" type="number" value="30" min="10" step="5">
+        </label>
       </div>
       <div class="row-inline dir-tools">
+        <label class="check"><input type="checkbox" id="rssAutoDl"><span>自动下载命中条目（关闭 = 仅入库待确认）</span></label>
         <label class="check"><input type="checkbox" id="rssRegex"><span>按正则匹配（进阶）</span></label>
       </div>
       <div class="actions">

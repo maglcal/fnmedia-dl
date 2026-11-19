@@ -319,6 +319,14 @@ class TestCrud(RssTestBase):
         with self.assertRaises(ValueError):
             self.feed.update(sub["id"], {"url": "notaurl"})
 
+    def test_update_auto_download(self):
+        sub = self.seed_sub()
+        self.assertFalse(sub["auto_download"])
+        out = self.feed.update(sub["id"], {"auto_download": True})
+        self.assertTrue(out["auto_download"])
+        out = self.feed.update(sub["id"], {"auto_download": False})
+        self.assertFalse(out["auto_download"])
+
     def test_update_missing_raises(self):
         with self.assertRaises(KeyError):
             self.feed.update("nosuch", {"name": "x"})
@@ -475,6 +483,30 @@ class TestCheck(RssTestBase):
         self.assertTrue(res["ok"])
         self.assertEqual(self.feed.snapshot()["subs"][0]["fail_count"], 0)
 
+    def test_manual_check_unsuspends(self):
+        """手动检查（manual=True）复位搁置：fail_count ≥ MAX_FAILS 后仍可手动
+        检查，且轮询恢复资格（fail_count 从 0 重新累计）。"""
+        sub = self.seed_sub()
+        bad = self.mock_client(status=500)
+        for _ in range(rssmod.MAX_FAILS):
+            self.feed.check(sub["id"], client=bad)
+        self.assertTrue(self.feed.snapshot()["subs"][0]["suspended"])
+        res = self.feed.check(sub["id"], client=bad, manual=True)
+        self.assertFalse(res["ok"])                      # 仍然失败
+        snap = self.feed.snapshot()["subs"][0]
+        self.assertEqual(snap["fail_count"], 1)          # 复位后重计（非 +1 到 6）
+        self.assertFalse(snap["suspended"])
+
+    def test_auto_check_does_not_unsuspend(self):
+        """定时（manual=False）检查不复位搁置——只有用户手动重试才复位。"""
+        sub = self.seed_sub()
+        bad = self.mock_client(status=500)
+        for _ in range(rssmod.MAX_FAILS):
+            self.feed.check(sub["id"], client=bad)
+        self.feed.check(sub["id"], client=bad)
+        self.assertEqual(self.feed.snapshot()["subs"][0]["fail_count"],
+                         rssmod.MAX_FAILS + 1)
+
 
 # ---------------------------------------------------------------- 派发
 
@@ -519,6 +551,19 @@ class TestDispatch(RssTestBase):
         self.assertEqual(self.feed.items(self.feed.snapshot()["subs"][0]["id"])[0]
                          ["state"], "dispatched")
 
+    def test_dispatch_failure_increments_retry_count(self):
+        """失败重试链计数：每次派发失败 retry_count++（自动重试上限的依据）。"""
+        item = self.seed_item()
+        fail = lambda u, d: {"ok": False, "error": "x"}   # noqa: E731
+        self.feed.dispatch_item(item["id"], fail)
+        self.feed.dispatch_item(item["id"], fail)
+        stored = self.feed.items(self.feed.snapshot()["subs"][0]["id"])[0]
+        self.assertEqual(stored["retry_count"], 2)
+        self.feed.dispatch_item(item["id"],
+                                lambda u, d: {"ok": True, "backend": "b"})
+        self.assertEqual(self.feed.items(self.feed.snapshot()["subs"][0]["id"])[0]
+                         ["state"], "dispatched")
+
     def test_dispatch_exception_marks_failed(self):
         item = self.seed_item()
 
@@ -541,6 +586,159 @@ class TestDispatch(RssTestBase):
     def test_dispatch_missing_raises(self):
         with self.assertRaises(KeyError):
             self.feed.dispatch_item("nosuch", lambda u, d: {"ok": True})
+
+
+# ---------------------------------------------------------------- 轮询（P2）
+
+class TestTick(RssTestBase):
+    """tick()：到点检查、搁置/停用跳过、auto_download 自动派发、
+    失败重试链、订阅间间隔、单飞撞车跳过。"""
+
+    def _set_sub(self, **fields):
+        with rssmod._FILE_LOCK:
+            data = self.feed._load()
+            data["subs"][0].update(fields)
+            self.feed._save(data)
+
+    def _get_item(self) -> dict:
+        sub_id = self.feed.snapshot()["subs"][0]["id"]
+        return self.feed.items(sub_id)[0]
+
+    @staticmethod
+    def _ok_fn(calls):
+        def fn(u, d):
+            calls.append((u, d))
+            return {"ok": True, "backend": "stub"}
+        return fn
+
+    @staticmethod
+    def _fail_fn(calls):
+        def fn(u, d):
+            calls.append((u, d))
+            return {"ok": False, "error": "boom"}
+        return fn
+
+    def test_tick_checks_due_sub(self):
+        """从未检查的订阅立即到点：tick 执行检查入库。"""
+        self.seed_sub()
+        cli = self.mock_client(body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))))
+        res = self.feed.tick(client=cli, sleep=lambda s: None)
+        self.assertEqual(res["checked"], 1)
+        self.assertEqual(res["dispatched"], 0)           # 无 dispatch_fn 不派发
+        self.assertEqual(len(self.feed.items(
+            self.feed.snapshot()["subs"][0]["id"])), 1)
+        self.assertTrue(self.feed.snapshot()["subs"][0]["last_check_ts"] > 0)
+
+    def test_tick_respects_interval(self):
+        """刚检查过的订阅未到点不重查；回拨 last_check_ts 后恢复到点。"""
+        self.seed_sub()                                  # interval_min=30
+        cap_list: list = []
+        cli = self.mock_client(
+            body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))),
+            capture=cap_list)
+        self.assertEqual(self.feed.tick(client=cli)["checked"], 1)
+        self.assertEqual(self.feed.tick(client=cli)["checked"], 0)
+        self.assertEqual(len(cap_list), 1)               # 未到点连请求都不发
+        self._set_sub(last_check_ts=0)
+        self.assertEqual(self.feed.tick(client=cli)["checked"], 1)
+        self.assertEqual(len(cap_list), 2)
+
+    def test_tick_skips_disabled(self):
+        sub = self.seed_sub()
+        self.feed.update(sub["id"], {"enabled": False})
+        cli = self.mock_client(
+            body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))), capture=[])
+        res = self.feed.tick(client=cli)
+        self.assertEqual(res["checked"], 0)
+
+    def test_tick_skips_suspended(self):
+        """fail_count ≥ MAX_FAILS 搁置：定时轮询跳过（手动检查不受限）。"""
+        self.seed_sub()
+        self._set_sub(fail_count=rssmod.MAX_FAILS)
+        cli = self.mock_client(
+            body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))), capture=[])
+        res = self.feed.tick(client=cli)
+        self.assertEqual(res["checked"], 0)
+
+    def test_tick_auto_dispatch(self):
+        """auto_download 开：同轮检查入库的 matched 条目自动派发。"""
+        self.seed_sub(auto_download=True)
+        calls: list = []
+        cli = self.mock_client(body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))))
+        res = self.feed.tick(self._ok_fn(calls), client=cli)
+        self.assertEqual(res["checked"], 1)
+        self.assertEqual(res["dispatched"], 1)
+        self.assertEqual(calls, [(magnet(IH_A), None)])
+        self.assertEqual(self._get_item()["state"], "dispatched")
+
+    def test_tick_auto_dispatch_disabled_sub_noop(self):
+        """auto_download 关（默认）：matched 只入库不自动派发。"""
+        self.seed_sub()
+        calls: list = []
+        cli = self.mock_client(body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))))
+        res = self.feed.tick(self._ok_fn(calls), client=cli)
+        self.assertEqual(res["dispatched"], 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(self._get_item()["state"], "matched")
+
+    def test_tick_auto_dispatch_cap(self):
+        """单订阅每轮上限：超量条目留下轮，FIFO 按入库顺序清空。"""
+        self.seed_sub(auto_download=True)
+        entries = "".join(entry_link(f"g{i}", f"t{i}", magnet(f"{i:x}" * 40))
+                          for i in range(5))
+        cli = self.mock_client(body=rss_wrap(entries))
+        calls: list = []
+        with mock.patch.object(rssmod, "MAX_AUTO_DISPATCH", 2):
+            res = self.feed.tick(self._ok_fn(calls), client=cli)
+            self.assertEqual(res["dispatched"], 2)
+            res = self.feed.tick(self._ok_fn(calls), client=cli)
+            self.assertEqual(res["dispatched"], 2)
+            res = self.feed.tick(self._ok_fn(calls), client=cli)
+            self.assertEqual(res["dispatched"], 1)
+        self.assertEqual(len(calls), 5)
+        sub_id = self.feed.snapshot()["subs"][0]["id"]
+        states = [i["state"] for i in self.feed.items(sub_id)]
+        self.assertEqual(states.count("dispatched"), 5)
+
+    def test_tick_retry_chain(self):
+        """失败重试链：自动重试至 MAX_DISPATCH_RETRY 次后搁置待手动。"""
+        self.seed_sub(auto_download=True)
+        calls: list = []
+        cli = self.mock_client(body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))))
+        self.feed.tick(self._fail_fn(calls), client=cli)
+        for _ in range(rssmod.MAX_DISPATCH_RETRY):
+            self.feed.tick(self._fail_fn(calls), client=cli)
+        self.assertEqual(len(calls), rssmod.MAX_DISPATCH_RETRY)
+        item = self._get_item()
+        self.assertEqual(item["state"], "failed")
+        self.assertEqual(item["retry_count"], rssmod.MAX_DISPATCH_RETRY)
+        self.feed.tick(self._fail_fn(calls), client=cli)   # 超限不再自动重试
+        self.assertEqual(len(calls), rssmod.MAX_DISPATCH_RETRY)
+        # 手动派发不受自动重试上限约束（显式用户意图）
+        res = self.feed.dispatch_item(item["id"],
+                                      lambda u, d: {"ok": True, "backend": "b"})
+        self.assertTrue(res["ok"])
+
+    def test_tick_sub_gap_between_checks(self):
+        """订阅间 TICK_SUB_GAP 间隔防对端限流（N 个订阅查 N-1 次间隔）。"""
+        self.seed_sub()
+        self.seed_sub()
+        cli = self.mock_client(body=b"<rss><channel/></rss>")
+        sleeps: list = []
+        res = self.feed.tick(client=cli, sleep=sleeps.append)
+        self.assertEqual(res["checked"], 2)
+        self.assertEqual(sleeps, [rssmod.TICK_SUB_GAP])
+
+    def test_tick_single_flight_skips(self):
+        """手动检查进行中：tick 跳过本轮不报错不中断。"""
+        self.seed_sub()
+        cli = self.mock_client(body=b"<rss><channel/></rss>")
+        self.assertTrue(rssmod._CHECK_GUARD.acquire(blocking=False))
+        try:
+            res = self.feed.tick(client=cli, sleep=lambda s: None)
+        finally:
+            rssmod._CHECK_GUARD.release()
+        self.assertEqual(res["checked"], 0)
 
 
 # ---------------------------------------------------------------- API

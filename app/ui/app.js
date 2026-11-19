@@ -1679,9 +1679,10 @@ on("#upNowBtn", "click", async () => {
   }, 1000);
 });
 
-/* ---------------- RSS 订阅（P1 手动闭环） ----------------
-   订阅 CRUD + 立即检查 + 条目预览 + 手动派发；样式复用任务表/链接列表。
-   P1 无定时轮询：检查与派发全靠手动按钮，条目经去重过滤后待确认。 */
+/* ---------------- RSS 订阅（P2 自动化） ----------------
+   订阅 CRUD + 立即检查 + 条目预览 + 手动派发 + 自动下载开关。
+   后台 rss-ticker 定时轮询到点订阅；auto_download 开的订阅命中条目自动
+   派发（每轮限量 + 失败重试限量），关的走手动确认。 */
 const RSS_STATE_BADGE = {
   new: `<span class="result-warn">待确认</span>`,
   matched: `<span class="result-warn">待确认</span>`,
@@ -1723,10 +1724,12 @@ function renderRssSubs(subs) {
       <span class="link-name">
         ${esc(s.name || s.url)}
         ${s.enabled ? "" : `<span class="tag">已停用</span>`}
+        ${s.auto_download ? `<span class="tag">自动下载</span>` : ""}
         ${s.suspended ? `<span class="tag warn">连续失败已搁置</span>` : ""}
         <div class="link-reason">${esc(s.url)}</div>
         <div class="link-reason">
           上次检查：${esc(s.last_check || "从未")}
+          · 轮询间隔 ${s.interval_min} 分钟
           · 条目 ${s.items_count}（待确认 ${s.matched_count}）
           ${rules.length ? " · 规则：" + esc(rules.join(" / ")) : ""}
           ${s.last_error ? ` · <span class="result-fail">${esc(s.last_error)}</span>` : ""}
@@ -1735,6 +1738,8 @@ function renderRssSubs(subs) {
       <button class="btn" data-rss="check" data-id="${esc(s.id)}">立即检查</button>
       <button class="btn ghost" data-rss="items" data-id="${esc(s.id)}"
               data-name="${esc(s.name || s.url)}">条目</button>
+      <button class="btn ghost" data-rss="auto" data-id="${esc(s.id)}"
+              data-auto="${s.auto_download ? "1" : "0"}">自动下载${s.auto_download ? "：开" : "：关"}</button>
       <button class="btn ghost" data-rss="toggle" data-id="${esc(s.id)}"
               data-enabled="${s.enabled ? "1" : "0"}">${s.enabled ? "停用" : "启用"}</button>
       <button class="btn danger" data-rss="del" data-id="${esc(s.id)}"
@@ -1765,6 +1770,14 @@ function renderRssSubs(subs) {
         }
       } else if (rss === "items") {
         openRssItems(id, name);
+      } else if (rss === "auto") {
+        try {
+          await API.send(`/api/rss/subs/${encodeURIComponent(id)}`, "PUT",
+            { auto_download: btn.dataset.auto !== "1" });
+          loadRss();
+        } catch (e) {
+          toast("操作失败：" + e.message);
+        }
       } else if (rss === "toggle") {
         try {
           await API.send(`/api/rss/subs/${encodeURIComponent(id)}`, "PUT",
@@ -1795,6 +1808,8 @@ on("#btnRssAdd", "click", async () => {
     url,
     name: $("#rssName").value.trim(),
     directory: $("#rssDir").value.trim(),
+    interval_min: parseInt($("#rssInterval").value, 10) || 30,
+    auto_download: $("#rssAutoDl").checked,
     filter: {
       must: rssKwList($("#rssMust").value),
       must_not: rssKwList($("#rssMustNot").value),
@@ -1805,7 +1820,7 @@ on("#btnRssAdd", "click", async () => {
   btn.disabled = true;
   try {
     await API.send("/api/rss/subs", "POST", body);
-    toast("✓ 已添加订阅，点「立即检查」拉取条目");
+    toast("✓ 已添加订阅，到点自动检查；也可点「立即检查」立即拉取");
     $("#rssUrl").value = "";
     $("#rssName").value = "";
     loadRss();

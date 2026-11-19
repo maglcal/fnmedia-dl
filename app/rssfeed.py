@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""RSS 订阅（P1 手动闭环）：订阅 CRUD、条目拉取解析、过滤去重、手动派发。
+"""RSS 订阅（P2 自动化）：订阅 CRUD、条目拉取解析、过滤去重、手动/自动派发。
 
 数据文件 state/rss.json（文件锁短临界区同 taskqueue 口径）：
   {"subs":  [{"id","name","url","enabled","interval_min","auto_download",
               "directory","filter","etag","last_modified",
-              "last_check","last_error","fail_count"}],
+              "last_check","last_check_ts","last_error","fail_count"}],
    "items": {sub_id: [{"id","guid","identity","title","url","size",
-                       "state","first_seen","last_result"}]},
+                       "state","retry_count","first_seen","last_result"}]},
    "seen":  {fingerprint: ts}}        # 条目去重指纹，30 天滚动清理
 
 条目解析（BEP 36 优先级链，Torrent RSS feeds 事实标准）：
@@ -24,12 +24,16 @@
 过滤（qBittorrent 三轴）：must_not 一票否决 → must 任一命中（空 = 全过）
   → 大小阈值（feed 提供大小时才生效）；regex 模式限长 512 字符（ReDoS 自担）。
 
-P1 仅手动闭环：check() 只拉取-解析-去重-过滤-入库，**不做定时轮询**，
-auto_download 字段先落库预留（P2 自动化用）；「立即检查」永远可用——
-fail_count ≥ MAX_FAILS 只搁置 P2 的定时轮询，不拦手动检查（手动重试即复位）。
+P2 自动化：tick() 定时轮询（main.py rss-ticker 每 60s 驱动）——到点订阅
+  检查 + auto_download 自动派发（matched 与未超限 failed 条目 FIFO 派发，
+  单订阅每轮至多 MAX_AUTO_DISPATCH 条前置节流；失败 retry_count++，超
+  MAX_DISPATCH_RETRY 次搁置待手动，不永久卡死）；订阅间 TICK_SUB_GAP 间隔
+  防对端限流。「立即检查」永远可用——fail_count ≥ MAX_FAILS 只搁置定时
+  轮询，不拦手动检查（手动检查即复位搁置，轮询恢复资格）。
 
-条目 state 取值：new（入库瞬态）→ matched（过滤命中，待手动派发）/
-  skipped（过滤排除 / 历史已有同资源）/ dispatched（已派发）/ failed（派发失败）。
+条目 state 取值：new（入库瞬态）→ matched（过滤命中，待派发）/
+  skipped（过滤排除 / 历史已有同资源）/ dispatched（已派发）/ failed
+  （派发失败，retry_count 记自动重试次数）。
 
 注意：文件名不能叫 queue.py——app 目录在 sys.path 首位，会遮蔽标准库
 queue 模块把 threading/anyio 等依赖带崩。
@@ -51,16 +55,20 @@ import filelock
 import links as linksmod
 
 _FILE_LOCK = threading.Lock()
-_CHECK_GUARD = threading.Lock()      # 检查单飞：手动检查与未来轮询不并发
+_CHECK_GUARD = threading.Lock()      # 检查单飞：手动检查与定时轮询不并发
 
 DEFAULT_FEED_TIMEOUT = 15.0          # 单次拉取超时（秒）
 MAX_FEED_BYTES = 2 * 1024 * 1024     # feed 体积极限 2MB（防恶意大包）
 MAX_FEED_ITEMS = 500                 # 单次解析条目极顶
 MAX_ITEMS_PER_SUB = 500              # 每订阅条目留存量（旧条目滚动丢弃）
-MAX_FAILS = 5                        # 连续失败次数上限（P2 轮询搁置阈值）
+MAX_FAILS = 5                        # 连续失败次数上限（定时轮询搁置阈值）
 SEEN_TTL = 30 * 86400                # seen 指纹缓存滚动窗口（秒）
 REGEX_MAX_LEN = 512                  # 正则规则长度上限（ReDoS 防护）
-MIN_INTERVAL_MIN = 10                # 轮询间隔下限（分钟，P2 生效）
+MIN_INTERVAL_MIN = 10                # 轮询间隔下限（分钟）
+TICK_INTERVAL_SEC = 60               # rss-ticker 醒转间隔（秒）
+TICK_SUB_GAP = 0.5                   # 订阅间请求间隔（秒，防对端限流）
+MAX_AUTO_DISPATCH = 3                # 单订阅每轮自动派发上限（前置节流）
+MAX_DISPATCH_RETRY = 3               # 自动派发失败重试上限（超限搁置待手动）
 
 _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^\s\"'<>]*")
 _TORRENT_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.torrent", re.I)
@@ -313,6 +321,7 @@ class RssFeed:
             data = self._load()
             sub = self._find(data, sub_id)
             sub["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            sub["last_check_ts"] = int(time.time())
             if ok:
                 sub["fail_count"] = 0
                 sub["last_error"] = ""
@@ -339,7 +348,8 @@ class RssFeed:
             "directory": (directory or "").strip(),
             "filter": _norm_filter(flt),
             "etag": "", "last_modified": "",
-            "last_check": "", "last_error": "", "fail_count": 0,
+            "last_check": "", "last_check_ts": 0,
+            "last_error": "", "fail_count": 0,
         }
         with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
@@ -442,11 +452,13 @@ class RssFeed:
             return {"status": "error", "error": f"订阅源拉取失败：{exc}"}
 
     def check(self, sub_id: str, *, client: httpx.Client | None = None,
-              history_check=None) -> dict:
-        """立即检查：拉取 → 解析 → 三层去重 → 过滤 → 入库（不派发）。
+              history_check=None, manual: bool = False) -> dict:
+        """立即/定时检查：拉取 → 解析 → 三层去重 → 过滤 → 入库（不派发）。
 
         history_check(url) → {"downloaded": bool}（资源级查重，API 层注入
         downloader.history_check）；None = 跳过该层（测试/离线）。
+        manual=True（「立即检查」按钮）：搁置订阅复位 fail_count，轮询恢复
+        资格——手动重试即复位。
         并发语义（同 taskqueue O3）：网络段不持文件锁，入库回写短临界区；
         检查整体单飞，撞车直接报错不排队。"""
         if not _CHECK_GUARD.acquire(blocking=False):
@@ -455,6 +467,11 @@ class RssFeed:
             with _FILE_LOCK:
                 data = self._load()
                 sub = dict(self._find(data, sub_id))
+            if manual and int(sub.get("fail_count") or 0) >= MAX_FAILS:
+                with _FILE_LOCK, filelock.locked(self.path):
+                    data = self._load()
+                    self._find(data, sub_id)["fail_count"] = 0
+                    self._save(data)
             cli = client or httpx.Client(trust_env=False)
             try:
                 fetched = self._fetch(sub, cli)
@@ -503,6 +520,7 @@ class RssFeed:
                         "url": raw.get("url") or "",
                         "size": int(raw.get("size") or 0),
                         "state": "new",
+                        "retry_count": 0,
                         "first_seen": now,
                         "last_result": "",
                     }
@@ -529,6 +547,7 @@ class RssFeed:
                 sub["last_modified"] = (fetched.get("last_modified")
                                         or sub.get("last_modified") or "")
                 sub["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                sub["last_check_ts"] = now
                 sub["fail_count"] = 0
                 sub["last_error"] = ""
                 self._prune_seen(data, now)
@@ -570,6 +589,80 @@ class RssFeed:
                 item["last_result"] = str(res.get("backend") or "")
             else:
                 item["state"] = "failed"
+                item["retry_count"] = int(item.get("retry_count") or 0) + 1
                 item["last_result"] = str(res.get("error") or "派发失败")[:200]
             self._save(data)
         return res
+
+    # ------------------------------------------------------------ 轮询（P2）
+
+    @staticmethod
+    def _due(sub: dict, now: int) -> bool:
+        """到点判定：从未检查（含旧版无 last_check_ts 的订阅）或距上次检查
+        已达 interval_min。"""
+        ts = int(sub.get("last_check_ts") or 0)
+        return now - ts >= int(sub.get("interval_min") or 30) * 60
+
+    def _auto_dispatch_round(self, dispatch_fn) -> dict:
+        """auto_download 订阅的自动派发：matched + 未超重试上限的 failed 条目，
+        FIFO（先入先出，积压按到货顺序清空），单订阅每轮至多 MAX_AUTO_DISPATCH
+        条（前置节流，防一次涌入大量任务）。"""
+        dispatched = failed = 0
+        if dispatch_fn is None:
+            return {"dispatched": 0, "failed": 0}
+        with _FILE_LOCK:
+            data = self._load()
+            targets: list[str] = []
+            for sub in data["subs"]:
+                if not (sub.get("enabled") and sub.get("auto_download")):
+                    continue
+                lst = data["items"].get(sub.get("id"), [])
+                cand = [it for it in lst
+                        if it.get("state") == "matched"
+                        or (it.get("state") == "failed"
+                            and int(it.get("retry_count") or 0)
+                            < MAX_DISPATCH_RETRY)]
+                cand.sort(key=lambda it: int(it.get("first_seen") or 0))
+                targets.extend(it["id"] for it in cand[:MAX_AUTO_DISPATCH])
+        for item_id in targets:
+            res = self.dispatch_item(item_id, dispatch_fn)
+            if res.get("ok"):
+                dispatched += 1
+            else:
+                failed += 1
+        return {"dispatched": dispatched, "failed": failed}
+
+    def tick(self, dispatch_fn=None, history_check=None,
+             client: httpx.Client | None = None, sleep=time.sleep) -> dict:
+        """定时轮询一轮（rss-ticker 每 TICK_INTERVAL_SEC 驱动）：
+
+        ① 到点检查：enabled 且未搁置（fail_count < MAX_FAILS）且距上次检查
+        ≥ interval_min 的订阅各查一次，订阅间 sleep TICK_SUB_GAP 防对端限流；
+        ② 自动派发：auto_download 订阅按 _auto_dispatch_round 清理积压。
+        单飞撞车（手动检查进行中）跳过本轮不报错；检查失败只记订阅状态不中断
+        后续订阅。返回 {checked, dispatched, failed} 汇总。"""
+        now = int(time.time())
+        with _FILE_LOCK:
+            data = self._load()
+            due = [dict(s) for s in data["subs"]
+                   if s.get("enabled")
+                   and int(s.get("fail_count") or 0) < MAX_FAILS
+                   and self._due(s, now)]
+        cli = client or httpx.Client(trust_env=False)
+        checked = 0
+        try:
+            for i, sub in enumerate(due):
+                if i:
+                    sleep(TICK_SUB_GAP)      # 订阅间间隔：防对端限流
+                try:
+                    self.check(sub["id"], client=cli,
+                               history_check=history_check)
+                    checked += 1
+                except (RuntimeError, KeyError):
+                    continue                 # 单飞撞车 / 订阅刚被删：跳过
+        finally:
+            if client is None:
+                cli.close()
+        stats = self._auto_dispatch_round(dispatch_fn)
+        return {"checked": checked,
+                "dispatched": stats["dispatched"], "failed": stats["failed"]}

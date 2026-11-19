@@ -35,7 +35,7 @@
   DELETE /api/queue/{id}     移除队列项
   POST /api/queue/run        立即派发全部待发项
   POST /api/queue/settings   每日定时派发设置
-  GET  /api/rss/subs                    RSS 订阅列表（P1 手动闭环）
+  GET  /api/rss/subs                    RSS 订阅列表（P2 自动化）
   POST /api/rss/subs                    新增订阅
   PUT  /api/rss/subs/{id}               更新订阅
   DELETE /api/rss/subs/{id}             删除订阅（连同条目）
@@ -1019,10 +1019,10 @@ def queue_settings(req: QueueSettingsReq):
     return {"ok": True, **q.snapshot()}
 
 
-# ------------------------------------------------------------ RSS 订阅（P1 手动闭环）
-# 订阅 CRUD + 立即检查 + 条目预览 + 手动派发；P1 无定时轮询（P2 上 rss-ticker）。
-# 写操作鉴权由 _admin_guard 统一兜（POST/PUT/DELETE 需网关令牌），
-# GET 只读接口与既有 /api/queue 等同口径放行。
+# ------------------------------------------------------------ RSS 订阅（P2 自动化）
+# 订阅 CRUD + 立即检查 + 条目预览 + 手动派发 + rss-ticker 定时轮询 +
+# auto_download 自动派发。写操作鉴权由 _admin_guard 统一兜（POST/PUT/DELETE
+# 需网关令牌），GET 只读接口与既有 /api/queue 等同口径放行。
 
 def _rss() -> rssmod.RssFeed:
     return rssmod.RssFeed(Path(cfgmod.STATE_DIR) / "rss.json")
@@ -1086,10 +1086,12 @@ def rss_remove(sub_id: str):
 @app.post("/api/rss/subs/{sub_id}/check")
 def rss_check(sub_id: str):
     """立即检查：拉取→解析→三层去重→过滤→入库，返回新条目命中情况。
-    资源级查重复用全局下载历史（downloader.history_check）。"""
+    资源级查重复用全局下载历史（downloader.history_check）。
+    manual=True：搁置订阅复位（手动重试即复位，轮询恢复资格）。"""
     mgr = _manager()
     try:
-        return _rss().check(sub_id, history_check=mgr.history_check)
+        return _rss().check(sub_id, history_check=mgr.history_check,
+                            manual=True)
     except KeyError as exc:
         raise HTTPException(404, str(exc))
     except RuntimeError as exc:
@@ -1157,6 +1159,24 @@ def _queue_worker_start():
             except Exception as exc:  # noqa: BLE001 - 后台线程绝不因异常退出
                 print(f"[fnmedia-dl] 队列定时派发异常：{exc}", file=sys.stderr)
     threading.Thread(target=_loop, daemon=True, name="queue-ticker").start()
+
+
+@app.on_event("startup")
+def _rss_worker_start():
+    """RSS 定时轮询守护线程（P2）：每 TICK_INTERVAL_SEC 醒一次，到点订阅
+    检查 + auto_download 自动派发（失败重试链与并发上限见 rssfeed.tick）。
+    同 queue-ticker 口径：先睡后查（给启动期网络留出就绪时间），异常绝不
+    带崩线程。"""
+    def _loop():
+        while True:
+            time.sleep(rssmod.TICK_INTERVAL_SEC)
+            try:
+                mgr = _manager()
+                _rss().tick(_queue_dispatch(mgr),
+                            history_check=mgr.history_check)
+            except Exception as exc:  # noqa: BLE001 - 后台线程绝不因异常退出
+                print(f"[fnmedia-dl] RSS 定时轮询异常：{exc}", file=sys.stderr)
+    threading.Thread(target=_loop, daemon=True, name="rss-ticker").start()
 
 
 @app.on_event("startup")
