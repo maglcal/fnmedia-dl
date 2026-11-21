@@ -388,6 +388,28 @@
           <input id="epOffset" type="number" value="0" step="1">
         </label>
       </div>
+      <details class="hint" id="epAdvanced">
+        <summary>剧集进阶：集数开关 / 多版本择优 / 遗漏检测 / 订阅组（选填）</summary>
+        <div class="form-grid">
+          <label>集数黑名单<span class="opt">逗号分隔，命中的集不收，如 1,2</span>
+            <input id="epNotDownload" type="text" spellcheck="false"
+                   placeholder="1, 2, 12">
+          </label>
+          <label>优先关键词<span class="opt">逗号分隔；命中者替换同集旧版本</span>
+            <input id="epPriority" type="text" spellcheck="false"
+                   placeholder="HDR, 1080p">
+          </label>
+          <label>订阅组名<span class="opt">同组订阅共享已收集数，跨源同集只收一条</span>
+            <input id="epGroupName" type="text" spellcheck="false"
+                   placeholder="如：某剧-主备源">
+          </label>
+        </div>
+        <div class="row-inline dir-tools">
+          <label class="check"><input type="checkbox" id="epDownloadNew"><span>只收最新集（本轮同季只留最大集）</span></label>
+          <label class="check"><input type="checkbox" id="epOmitDetect"><span>遗漏检测（卡片提示同季缺集）</span></label>
+          <label class="check"><input type="checkbox" id="epMaster"><span>组内主源（勾选者先检查占集名额）</span></label>
+        </div>
+      </details>
       <div class="row-inline dir-tools">
         <label class="check"><input type="checkbox" id="rssAutoDl"><span>自动下载命中条目（关闭 = 仅入库待确认）</span></label>
         <label class="check"><input type="checkbox" id="rssRegex"><span>按正则匹配（进阶）</span></label>

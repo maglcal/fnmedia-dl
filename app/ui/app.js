@@ -1701,12 +1701,14 @@ let rssEditId = null;
 
 function rssClearForm() {
   for (const id of ["rssUrl", "rssName", "rssDir", "rssMust", "rssMustNot",
-                    "epRegex"]) $(`#${id}`).value = "";
+                    "epRegex", "epNotDownload", "epPriority", "epGroupName"])
+    $(`#${id}`).value = "";
   $("#rssInterval").value = "30";
   $("#rssStaleDays").value = "0";
   $("#epGroup").value = "1";
   $("#epOffset").value = "0";
-  for (const id of ["rssAutoDl", "rssRegex", "epDedup", "rssEpReset"])
+  for (const id of ["rssAutoDl", "rssRegex", "epDedup", "rssEpReset",
+                    "epDownloadNew", "epOmitDetect", "epMaster"])
     $(`#${id}`).checked = false;
 }
 
@@ -1735,6 +1737,12 @@ function rssEnterEditMode(sub) {
   $("#epRegex").value = ep.regex || "";
   $("#epGroup").value = String(ep.group || 1);
   $("#epOffset").value = String(ep.offset || 0);
+  $("#epNotDownload").value = (ep.not_download || []).join(", ");
+  $("#epPriority").value = (ep.priority || []).join(", ");
+  $("#epGroupName").value = ep.group_name || "";
+  $("#epDownloadNew").checked = !!ep.download_new;
+  $("#epOmitDetect").checked = !!ep.omit_detect;
+  $("#epMaster").checked = !!ep.master;
   $("#rssEpReset").checked = false;
   $("#btnRssAdd").textContent = "保存修改";
   $("#btnRssCancelEdit").hidden = false;
@@ -1773,6 +1781,10 @@ function renderRssSubs(subs) {
         ${s.enabled ? "" : `<span class="tag">已停用</span>`}
         ${s.auto_download ? `<span class="tag">自动下载</span>` : ""}
         ${(s.episode && s.episode.enabled) ? `<span class="tag">剧集去重</span>` : ""}
+        ${(s.episode && s.episode.group_name) ? `<span class="tag">订阅组：${esc(s.episode.group_name)}${s.episode.master ? "（主）" : ""}</span>` : ""}
+        ${s.omit && Object.keys(s.omit).length
+          ? `<span class="tag warn">疑似缺集：${Object.entries(s.omit).map(([sn, eps]) => `S${sn} ` + eps.join(",")).join(" / ")}</span>`
+          : ""}
         ${s.stale ? `<span class="tag warn">源停滞 ${s.stale_idle_days} 天无新条目</span>` : ""}
         ${s.suspended ? `<span class="tag warn">连续失败已搁置</span>` : ""}
         <div class="link-reason">${esc(s.url)}</div>
@@ -1875,6 +1887,12 @@ on("#btnRssAdd", "click", async () => {
       regex: $("#epRegex").value.trim(),
       group: parseInt($("#epGroup").value, 10) || 1,
       offset: parseInt($("#epOffset").value, 10) || 0,
+      not_download: rssKwList($("#epNotDownload").value).join(","),
+      priority: rssKwList($("#epPriority").value).join(","),
+      group_name: $("#epGroupName").value.trim(),
+      download_new: $("#epDownloadNew").checked,
+      omit_detect: $("#epOmitDetect").checked,
+      master: $("#epMaster").checked,
     },
   };
   const btn = $("#btnRssAdd");

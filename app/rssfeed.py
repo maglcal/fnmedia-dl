@@ -27,6 +27,11 @@
   自定义正则（regex+group 捕获组+offset 偏移）或内置模式链（SxxExx→
   第N集/话/回→EPxx→Exx→裸集数）解析，解析不出不拦（宁漏勿错杀）；
   过滤排除的条目不占集名额，手动派发仍可越过（显式用户意图）。
+  集数语义进阶（P3）：not_download 集数黑名单 / download_new 本轮同季只收
+  最大集（两者不占集名额）；priority 优先关键词 + 内置 PROPER/REPACK
+  高分版本替换同集旧 matched 条目（同分先到先得）；omit_detect 已收集数
+  断档提示写 sub.omit；group_name 订阅组跨源共享 ep_seen（master 在 tick
+  中先检查占名额，实现主备互补）。
 过滤（qBittorrent 三轴）：must_not 一票否决 → must 任一命中（空 = 全过）
   → 大小阈值（feed 提供大小时才生效）；regex 模式限长 512 字符（ReDoS 自担）。
 
@@ -84,6 +89,12 @@ MAX_AUTO_DISPATCH = 3                # 单订阅每轮自动派发上限（前�
 MAX_DISPATCH_RETRY = 3               # 自动派发失败重试上限（超限搁置待手动）
 MAX_EP_SEEN = 2000                   # 每订阅已收集数键上限（按时间淘汰旧键）
 MAX_STALE_DAYS = 3650                # 停滞阈值上限（天，约 10 年；0=关闭）
+MAX_EP_LIST = 200                    # not_download/priority 列表长度上限（防滥用）
+MAX_GROUP_LEN = 64                   # 订阅组名长度上限
+# 洗版/修复版标记（多版本择优内置优先分）：PROPER/REPACK/REMUX 等常见后缀
+_PRIORITY_RE = re.compile(
+    r"\b(PROPER|REPACK|REMUX|DIRECTORS.?CUT|EXTENDED|UNCUT|INTERNAL|HC-HDR)\b",
+    re.I)
 
 _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^\s\"'<>]*")
 _TORRENT_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.torrent", re.I)
@@ -248,8 +259,37 @@ def _norm_episode(ep: dict | None) -> dict:
         if compiled.groups < group:
             raise ValueError(
                 f"集数正则只有 {compiled.groups} 个捕获组，取不到第 {group} 组")
+    # 集数黑名单（not_download）：正整数集号列表；接受 "1,3,5" 或 ["1","3"]
+    raw_nd = ep.get("not_download") or []
+    if isinstance(raw_nd, str):
+        raw_nd = [s for s in raw_nd.split(",") if s.strip()]
+    if not isinstance(raw_nd, (list, tuple)) or len(raw_nd) > MAX_EP_LIST:
+        raise ValueError(f"集数黑名单最多 {MAX_EP_LIST} 项")
+    try:
+        not_download = sorted({int(x) for x in raw_nd if str(x).strip()})
+    except (TypeError, ValueError):
+        raise ValueError("集数黑名单需为整数集号（逗号分隔或数组）")
+    # 优先关键词（priority）：多版本择优，命中者替换同集旧条目
+    raw_pri = ep.get("priority") or []
+    if isinstance(raw_pri, str):
+        raw_pri = [s for s in raw_pri.split(",") if s.strip()]
+    if not isinstance(raw_pri, (list, tuple)) or len(raw_pri) > MAX_EP_LIST:
+        raise ValueError(f"优先关键词最多 {MAX_EP_LIST} 项")
+    priority = []
+    for kw in raw_pri:
+        kw = str(kw).strip()
+        if kw and len(kw) <= REGEX_MAX_LEN and kw not in priority:
+            priority.append(kw)
+    # 订阅组名（group_name；注意 group 已被正则捕获组号占用）：同组订阅
+    # 共享已收集数——跨源同集只收一条，先到先得/按优先关键词择优。
+    # master=True 的订阅组内优先检查（其 ep_seen 先占位）。
+    group_name = str(ep.get("group_name") or "").strip()[:MAX_GROUP_LEN]
     return {"enabled": bool(ep.get("enabled")), "regex": regex,
-            "group": group, "offset": offset}
+            "group": group, "offset": offset,
+            "not_download": not_download, "priority": priority,
+            "download_new": bool(ep.get("download_new")),
+            "omit_detect": bool(ep.get("omit_detect")),
+            "group_name": group_name, "master": bool(ep.get("master"))}
 
 
 # ---------------------------------------------------------------- 解析
@@ -395,6 +435,36 @@ def _stale_eval(sub: dict, now: int, has_new: bool) -> str:
     name = sub.get("name") or sub.get("url") or sub.get("id") or ""
     return (f"订阅「{name}」源停滞：已 {idle // 86400} 天无新条目"
             f"（阈值 {days} 天）")
+
+
+def _version_score(title: str, priority: list[str]) -> int:
+    """多版本择优评分：PROPER/REPACK 等内置标记 +2，用户优先关键词各 +1。
+    同分先到先得（不替换），高分替换同集旧条目。"""
+    score = 2 if _PRIORITY_RE.search(title or "") else 0
+    low = (title or "").lower()
+    for kw in priority or []:
+        if kw.lower() in low:
+            score += 1
+    return score
+
+
+def _omit_seasons(ep_seen: dict) -> dict:
+    """遗漏检测：按季找 1..max 之间缺失的集号（只报断档，不报未来集）。
+    返回 {season_str: [缺集…]}；ep_seen 键形如 S00E01，季号 0 = 无季信息。"""
+    by_season: dict[int, set[int]] = {}
+    for key in ep_seen:
+        m = re.fullmatch(r"S(\d+)E(\d+)", str(key))
+        if not m:
+            continue
+        by_season.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    out: dict[str, list[int]] = {}
+    for season, eps in by_season.items():
+        if not eps:
+            continue
+        missing = sorted(set(range(1, max(eps) + 1)) - eps)
+        if missing:
+            out[str(season)] = missing[:50]   # 限量防异常数据撑爆 UI
+    return out
 
 
 def _notify_stale(notify_fn, message: str, sub: dict) -> None:
@@ -549,6 +619,8 @@ class RssFeed:
                 sub["filter"] = _norm_filter(patch.get("filter"))
             if "episode" in patch:
                 sub["episode"] = _norm_episode(patch.get("episode"))
+                if not sub["episode"].get("omit_detect"):
+                    sub.pop("omit", None)   # 关掉遗漏检测即清旧结果（不等下轮 check）
             if patch.get("ep_reset"):
                 sub["ep_seen"] = {}      # 换正则/重收全集时显式清空已收集数
             if "stale_days" in patch:
@@ -689,6 +761,31 @@ class RssFeed:
                 ep_cfg = sub.get("episode") or {}
                 ep_on = bool(ep_cfg.get("enabled"))
                 ep_seen = sub.setdefault("ep_seen", {})
+                # 订阅组（P3）：同组订阅共享已收集数——跨源同集只收一条。
+                # 组表存 data["groups"][组名]（与 sub.ep_seen 双向同步：
+                # 组内成员都指向同一 dict 对象，一次写入全组可见）。
+                group_name = str(ep_cfg.get("group_name") or "").strip()
+                if group_name and ep_on:
+                    group_seen = data.setdefault("groups", {}).setdefault(
+                        group_name, {})
+                    # 合并历史：订阅自己的 ep_seen 并入组表（老订阅升级兼容）
+                    for k, v in ep_seen.items():
+                        group_seen.setdefault(k, v)
+                    ep_seen = group_seen
+                    sub["ep_seen"] = group_seen
+                not_download = set(ep_cfg.get("not_download") or [])
+                priority = ep_cfg.get("priority") or []
+                # download_new：本轮同季只收最大集（先扫一遍算每季 max）
+                season_max: dict[int, int] = {}
+                if ep_on and ep_cfg.get("download_new"):
+                    for raw in entries:
+                        ep = parse_episode(raw.get("title") or "",
+                                           ep_cfg.get("regex") or "",
+                                           int(ep_cfg.get("group") or 1),
+                                           int(ep_cfg.get("offset") or 0))
+                        if ep:
+                            season_max[ep[0]] = max(season_max.get(ep[0], 0),
+                                                    ep[1])
                 lst = data["items"].setdefault(sub_id, [])
                 seen = data.setdefault("seen", {})
                 existing = ({it.get("guid") for it in lst}
@@ -713,6 +810,7 @@ class RssFeed:
                         "last_result": "",
                     }
                     ep_key = ""
+                    ep = None
                     if ep_on:
                         ep = parse_episode(raw.get("title") or "",
                                            ep_cfg.get("regex") or "",
@@ -720,6 +818,14 @@ class RssFeed:
                                            int(ep_cfg.get("offset") or 0))
                         if ep:
                             ep_key = f"S{ep[0]:02d}E{ep[1]:02d}"
+                    # 集数级开关（P3）：黑名单命中 / download_new 非最新集
+                    # → 跳过入库，不占集名额（同集其他版本仍可被收）
+                    ep_gate = ""
+                    if ep:
+                        if ep[1] in not_download:
+                            ep_gate = f"集数黑名单：{ep[1]}"
+                        elif season_max and ep[1] < season_max.get(ep[0], 0):
+                            ep_gate = f"只收最新集：{ep_key}（本季最新 {season_max[ep[0]]}）"
                     # 层②：资源级下载历史查重（命中 = 已有同资源）
                     if history_check is not None:
                         try:
@@ -728,22 +834,56 @@ class RssFeed:
                             hit = {}
                         if hit.get("downloaded"):
                             item["state"] = "skipped"
-                            item["last_result"] = "下载历史已有同资源"
+                            item["last_result"] = ep_gate or "下载历史已有同资源"
                             lst.append(item)
                             added.append(item)
                             # 已有同资源 = 该集已入库，占集名额挡其他版本
-                            if ep_key and ep_key not in ep_seen:
+                            # （集数开关拦下的条目不占名额）
+                            if ep_key and not ep_gate and ep_key not in ep_seen:
                                 ep_seen[ep_key] = now
                             continue
                     ok, reason = _filter_entry(item["title"], item["size"], flt)
-                    # 层②.5 剧集去重（P3）：同（订阅,季,集）只收一条、先到
-                    # 先得；过滤排除的条目不占名额（同集换版本仍可收）
+                    # 层②.5 集数级开关（P3）：黑名单/非最新集 → 不入库
+                    if ok and ep_gate:
+                        ok, reason = False, ep_gate
+                    # 层②.6 剧集去重（P3）：同（订阅,季,集）只收一条、
+                    # 先到先得；多版本择优开启时高分版本可替换旧条目。
+                    # 过滤排除的条目不占名额（同集换版本仍可收）
                     if ok and ep_key:
                         if ep_key in ep_seen:
-                            ok = False
-                            reason = f"同集已收：{ep_key}"
+                            score = _version_score(item["title"], priority)
+                            old = next((i for i in reversed(lst)
+                                        if i.get("ep_key") == ep_key
+                                        and i.get("state") == "matched"), None)
+                            # 老数据无 ep_key 标记：按标题反推兼容升级前条目
+                            if old is None:
+                                for i in reversed(lst):
+                                    if i.get("state") != "matched":
+                                        continue
+                                    ip = parse_episode(i.get("title") or "",
+                                                       ep_cfg.get("regex") or "",
+                                                       int(ep_cfg.get("group") or 1),
+                                                       int(ep_cfg.get("offset") or 0))
+                                    if ip and f"S{ip[0]:02d}E{ip[1]:02d}" == ep_key:
+                                        i["ep_key"] = ep_key
+                                        i["version_score"] = _version_score(
+                                            i.get("title") or "", priority)
+                                        old = i
+                                        break
+                            old_score = int((old or {}).get("version_score") or 0)
+                            if old and score > old_score:
+                                old["state"] = "skipped"
+                                old["last_result"] = f"已被更优版本替换：{ep_key}"
+                                item["ep_key"] = ep_key
+                                item["version_score"] = score
+                                ep_seen[ep_key] = now
+                            else:
+                                ok, reason = False, f"同集已收：{ep_key}"
                         else:
                             ep_seen[ep_key] = now
+                            item["ep_key"] = ep_key
+                            item["version_score"] = _version_score(
+                                item["title"], priority)
                     item["state"] = "matched" if ok else "skipped"
                     item["last_result"] = "" if ok else reason
                     lst.append(item)
@@ -751,7 +891,14 @@ class RssFeed:
                 if len(ep_seen) > MAX_EP_SEEN:   # 已收集数键按时间淘汰旧键
                     keep = sorted(ep_seen.items(), key=lambda kv: kv[1],
                                   reverse=True)[:MAX_EP_SEEN]
-                    sub["ep_seen"] = dict(keep)
+                    # 原地更新保持 dict 身份——订阅组共享时若重新赋值
+                    # sub["ep_seen"] 会断开与 data["groups"] 的共享引用
+                    ep_seen.clear()
+                    ep_seen.update(dict(keep))
+                if ep_on and ep_cfg.get("omit_detect"):
+                    sub["omit"] = _omit_seasons(ep_seen)
+                elif "omit" in sub:
+                    sub.pop("omit", None)      # 关掉检测后不留旧结果
                 if len(lst) > MAX_ITEMS_PER_SUB:
                     data["items"][sub_id] = lst[-MAX_ITEMS_PER_SUB:]
                 sub["etag"] = (fetched.get("etag") or sub.get("etag") or "")
@@ -864,6 +1011,24 @@ class RssFeed:
                    if s.get("enabled")
                    and int(s.get("fail_count") or 0) < MAX_FAILS
                    and self._due(s, now)]
+            # 同一订阅组内 master 先检查（稳定排序保组内原顺序）——
+            # 先占集名额，standby 源的同集自动跳过，实现主备互补。
+            # 只调组内相对顺序：组外订阅位置不动（不破坏既有检查节奏）。
+            group_order = {}
+            for pos, s in enumerate(due):
+                gn = str((s.get("episode") or {}).get("group_name") or "")
+                if gn:
+                    group_order.setdefault(gn, []).append(pos)
+            for gn, positions in group_order.items():
+                if len(positions) < 2:
+                    continue
+                originals = [due[p] for p in positions]
+                masters = [s for s in originals
+                           if (s.get("episode") or {}).get("master")]
+                reordered = masters + [s for s in originals
+                                       if not (s.get("episode") or {}).get("master")]
+                for pos, s in zip(positions, reordered):
+                    due[pos] = s
         cli = client or httpx.Client(trust_env=False)
         checked = 0
         try:
