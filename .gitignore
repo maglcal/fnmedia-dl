@@ -1,6 +1,7 @@
 dist/
 .tools/
 .playwright-cli/
+.workbuddy/
 packaging/fpk/.build/
 __pycache__/
 *.pyc
