@@ -395,6 +395,32 @@ class TestCrud(RssTestBase):
         with self.assertRaises(ValueError):
             self.feed.update(sub["id"], {"url": "notaurl"})
 
+    def test_url_change_clears_conditional_headers(self):
+        """换源清 ETag/Last-Modified（否则旧 etag 打新源收 304 假无更新）；
+        未换源则保留。"""
+        sub = self.seed_sub()
+        cap: list = []
+        self.feed.check(sub["id"], client=self.mock_client(
+            body=rss_wrap(entry_link("g1", "t1", magnet(IH_A))),
+            headers={"etag": 'W/"old"',
+                     "last-modified": "Mon, 01 Jan 2024 00:00:00 GMT"},
+            capture=cap))
+        self.assertEqual(self.feed.snapshot()["subs"][0]["etag"], 'W/"old"')
+        # 同 URL 更新不动条件头
+        self.feed.update(sub["id"], {"name": "改名"})
+        self.assertEqual(self.feed.snapshot()["subs"][0]["etag"], 'W/"old"')
+        # 换 URL 清空
+        out = self.feed.update(sub["id"],
+                               {"url": "https://rss.example/other.xml"})
+        self.assertEqual(out["etag"], "")
+        self.assertEqual(out["last_modified"], "")
+        cap.clear()
+        self.feed.check(sub["id"], client=self.mock_client(
+            body=rss_wrap(entry_link("g2", "t2", magnet(IH_B))),
+            capture=cap))
+        self.assertNotIn("if-none-match", cap[0].headers)
+        self.assertNotIn("if-modified-since", cap[0].headers)
+
     def test_update_auto_download(self):
         sub = self.seed_sub()
         self.assertFalse(sub["auto_download"])

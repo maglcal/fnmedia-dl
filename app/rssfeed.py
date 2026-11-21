@@ -532,7 +532,11 @@ class RssFeed:
                 url = str(patch.get("url") or "").strip()
                 if not url.lower().startswith(("http://", "https://")):
                     raise ValueError("订阅地址需为 http(s) 链接")
-                sub["url"] = url
+                if url != sub.get("url"):
+                    sub["url"] = url
+                    # 换源必清条件头：拿旧 etag 打新源会收到 304 假「无更新」
+                    sub["etag"] = ""
+                    sub["last_modified"] = ""
             if "enabled" in patch:
                 sub["enabled"] = bool(patch.get("enabled"))
             if "auto_download" in patch:

@@ -1696,6 +1696,53 @@ function rssKwList(v) {
   return (v || "").split(/[,，]/).map((s) => s.trim()).filter(Boolean);
 }
 
+// 编辑模式：非空 = 正编辑该订阅，表单复用添加表单、提交走 PUT。
+let rssEditId = null;
+
+function rssClearForm() {
+  for (const id of ["rssUrl", "rssName", "rssDir", "rssMust", "rssMustNot",
+                    "epRegex"]) $(`#${id}`).value = "";
+  $("#rssInterval").value = "30";
+  $("#rssStaleDays").value = "0";
+  $("#epGroup").value = "1";
+  $("#epOffset").value = "0";
+  for (const id of ["rssAutoDl", "rssRegex", "epDedup", "rssEpReset"])
+    $(`#${id}`).checked = false;
+}
+
+function rssExitEditMode() {
+  rssEditId = null;
+  $("#btnRssAdd").textContent = "添加订阅";
+  $("#btnRssCancelEdit").hidden = true;
+  $("#rssEpResetRow").hidden = true;
+  $("#rssEpReset").checked = false;
+}
+
+function rssEnterEditMode(sub) {
+  rssEditId = sub.id;
+  $("#rssUrl").value = sub.url || "";
+  $("#rssName").value = sub.name || "";
+  $("#rssDir").value = sub.directory || "";
+  const f = sub.filter || {};
+  $("#rssMust").value = (f.must || []).join(", ");
+  $("#rssMustNot").value = (f.must_not || []).join(", ");
+  $("#rssInterval").value = String(sub.interval_min || 30);
+  $("#rssStaleDays").value = String(sub.stale_days || 0);
+  $("#rssAutoDl").checked = !!sub.auto_download;
+  $("#rssRegex").checked = !!f.regex;
+  const ep = sub.episode || {};
+  $("#epDedup").checked = !!ep.enabled;
+  $("#epRegex").value = ep.regex || "";
+  $("#epGroup").value = String(ep.group || 1);
+  $("#epOffset").value = String(ep.offset || 0);
+  $("#rssEpReset").checked = false;
+  $("#btnRssAdd").textContent = "保存修改";
+  $("#btnRssCancelEdit").hidden = false;
+  $("#rssEpResetRow").hidden = false;
+  $("#rssUrl").scrollIntoView({ behavior: "smooth", block: "center" });
+  toast("已载入订阅配置，修改后点「保存修改」");
+}
+
 async function loadRss() {
   try {
     const d = await API.get("/api/rss/subs");
@@ -1738,6 +1785,7 @@ function renderRssSubs(subs) {
         </div>
       </span>
       <button class="btn" data-rss="check" data-id="${esc(s.id)}">立即检查</button>
+      <button class="btn ghost" data-rss="edit" data-id="${esc(s.id)}">编辑</button>
       <button class="btn ghost" data-rss="items" data-id="${esc(s.id)}"
               data-name="${esc(s.name || s.url)}">条目</button>
       <button class="btn ghost" data-rss="auto" data-id="${esc(s.id)}"
@@ -1770,6 +1818,9 @@ function renderRssSubs(subs) {
           btn.disabled = false;
           btn.textContent = "立即检查";
         }
+      } else if (rss === "edit") {
+        const sub = subs.find((x) => x.id === id);
+        if (sub) rssEnterEditMode(sub);
       } else if (rss === "items") {
         openRssItems(id, name);
       } else if (rss === "auto") {
@@ -1793,6 +1844,7 @@ function renderRssSubs(subs) {
         try {
           await API.send(`/api/rss/subs/${encodeURIComponent(id)}`, "DELETE");
           if (rssItemsSub === id) closeRssItems();
+          if (rssEditId === id) { rssExitEditMode(); rssClearForm(); }
           toast("已删除订阅");
           loadRss();
         } catch (e) {
@@ -1808,7 +1860,7 @@ on("#btnRssAdd", "click", async () => {
   if (!url) return toast("请先填写订阅地址");
   const body = {
     url,
-    name: $("#rssName").value.trim(),
+    name: $("#rssName").value.trim() || url.split("//").pop().slice(0, 40),
     directory: $("#rssDir").value.trim(),
     interval_min: parseInt($("#rssInterval").value, 10) || 30,
     auto_download: $("#rssAutoDl").checked,
@@ -1826,18 +1878,33 @@ on("#btnRssAdd", "click", async () => {
     },
   };
   const btn = $("#btnRssAdd");
+  const editing = !!rssEditId;
+  if (editing && $("#rssEpReset").checked) body.ep_reset = true;
   btn.disabled = true;
   try {
-    await API.send("/api/rss/subs", "POST", body);
-    toast("✓ 已添加订阅，到点自动检查；也可点「立即检查」立即拉取");
-    $("#rssUrl").value = "";
-    $("#rssName").value = "";
+    if (editing) {
+      await API.send(`/api/rss/subs/${encodeURIComponent(rssEditId)}`, "PUT", body);
+      toast("✓ 订阅配置已保存");
+      rssExitEditMode();
+      rssClearForm();
+    } else {
+      await API.send("/api/rss/subs", "POST", body);
+      toast("✓ 已添加订阅，到点自动检查；也可点「立即检查」立即拉取");
+      $("#rssUrl").value = "";
+      $("#rssName").value = "";
+    }
     loadRss();
   } catch (e) {
-    toast("添加失败：" + e.message);
+    toast((editing ? "保存失败：" : "添加失败：") + e.message);
   } finally {
     btn.disabled = false;
   }
+});
+
+on("#btnRssCancelEdit", "click", () => {
+  rssExitEditMode();
+  rssClearForm();
+  toast("已取消编辑");
 });
 
 on("#btnRssRefresh", "click", loadRss);
