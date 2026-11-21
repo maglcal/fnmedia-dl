@@ -1054,15 +1054,54 @@ class TestThunderCloudDirMap(unittest.TestCase):
         return tc
 
     def test_add_converts_host_path_to_container(self):
-        """宿主路径自动换算为容器内路径再下发（与本地直连同款）。"""
-        captured = {}
-        tc = self._tc(captured)
+        """方案 B（0.1.47.4）：宿主路径先原样下发；只有设备报目录锚定
+        失败才换算重试（目录解析在 POST /task 前，重试不重复建任务）。"""
+        calls: list = []
+
+        def create_task(*a, **kw):
+            calls.append(dict(kw))
+            if len(calls) == 1:
+                raise BackendError("保存目录 /vol1/1000/movie "
+                                   "不在引擎可达的下载目录树内")
+            return "t-1"
+
+        tc = self._tc({})
+        tc.core.create_task = create_task
         with mock.patch("xunlei_docker.container_mounts",
                         return_value=self.MOUNTS):
             tid = tc.add("magnet:?xt=urn:btih:aa",
                          directory="/vol1/1000/movie")
         self.assertEqual(tid, "t-1")
-        self.assertEqual(captured.get("directory"), "/downloads/movie")
+        self.assertEqual([c["directory"] for c in calls],
+                         ["/vol1/1000/movie", "/downloads/movie"])
+
+    def test_add_no_retry_on_other_error(self):
+        """非目录锚定错误不换算重试（避免掩盖真因/重复派发）。"""
+        calls: list = []
+
+        def create_task(*a, **kw):
+            calls.append(dict(kw))
+            raise BackendError("迅雷接口错误：网络超时")
+
+        tc = self._tc({})
+        tc.core.create_task = create_task
+        with mock.patch("xunlei_docker.container_mounts",
+                        return_value=self.MOUNTS):
+            with self.assertRaises(BackendError):
+                tc.add("magnet:?xt=urn:btih:aa",
+                       directory="/vol1/1000/movie")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["directory"], "/vol1/1000/movie")
+
+    def test_add_native_dir_no_retry(self):
+        """设备原生路径一次成功：即便本机挂载表有同前缀也不换算（0.1.46
+        回归教训——本地容器挂载 ≠ 远程设备文件系统）。"""
+        captured = {}
+        tc = self._tc(captured)
+        with mock.patch("xunlei_docker.container_mounts",
+                        return_value=self.MOUNTS):
+            tc.add("magnet:?xt=urn:btih:aa", directory="/vol00/WDC")
+        self.assertEqual(captured.get("directory"), "/vol00/WDC")
 
     def test_add_passthrough_unmapped_dir(self):
         """映射外路径原样放行，可达性交回设备侧目录树锚定（0.1.47 修

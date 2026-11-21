@@ -1038,22 +1038,29 @@ class ThunderCloud(Backend):
         # 只能指望 DHT 回填。显式真名（缓存命中/用户命名）仍覆盖。
         apply_display_name(resource, url, name)
         d = (directory or (self.conf.get("dir") or "")).strip()
-        # 目录映射换算（0.1.45.8 补翻译，0.1.47 修误挡）：绝对路径先查
-        # 容器挂载——宿主路径自动换算为容器内路径（用户填
-        # /vol1/1000/movie 而引擎目录树是 /downloads/ 视角，缺这步翻译
-        # 目录锚定必失败报「不在引擎可达的下载目录树内」——0.1.45.8
-        # 用户实测删任务重下三通道全灭暴露）；映射外 → 原样放行，
-        # 可达性交回设备侧目录树锚定判定——0.1.46 回归教训：本地容器
-        # 挂载 ≠ 远程设备文件系统，硬拦会误杀设备原生可见的路径（用户
-        # /vol00 外置盘实测被误挡、回滚 0.1.45 即正常）；真不可达时
-        # drive_core 自会报错并给可操作指引。查不到容器 → 同样放行
-        # 靠目录表锚定（群晖套件/自建容器）。
+        # 目录映射（方案 B：锚定失败才换算，0.1.47.4）：先按用户填的原样
+        # 下发，让设备侧目录树裁决可达性——本地容器挂载表 ≠ 远程设备
+        # 文件系统（0.1.46 回归教训：设备原生可见 /vol00 被预换算误挡），
+        # 只有设备确实报「不在引擎可达的下载目录树内」时才尝试换算重试。
+        # 安全前提：drive_core.create_task 在目录解析阶段（POST /task 之前）
+        # 抛该错——此时尚未建任务，重试不会重复派发；POST 后的失败不重试。
+        # 换算重试解决 0.1.45.8 场景：宿主 /vol1/1000/movie 而设备目录树
+        # 是 /downloads/ 视角，原样锚定失败后换算再试即可命中。
+        mapped = ""
         if d.startswith("/"):
-            mapped, _ = xunlei_docker.map_engine_dir(
+            candidate, _ = xunlei_docker.map_engine_dir(
                 d, xunlei_docker.container_mounts())
-            if mapped is not None and mapped != d:
-                d = mapped
-        return self.core.create_task(url, resource, target, directory=d)
+            if candidate and candidate != d:
+                mapped = candidate
+        try:
+            return self.core.create_task(url, resource, target, directory=d)
+        except BackendError as exc:
+            stray = ("不在引擎可达的下载目录树内" in str(exc))
+            if mapped and stray:
+                _dbg(f"目录锚定失败→换算重试: {d} → {mapped}")
+                return self.core.create_task(url, resource, target,
+                                             directory=mapped)
+            raise
 
     def browse_dirs(self, path: str = "") -> dict:
         """只读浏览远程设备下载目录树（下载目录选择器数据源）。
