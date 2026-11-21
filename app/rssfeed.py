@@ -5,7 +5,7 @@
   {"subs":  [{"id","name","url","enabled","interval_min","auto_download",
               "directory","filter","episode","ep_seen","etag",
               "last_modified","last_check","last_check_ts","last_error",
-              "fail_count"}],
+              "fail_count","stale_days","last_new_ts","stale_notified_day"}],
    "items": {sub_id: [{"id","guid","identity","title","url","size",
                        "state","retry_count","first_seen","last_result"}]},
    "seen":  {fingerprint: ts}}        # 条目去重指纹，30 天滚动清理
@@ -40,6 +40,13 @@ P2 自动化：tick() 定时轮询（main.py rss-ticker 每 60s 驱动）——�
 条目 state 取值：new（入库瞬态）→ matched（过滤命中，待派发）/
   skipped（过滤排除 / 历史已有同资源）/ dispatched（已派发）/ failed
   （派发失败，retry_count 记自动重试次数）。
+
+源停滞提醒（P3 轻件）：订阅可设 stale_days（N 天无新条目提醒，0=关闭）。
+  last_new_ts 记最后一次发现新条目的时间（add 时初始化为当下防新建即报），
+  每次成功检查（含 not_modified）评估：超阈值且当天未提醒过则写
+  stale_notified_day（一天至多一次）、返回 stale_notice 文案并可经 notify_fn
+  回调外发；新条目到达即刷新 last_new_ts、清提醒标记（再次停滞可再提醒）。
+  提醒只反映「源是否还在更新」——过滤排除的条目仍是新发布，算源活跃。
 
 注意：文件名不能叫 queue.py——app 目录在 sys.path 首位，会遮蔽标准库
 queue 模块把 threading/anyio 等依赖带崩。
@@ -76,6 +83,7 @@ TICK_SUB_GAP = 0.5                   # 订阅间请求间隔（秒，防对端�
 MAX_AUTO_DISPATCH = 3                # 单订阅每轮自动派发上限（前置节流）
 MAX_DISPATCH_RETRY = 3               # 自动派发失败重试上限（超限搁置待手动）
 MAX_EP_SEEN = 2000                   # 每订阅已收集数键上限（按时间淘汰旧键）
+MAX_STALE_DAYS = 3650                # 停滞阈值上限（天，约 10 年；0=关闭）
 
 _MAGNET_RE = re.compile(r"magnet:\?xt=urn:btih:[0-9a-zA-Z]{32,40}[^\s\"'<>]*")
 _TORRENT_URL_RE = re.compile(r"https?://[^\s\"'<>]+\.torrent", re.I)
@@ -102,6 +110,17 @@ def _norm_interval(v) -> int:
     if n < MIN_INTERVAL_MIN:
         raise ValueError(f"轮询间隔最短 {MIN_INTERVAL_MIN} 分钟")
     return n
+
+
+def _norm_stale_days(v) -> int:
+    """停滞提醒阈值归一：0=关闭，正整数上限 MAX_STALE_DAYS。"""
+    try:
+        n = int(v if v is not None and str(v).strip() != "" else 0)
+    except (TypeError, ValueError):
+        raise ValueError("停滞提醒天数需为整数（0=关闭）")
+    if n < 0:
+        raise ValueError("停滞提醒天数不能为负")
+    return min(n, MAX_STALE_DAYS)
 
 
 def _opt_float(v):
@@ -346,6 +365,48 @@ def _parse_feed(data: bytes) -> list[dict]:
 
 # ---------------------------------------------------------------- 存储
 
+def _stale_eval(sub: dict, now: int, has_new: bool) -> str:
+    """评估源停滞并回写 sub 状态；返回本次提醒文案（空=不提醒）。
+
+    调用方须持文件锁并在之后落盘。has_new=本次检查是否发现新条目
+    （added 非空）——新条目刷新 last_new_ts 并清提醒标记（再次停滞可再报）。
+    """
+    try:
+        days = _norm_stale_days(sub.get("stale_days"))
+    except ValueError:
+        days = 0                 # 历史脏数据退化成关闭，不打断检查
+    if days <= 0:
+        return ""
+    if has_new:
+        sub["last_new_ts"] = now
+        sub["stale_notified_day"] = ""
+        return ""
+    last_new = int(sub.get("last_new_ts") or 0)
+    if last_new <= 0:
+        sub["last_new_ts"] = now   # 老订阅迁移：缺字段从本次检查起算，不误报
+        return ""
+    idle = now - last_new
+    if idle < days * 86400:
+        return ""
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    if sub.get("stale_notified_day") == today:
+        return ""                # 一天至多提醒一次
+    sub["stale_notified_day"] = today
+    name = sub.get("name") or sub.get("url") or sub.get("id") or ""
+    return (f"订阅「{name}」源停滞：已 {idle // 86400} 天无新条目"
+            f"（阈值 {days} 天）")
+
+
+def _notify_stale(notify_fn, message: str, sub: dict) -> None:
+    """锁外发提醒；通知失败不影响订阅检查结果。"""
+    if not notify_fn or not message:
+        return
+    try:
+        notify_fn(message, dict(sub))
+    except Exception:  # noqa: BLE001 - 外部通知不可靠，失败静默
+        pass
+
+
 def _fingerprint(guid: str, identity: str) -> str:
     """条目去重指纹：资源级身份（磁力/ed2k 按哈希归一）优先，guid 兜底。"""
     if identity.startswith(("btih:", "ed2k:")):
@@ -401,26 +462,37 @@ class RssFeed:
         cutoff = now - SEEN_TTL
         data["seen"] = {k: ts for k, ts in data["seen"].items() if ts >= cutoff}
 
-    def _touch(self, sub_id: str, *, ok: bool, error: str = "") -> None:
-        """检查结果回写订阅状态（成功清零 fail_count，失败累计并留错因）。"""
+    def _touch(self, sub_id: str, *, ok: bool, error: str = "",
+               stale_has_new: bool | None = None) -> str:
+        """检查结果回写订阅状态（成功清零 fail_count，失败累计并留错因）。
+
+        stale_has_new=None 不评估停滞（失败路径）；True/False 评估并返回
+        本次提醒文案（由调用方在锁外发给 notify_fn）。
+        """
+        notice = ""
         with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
             sub = self._find(data, sub_id)
+            now = int(time.time())
             sub["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            sub["last_check_ts"] = int(time.time())
+            sub["last_check_ts"] = now
             if ok:
                 sub["fail_count"] = 0
                 sub["last_error"] = ""
             else:
                 sub["fail_count"] = int(sub.get("fail_count") or 0) + 1
                 sub["last_error"] = error[:200]
+            if stale_has_new is not None:
+                notice = _stale_eval(sub, now, stale_has_new)
             self._save(data)
+        return notice
 
     # ------------------------------------------------------------ CRUD
 
     def add(self, url: str, name: str = "", *, directory: str = "",
             interval_min: int = 30, auto_download: bool = False,
-            flt: dict | None = None, episode: dict | None = None) -> dict:
+            flt: dict | None = None, episode: dict | None = None,
+            stale_days: int = 0) -> dict:
         url = (url or "").strip()
         if not url.lower().startswith(("http://", "https://")):
             raise ValueError("订阅地址需为 http(s) 链接")
@@ -438,6 +510,9 @@ class RssFeed:
             "etag": "", "last_modified": "",
             "last_check": "", "last_check_ts": 0,
             "last_error": "", "fail_count": 0,
+            "stale_days": _norm_stale_days(stale_days),
+            "last_new_ts": int(time.time()),
+            "stale_notified_day": "",
         }
         with _FILE_LOCK, filelock.locked(self.path):
             data = self._load()
@@ -472,6 +547,8 @@ class RssFeed:
                 sub["episode"] = _norm_episode(patch.get("episode"))
             if patch.get("ep_reset"):
                 sub["ep_seen"] = {}      # 换正则/重收全集时显式清空已收集数
+            if "stale_days" in patch:
+                sub["stale_days"] = _norm_stale_days(patch.get("stale_days"))
             self._save(data)
             return dict(sub)
 
@@ -489,12 +566,21 @@ class RssFeed:
         with _FILE_LOCK:
             data = self._load()
         subs = []
+        now = int(time.time())
         for s in data["subs"]:
             d = dict(s)
             lst = data["items"].get(s.get("id"), [])
             d["items_count"] = len(lst)
             d["matched_count"] = sum(1 for i in lst if i.get("state") == "matched")
             d["suspended"] = int(s.get("fail_count") or 0) >= MAX_FAILS
+            try:
+                days = _norm_stale_days(s.get("stale_days"))
+            except ValueError:
+                days = 0
+            last_new = int(s.get("last_new_ts") or 0)
+            idle_days = max(0, (now - last_new) // 86400) if last_new else 0
+            d["stale_idle_days"] = idle_days
+            d["stale"] = bool(days > 0 and last_new and idle_days >= days)
             subs.append(d)
         return {"subs": subs}
 
@@ -544,7 +630,8 @@ class RssFeed:
             return {"status": "error", "error": f"订阅源拉取失败：{exc}"}
 
     def check(self, sub_id: str, *, client: httpx.Client | None = None,
-              history_check=None, manual: bool = False) -> dict:
+              history_check=None, manual: bool = False,
+              notify_fn=None) -> dict:
         """立即/定时检查：拉取 → 解析 → 三层去重 → 过滤 → 入库（不派发）。
 
         history_check(url) → {"downloaded": bool}（资源级查重，API 层注入
@@ -571,20 +658,22 @@ class RssFeed:
                 if client is None:
                     cli.close()
             if fetched["status"] == "not_modified":
-                self._touch(sub_id, ok=True)
+                notice = self._touch(sub_id, ok=True, stale_has_new=False)
+                _notify_stale(notify_fn, notice, sub)
                 return {"ok": True, "sub_id": sub_id, "status": "not_modified",
-                        "new": 0, "matched": 0, "skipped": 0, "items": []}
+                        "new": 0, "matched": 0, "skipped": 0, "items": [],
+                        "stale_notice": notice}
             if fetched["status"] == "error":
                 err = fetched.get("error") or "订阅源拉取失败"
                 self._touch(sub_id, ok=False, error=err)
                 return {"ok": False, "sub_id": sub_id, "status": "error",
-                        "error": err}
+                        "error": err, "stale_notice": ""}
             try:
                 entries = _parse_feed(fetched["body"])
             except ValueError as exc:
                 self._touch(sub_id, ok=False, error=str(exc))
                 return {"ok": False, "sub_id": sub_id, "status": "error",
-                        "error": str(exc)}
+                        "error": str(exc), "stale_notice": ""}
 
             # 入库（短锁）：seen 指纹先写（宁漏勿重）→ 历史查重 → 过滤
             now = int(time.time())
@@ -669,11 +758,14 @@ class RssFeed:
                 sub["fail_count"] = 0
                 sub["last_error"] = ""
                 self._prune_seen(data, now)
+                notice = _stale_eval(sub, now, bool(added))
                 self._save(data)
+            _notify_stale(notify_fn, notice, sub)
             matched = sum(1 for i in added if i["state"] == "matched")
             return {"ok": True, "sub_id": sub_id, "status": "ok",
                     "new": len(added), "matched": matched,
-                    "skipped": len(added) - matched, "items": added}
+                    "skipped": len(added) - matched, "items": added,
+                    "stale_notice": notice}
         finally:
             _CHECK_GUARD.release()
 
@@ -751,12 +843,14 @@ class RssFeed:
         return {"dispatched": dispatched, "failed": failed}
 
     def tick(self, dispatch_fn=None, history_check=None,
-             client: httpx.Client | None = None, sleep=time.sleep) -> dict:
+             client: httpx.Client | None = None, sleep=time.sleep,
+             notify_fn=None) -> dict:
         """定时轮询一轮（rss-ticker 每 TICK_INTERVAL_SEC 驱动）：
 
         ① 到点检查：enabled 且未搁置（fail_count < MAX_FAILS）且距上次检查
         ≥ interval_min 的订阅各查一次，订阅间 sleep TICK_SUB_GAP 防对端限流；
         ② 自动派发：auto_download 订阅按 _auto_dispatch_round 清理积压。
+        停滞订阅（stale_days>0 且超阈值）经 notify_fn 提醒，一天至多一次。
         单飞撞车（手动检查进行中）跳过本轮不报错；检查失败只记订阅状态不中断
         后续订阅。返回 {checked, dispatched, failed} 汇总。"""
         now = int(time.time())
@@ -774,7 +868,8 @@ class RssFeed:
                     sleep(TICK_SUB_GAP)      # 订阅间间隔：防对端限流
                 try:
                     self.check(sub["id"], client=cli,
-                               history_check=history_check)
+                               history_check=history_check,
+                               notify_fn=notify_fn)
                     checked += 1
                 except (RuntimeError, KeyError):
                     continue                 # 单飞撞车 / 订阅刚被删：跳过

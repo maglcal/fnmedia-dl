@@ -1726,6 +1726,7 @@ function renderRssSubs(subs) {
         ${s.enabled ? "" : `<span class="tag">已停用</span>`}
         ${s.auto_download ? `<span class="tag">自动下载</span>` : ""}
         ${(s.episode && s.episode.enabled) ? `<span class="tag">剧集去重</span>` : ""}
+        ${s.stale ? `<span class="tag warn">源停滞 ${s.stale_idle_days} 天无新条目</span>` : ""}
         ${s.suspended ? `<span class="tag warn">连续失败已搁置</span>` : ""}
         <div class="link-reason">${esc(s.url)}</div>
         <div class="link-reason">
@@ -1811,6 +1812,7 @@ on("#btnRssAdd", "click", async () => {
     directory: $("#rssDir").value.trim(),
     interval_min: parseInt($("#rssInterval").value, 10) || 30,
     auto_download: $("#rssAutoDl").checked,
+    stale_days: parseInt($("#rssStaleDays").value, 10) || 0,
     filter: {
       must: rssKwList($("#rssMust").value),
       must_not: rssKwList($("#rssMustNot").value),

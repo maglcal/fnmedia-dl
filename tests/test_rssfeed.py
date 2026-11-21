@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """RSS 订阅（rssfeed.py）测试：BEP 36 解析优先级、三轴过滤、指纹去重、
-剧集去重（P3）、CRUD、check 闭环（MockTransport 注入假 feed）、派发幂等
-+ API 层。"""
+剧集去重与源停滞提醒（P3）、CRUD、check 闭环（MockTransport 注入假 feed）、
+派发幂等 + API 层。"""
 from __future__ import annotations
 
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -720,6 +721,138 @@ class TestEpisodeDedup(RssTestBase):
         self.assertEqual(res2["matched"], 1)
 
 
+# ---------------------------------------------------------------- 源停滞提醒
+
+class TestStale(RssTestBase):
+    """P3 轻件：阈值触发、一天至多一次、新条目复位、notify_fn 回调缝。"""
+
+    def _set_sub(self, **fields):
+        with rssmod._FILE_LOCK:
+            data = self.feed._load()
+            data["subs"][0].update(fields)
+            self.feed._save(data)
+
+    def _backdate(self, days: int):
+        self._set_sub(last_new_ts=int(time.time()) - days * 86400)
+
+    def test_default_off_no_notice(self):
+        sub = self.seed_sub()
+        self.assertEqual(sub["stale_days"], 0)
+        self.assertGreater(sub["last_new_ts"], 0)
+        self._backdate(30)
+        calls: list = []
+        res = self.feed.check(sub["id"], client=self.mock_client(status=304),
+                              notify_fn=lambda m, s: calls.append(m))
+        self.assertEqual(res["stale_notice"], "")
+        self.assertEqual(calls, [])
+        self.assertFalse(self.feed.snapshot()["subs"][0]["stale"])
+
+    def test_threshold_triggers_once_per_day(self):
+        self.seed_sub(stale_days=7)
+        self._backdate(8)
+        first = self.feed.check(self.feed.snapshot()["subs"][0]["id"],
+                                client=self.mock_client(status=304))
+        self.assertIn("源停滞", first["stale_notice"])
+        self.assertIn("8 天", first["stale_notice"])
+        snap = self.feed.snapshot()["subs"][0]
+        self.assertTrue(snap["stale"])
+        self.assertEqual(snap["stale_idle_days"], 8)
+        self.assertEqual(snap["stale_notified_day"], time.strftime("%Y-%m-%d"))
+        # 同一天再检查不重复提醒（红标仍在，通知只发一次）
+        second = self.feed.check(snap["id"],
+                                 client=self.mock_client(status=304))
+        self.assertEqual(second["stale_notice"], "")
+
+    def test_new_entry_resets(self):
+        sub = self.seed_sub(stale_days=7)
+        self._backdate(8)
+        self.feed.check(sub["id"], client=self.mock_client(status=304))
+        res = self.feed.check(sub["id"], client=self.mock_client(
+            body=rss_wrap(entry_link("g1", "t1", magnet(IH_A)))))
+        self.assertEqual(res["new"], 1)
+        self.assertEqual(res["stale_notice"], "")
+        snap = self.feed.snapshot()["subs"][0]
+        self.assertGreater(snap["last_new_ts"], 0)
+        self.assertEqual(snap["stale_notified_day"], "")
+        self.assertFalse(snap["stale"])
+
+    def test_notify_fn_called_and_exception_tolerated(self):
+        sub = self.seed_sub(stale_days=1)
+        self._backdate(3)
+        calls: list = []
+        self.feed.check(sub["id"], client=self.mock_client(status=304),
+                        notify_fn=lambda m, s: calls.append((m, s["name"])))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("测试源", calls[0][1])
+        # 外部通知挂掉不影响检查结果
+        self._set_sub(stale_notified_day="")
+
+        def boom(msg, s):
+            raise RuntimeError("notify down")
+
+        res = self.feed.check(sub["id"], client=self.mock_client(status=304),
+                              notify_fn=boom)
+        self.assertTrue(res["ok"])
+        self.assertIn("源停滞", res["stale_notice"])
+
+    def test_error_path_skips_stale(self):
+        sub = self.seed_sub(stale_days=1)
+        self._backdate(3)
+        calls: list = []
+        res = self.feed.check(sub["id"], client=self.mock_client(status=500),
+                              notify_fn=lambda m, s: calls.append(m))
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stale_notice"], "")
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            self.feed.snapshot()["subs"][0]["stale_notified_day"], "")
+
+    def test_legacy_sub_no_false_alarm(self):
+        """老订阅缺 last_new_ts：从本次检查起算，不立刻误报。"""
+        sub = self.seed_sub(stale_days=7)
+        self._set_sub(last_new_ts=0)
+        res = self.feed.check(sub["id"], client=self.mock_client(status=304))
+        self.assertEqual(res["stale_notice"], "")
+        snap = self.feed.snapshot()["subs"][0]
+        self.assertGreater(snap["last_new_ts"], 0)
+        self.assertFalse(snap["stale"])
+
+    def test_stale_days_validation(self):
+        with self.assertRaises(ValueError):
+            self.seed_sub(stale_days=-1)
+        with self.assertRaises(ValueError):
+            self.seed_sub(stale_days="abc")
+        sub = self.seed_sub(stale_days="3")
+        self.assertEqual(sub["stale_days"], 3)
+        self.assertEqual(self.feed.update(
+            sub["id"], {"stale_days": 5})["stale_days"], 5)
+        with self.assertRaises(ValueError):
+            self.feed.update(sub["id"], {"stale_days": -1})
+        big = self.feed.update(sub["id"], {"stale_days": 99999})
+        self.assertEqual(big["stale_days"], rssmod.MAX_STALE_DAYS)
+
+    def test_filtered_entry_counts_as_source_active(self):
+        """过滤排除的条目仍是新发布，算源活跃，不触发停滞。"""
+        sub = self.seed_sub(stale_days=7, flt={"must_not": ["cam"]})
+        self._backdate(8)
+        res = self.feed.check(sub["id"], client=self.mock_client(
+            body=rss_wrap(entry_link("g1", "bad CAM", magnet(IH_A)))))
+        self.assertEqual(res["new"], 1)
+        self.assertEqual(res["matched"], 0)
+        self.assertEqual(res["stale_notice"], "")
+        self.assertFalse(self.feed.snapshot()["subs"][0]["stale"])
+
+    def test_tick_propagates_notify_fn(self):
+        self.seed_sub(stale_days=1)
+        self._backdate(3)
+        calls: list = []
+        res = self.feed.tick(client=self.mock_client(status=304),
+                             sleep=lambda s: None,
+                             notify_fn=lambda m, s: calls.append(m))
+        self.assertEqual(res["checked"], 1)
+        self.assertEqual(len(calls), 1)
+
+
 # ---------------------------------------------------------------- 派发
 
 class TestDispatch(RssTestBase):
@@ -1036,6 +1169,21 @@ class TestRssAPI(unittest.TestCase):
         self.assertEqual(self.client.put(
             f"/api/rss/subs/{sub['id']}",
             json={"episode": {"group": 0}}).status_code, 400)
+
+    def test_stale_days_api(self):
+        sub = self._add(stale_days=7)
+        self.assertEqual(sub["stale_days"], 7)
+        snap = self.client.get("/api/rss/subs").json()["subs"][0]
+        self.assertIn("stale", snap)
+        self.assertIn("stale_idle_days", snap)
+        self.assertFalse(snap["stale"])
+        r = self.client.put(f"/api/rss/subs/{sub['id']}",
+                            json={"stale_days": 0})
+        self.assertEqual(r.json()["sub"]["stale_days"], 0)
+        self.assertEqual(self.client.post(
+            "/api/rss/subs",
+            json={"url": "https://x.example/f", "stale_days": -1}
+        ).status_code, 400)
 
     def test_items_and_check_404(self):
         self.assertEqual(self.client.get(

@@ -1041,6 +1041,7 @@ class RssSubAddReq(BaseModel):
     auto_download: bool = False
     filter: dict | None = None
     episode: dict | None = None
+    stale_days: int = 0               # N 天无新条目提醒，0=关闭
 
 
 @app.post("/api/rss/subs")
@@ -1049,7 +1050,8 @@ def rss_add(req: RssSubAddReq):
         sub = _rss().add(req.url, req.name, directory=req.directory,
                          interval_min=req.interval_min,
                          auto_download=req.auto_download,
-                         flt=req.filter, episode=req.episode)
+                         flt=req.filter, episode=req.episode,
+                         stale_days=req.stale_days)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True, "sub": sub}
@@ -1065,6 +1067,7 @@ class RssSubPatchReq(BaseModel):
     filter: dict | None = None
     episode: dict | None = None
     ep_reset: bool | None = None      # true = 清空已收集数记录（换正则后用）
+    stale_days: int | None = None     # N 天无新条目提醒，0=关闭
 
 
 @app.put("/api/rss/subs/{sub_id}")

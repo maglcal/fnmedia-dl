@@ -374,6 +374,9 @@
         <label>轮询间隔<span class="opt">分钟，最短 10</span>
           <input id="rssInterval" type="number" value="30" min="10" step="5">
         </label>
+        <label>停滞提醒<span class="opt">天，0=关闭；N 天无新条目在卡片红标提醒</span>
+          <input id="rssStaleDays" type="number" value="0" min="0" step="1">
+        </label>
         <label>集数正则<span class="opt">选填，剧集去重自定义解析（留空用内置模式）</span>
           <input id="epRegex" type="text" spellcheck="false"
                  placeholder="如：EP(\d+)">
